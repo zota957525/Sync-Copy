@@ -1,0 +1,71 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos-universal
+            target: universal-apple-darwin
+            extra_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            bundle_glob: 'src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg,src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app'
+          - os: windows-latest
+            name: windows-x64
+            target: ''
+            extra_targets: ''
+            bundle_glob: 'src-tauri/target/release/bundle/msi/*.msi,src-tauri/target/release/bundle/nsis/*.exe'
+
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.extra_targets }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          key: ${{ matrix.name }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build (macOS universal)
+        if: matrix.target == 'universal-apple-darwin'
+        run: npm run tauri build -- --target universal-apple-darwin
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows-latest'
+        run: npm run tauri build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-copy-${{ matrix.name }}
+          path: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: ignore
+          retention-days: 14
