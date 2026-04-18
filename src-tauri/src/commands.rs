@@ -139,19 +139,19 @@ pub async fn join_group(app: AppHandle) -> Result<(), String> {
     let _ = app.emit("status-updated", ());
 
     // 握手到 peer_hint
-    if let Some(target) = peer_hint.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(raw) = peer_hint.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         *state.status.write() = ConnectionStatus::Connecting;
         let _ = app.emit("status-updated", ());
-        match network::client::handshake(target, &password, &device_id, &device_name, port).await {
-            Ok(mut peer) => {
-                // 对方返回的 Peer 使用用户填的 addr 作为回连地址
-                peer.addr = target.to_string();
+        match network::client::handshake(raw, &password, &device_id, &device_name, port).await {
+            Ok(peer) => {
                 state.peers.upsert(peer);
                 crate::state::update_status_connected(&state);
                 let _ = app.emit("status-updated", ());
             }
             Err(e) => {
-                let msg = e.to_string();
+                // 用 {:#} 展开完整 anyhow 错误链，而不是只留顶层的 "builder error"
+                let msg = format!("{:#}", e);
+                tracing::warn!(error = %msg, "handshake failed");
                 *state.status.write() = ConnectionStatus::Error { message: msg.clone() };
                 let _ = app.emit("status-updated", ());
                 return Err(msg);
