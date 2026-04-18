@@ -28,3 +28,4 @@ arboard = "3"
 axum = "0.8"
 # 让 reqwest 用系统默认 TLS 后端（Windows schannel / macOS SecureTransport），避免 rustls 在 Windows 的 crypto provider 坑
 reqwest = { version = "0.12", features = ["json"] }
+if-addrs = "0.13"

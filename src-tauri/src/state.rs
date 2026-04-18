@@ -42,6 +42,9 @@ pub struct AppState {
 
     /// 接收去重：每个 peer 最后见过的最大 seq
     pub last_seen_seq: RwLock<HashMap<String, u64>>,
+
+    /// 握手审批队列：服务端收到握手后挂在这里，等前端点「同意/拒绝」再继续
+    pub pending_approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
 }
 
 impl AppState {
@@ -55,6 +58,7 @@ impl AppState {
             server_shutdown: Mutex::new(None),
             seq: AtomicU64::new(1),
             last_seen_seq: RwLock::new(HashMap::new()),
+            pending_approvals: Mutex::new(HashMap::new()),
         })
     }
 

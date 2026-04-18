@@ -43,19 +43,26 @@ pub async fn handshake(
         listen_addr: format!("0.0.0.0:{}", my_listen_port),
     };
     let client = build_client()?;
+    // 对方要等用户点"同意/拒绝"，给足 35 秒（服务端审批超时是 30s）
     let resp = client
         .post(&url)
         .json(&req)
+        .timeout(Duration::from_secs(35))
         .send()
         .await
         .with_context(|| format!("连接 {} 失败", target))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if status.as_u16() == 401 {
-            anyhow::bail!("密码不匹配（服务端返回 401）");
+        match status.as_u16() {
+            401 => anyhow::bail!("密码不匹配（对方返回 401）"),
+            403 => anyhow::bail!("对方拒绝了你的加入请求"),
+            408 => anyhow::bail!("对方没有在 30 秒内确认，请让对方点「同意」后重试"),
+            409 => anyhow::bail!("冲突：device_id 与对方相同（可能是同一份配置复制到两台机器）"),
+            code => {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("握手失败：HTTP {} {}", code, body);
+            }
         }
-        anyhow::bail!("握手失败：HTTP {} {}", status.as_u16(), body);
     }
     let body: HandshakeResp = resp.json().await.context("解析握手响应 JSON 失败")?;
     Ok(Peer {

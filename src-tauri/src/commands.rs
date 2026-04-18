@@ -162,14 +162,60 @@ pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
     }
 }
 
-/// 返回本机在局域网中对外表现的 IPv4（用 "连接到公共地址" 的套路让 OS 告诉我们默认出口 IP）
+/// 响应握手审批：前端弹框里点「同意/拒绝」后调用
+#[tauri::command]
+pub fn respond_handshake(
+    state: State<'_, Arc<AppState>>,
+    request_id: String,
+    accept: bool,
+) {
+    let mut pending = state.pending_approvals.lock();
+    if let Some(tx) = pending.remove(&request_id) {
+        let _ = tx.send(accept);
+    }
+}
+
+/// 返回本机在局域网中对外表现的 IPv4。
+///
+/// 之前用 `UdpSocket::connect("8.8.8.8:80")` 让 OS 选路的套路，在有 Clash/VPN
+/// 劫持了 DNS 或 198.18.0.0/15 路由时会返回 fake-IP（比如 198.18.0.1），
+/// 所以改为枚举所有网卡，过滤回环/链路本地/benchmark 段，优先返回 RFC1918 私网地址。
 #[tauri::command]
 pub fn get_local_ip() -> Option<String> {
-    use std::net::UdpSocket;
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    // 不会真的发包，只是让 OS 选路并把本地地址填好
-    socket.connect("8.8.8.8:80").ok()?;
-    socket.local_addr().ok().map(|a| a.ip().to_string())
+    use std::net::IpAddr;
+
+    let ifs = if_addrs::get_if_addrs().ok()?;
+    let mut best: Option<(u8, String)> = None;
+
+    for iface in ifs {
+        if iface.is_loopback() {
+            continue;
+        }
+        let IpAddr::V4(v4) = iface.ip() else { continue };
+        let [a, b, _, _] = v4.octets();
+
+        // 169.254/16 自动专用（APIPA）—— 未拿到 DHCP 时才有
+        if a == 169 && b == 254 {
+            continue;
+        }
+        // 198.18/15 benchmarking 段 —— Clash fake-IP / 网卡测试常用
+        if a == 198 && (b == 18 || b == 19) {
+            continue;
+        }
+
+        // 优先级：RFC1918 私网 > 其它
+        let is_private = (a == 192 && b == 168)
+            || a == 10
+            || (a == 172 && (16..=31).contains(&b));
+        let priority: u8 = if is_private { 0 } else { 1 };
+        let ip_str = v4.to_string();
+        match &best {
+            None => best = Some((priority, ip_str)),
+            Some((p, _)) if priority < *p => best = Some((priority, ip_str)),
+            _ => {}
+        }
+    }
+    best.map(|(_, s)| s)
 }
 
 #[tauri::command]

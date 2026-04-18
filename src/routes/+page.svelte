@@ -40,6 +40,13 @@
   let banner = $state<string | null>(null); // 全局错误横幅（替代 alert）
   let unlistenFns: UnlistenFn[] = [];
 
+  type PendingApproval = {
+    request_id: string;
+    device_id: string;
+    device_name: string;
+  };
+  let pendingApprovals = $state<PendingApproval[]>([]);
+
   let form = $state<ConfigView>({
     port: 5858,
     password: "",
@@ -162,6 +169,15 @@
     await refreshStatus();
   }
 
+  async function respondApproval(request_id: string, accept: boolean) {
+    try {
+      await invoke("respond_handshake", { requestId: request_id, accept });
+    } catch (e) {
+      console.warn("respond_handshake failed", e);
+    }
+    pendingApprovals = pendingApprovals.filter((p) => p.request_id !== request_id);
+  }
+
   // ---- history actions ----
   async function deleteItem(id: string, ev: MouseEvent) {
     ev.stopPropagation();
@@ -217,6 +233,10 @@
     listen("status-updated", () => refreshStatus()).then((fn) =>
       unlistenFns.push(fn)
     );
+    listen<PendingApproval>("handshake-pending", (e) => {
+      // 追加到队列（多设备同时申请时依次处理）
+      pendingApprovals = [...pendingApprovals, e.payload];
+    }).then((fn) => unlistenFns.push(fn));
     return () => {
       unlistenFns.forEach((fn) => fn());
     };
@@ -434,8 +454,32 @@
       <div class="btn-row">
         <button class="ghost" onclick={closeJoin} disabled={joining}>取消</button>
         <button class="primary" onclick={submitJoin} disabled={joining}>
-          {joining ? "连接中…" : "加入"}
+          {joining ? "等待对方同意…" : "加入"}
         </button>
+      </div>
+    </div>
+  {/if}
+
+  <!-- 握手审批覆盖层：对方发起握手时弹这个，盖住整个浮窗直到用户做决定 -->
+  {#if pendingApprovals.length > 0}
+    {@const p = pendingApprovals[0]}
+    <div class="approval-overlay">
+      <div class="approval-card">
+        <div class="approval-icon">📥</div>
+        <div class="approval-title">有设备希望加入</div>
+        <div class="approval-device">{p.device_name}</div>
+        <div class="approval-hint">30 秒内未响应视为拒绝</div>
+        <div class="approval-actions">
+          <button class="ghost" onclick={() => respondApproval(p.request_id, false)}
+            >拒绝</button
+          >
+          <button class="primary" onclick={() => respondApproval(p.request_id, true)}
+            >同意</button
+          >
+        </div>
+        {#if pendingApprovals.length > 1}
+          <div class="approval-queue">还有 {pendingApprovals.length - 1} 个待处理</div>
+        {/if}
       </div>
     </div>
   {/if}
@@ -798,5 +842,66 @@
   .primary:disabled {
     opacity: 0.6;
     cursor: not-allowed;
+  }
+
+  /* 握手审批覆盖层 */
+  .approval-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 12px;
+    z-index: 100;
+  }
+  .approval-card {
+    width: 100%;
+    background: rgba(40, 40, 46, 0.98);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    padding: 14px 12px 12px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+  }
+  .approval-icon {
+    font-size: 28px;
+    line-height: 1;
+  }
+  .approval-title {
+    font-size: 13px;
+    color: #d1d5db;
+  }
+  .approval-device {
+    font-size: 15px;
+    font-weight: 600;
+    color: #fef3c7;
+    margin: 2px 0;
+    word-break: break-all;
+    text-align: center;
+  }
+  .approval-hint {
+    font-size: 10px;
+    color: #9ca3af;
+  }
+  .approval-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+    width: 100%;
+  }
+  .approval-actions button {
+    flex: 1;
+  }
+  .approval-queue {
+    margin-top: 6px;
+    font-size: 10px;
+    color: #9ca3af;
+    font-style: italic;
   }
 </style>

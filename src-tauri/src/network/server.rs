@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     extract::State,
@@ -6,6 +6,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use serde_json::json;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::oneshot;
 
@@ -16,6 +17,9 @@ use crate::{
     peer::Peer,
     state::AppState,
 };
+
+/// 前端审批超时：服务端收到握手后最多等这么久
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct ServerCtx {
@@ -50,7 +54,7 @@ async fn handle_handshake(
     State(ctx): State<ServerCtx>,
     Json(req): Json<HandshakeReq>,
 ) -> Result<Json<HandshakeResp>, StatusCode> {
-    // 密码校验
+    // 1. 密码校验（快速，不打扰用户）
     let (my_id, my_name, my_pwd) = {
         let cfg = ctx.state.config.read();
         (
@@ -63,8 +67,58 @@ async fn handle_handshake(
         tracing::warn!(remote = %req.device_name, "handshake password mismatch");
         return Err(StatusCode::UNAUTHORIZED);
     }
+    // 自己不能加入自己
+    if req.device_id == my_id {
+        return Err(StatusCode::CONFLICT);
+    }
+    // 已经是已知 peer 就直接通过（幂等）
+    if ctx
+        .state
+        .peers
+        .snapshot()
+        .iter()
+        .any(|p| p.device_id == req.device_id)
+    {
+        return Ok(Json(HandshakeResp {
+            device_id: my_id,
+            device_name: my_name,
+        }));
+    }
 
-    // 把对方加入本机 peer 表
+    // 2. 生成 request_id，挂 oneshot，发事件给前端
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = oneshot::channel::<bool>();
+    {
+        let mut pending = ctx.state.pending_approvals.lock();
+        pending.insert(request_id.clone(), tx);
+    }
+    let _ = ctx.app.emit(
+        "handshake-pending",
+        json!({
+            "request_id": request_id,
+            "device_id": req.device_id,
+            "device_name": req.device_name,
+        }),
+    );
+    tracing::info!(peer = %req.device_name, "handshake pending user approval");
+
+    // 3. 最多等 30 秒
+    let approved = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
+        Ok(Ok(ok)) => ok,
+        _ => {
+            // 超时或 sender drop：清理挂起项，返回 408
+            ctx.state.pending_approvals.lock().remove(&request_id);
+            tracing::warn!(peer = %req.device_name, "handshake approval timed out");
+            return Err(StatusCode::REQUEST_TIMEOUT);
+        }
+    };
+
+    if !approved {
+        tracing::info!(peer = %req.device_name, "handshake rejected by user");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // 4. 通过：登记 peer
     ctx.state.peers.upsert(Peer {
         device_id: req.device_id.clone(),
         device_name: req.device_name.clone(),
@@ -72,7 +126,7 @@ async fn handle_handshake(
     });
     crate::state::update_status_connected(&ctx.state);
     let _ = ctx.app.emit("status-updated", ());
-    tracing::info!(peer = %req.device_name, addr = %req.listen_addr, "peer joined");
+    tracing::info!(peer = %req.device_name, "peer approved and joined");
 
     Ok(Json(HandshakeResp {
         device_id: my_id,
@@ -88,16 +142,13 @@ async fn handle_clipboard(
     if req.password != my_pwd {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    // 忽略由自己发出的（不应该，但保险）
     if req.origin_device_id == ctx.state.config.read().device_id {
         return Ok(StatusCode::OK);
     }
-    // 去重：seq 校验
     if !ctx.state.seen_seq_and_update(&req.origin_device_id, req.seq) {
         return Ok(StatusCode::OK);
     }
 
-    // 入历史
     if ctx
         .state
         .history
@@ -112,7 +163,6 @@ async fn handle_clipboard(
         let _ = ctx.app.emit("history-updated", ());
     }
 
-    // 通过 channel 发给剪切板线程：写入系统剪切板 + 抑制下次本地轮询回传
     if let Some(tx) = ctx.state.clipboard_tx.lock().as_ref() {
         let _ = tx.send(ClipboardCmd::SetSuppress(req.text));
     }

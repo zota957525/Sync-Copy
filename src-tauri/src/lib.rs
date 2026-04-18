@@ -47,6 +47,7 @@ pub fn run() {
             commands::join_group,
             commands::leave_group,
             commands::get_local_ip,
+            commands::respond_handshake,
         ])
         .setup(move |app| {
             build_tray(app.handle())?;
