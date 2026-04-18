@@ -28,14 +28,28 @@
     device_id: string;
   };
 
+  type View = "main" | "settings" | "join";
+
   let status = $state<StatusKind>({ kind: "idle" });
   let history = $state<HistoryItem[]>([]);
-  let settingsOpen = $state(false);
+  let view = $state<View>("main");
   let showPassword = $state(false);
+  let localIp = $state<string | null>(null);
+  let joining = $state(false);
+  let joinTarget = $state("");
+  let banner = $state<string | null>(null); // 全局错误横幅（替代 alert）
   let unlistenFns: UnlistenFn[] = [];
 
+  let form = $state<ConfigView>({
+    port: 5858,
+    password: "",
+    device_name: "",
+    peer_hint: null,
+    device_id: "",
+  });
+
+  // ---- random password ----
   function randomPassword(len = 8): string {
-    // 去除易混淆字符 (0/O/o, 1/l/I)
     const pool =
       "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     const arr = new Uint32Array(len);
@@ -50,51 +64,7 @@
     showPassword = true;
   }
 
-  async function openSettings() {
-    // 进入设置前从 backend 拉最新配置，避免显示上一次未保存的残留
-    await loadConfig();
-    showPassword = false;
-    settingsOpen = true;
-  }
-
-  async function closeSettings() {
-    // × 关闭 = 放弃未保存修改：从 backend 重新加载覆盖 form
-    await loadConfig();
-    showPassword = false;
-    settingsOpen = false;
-  }
-
-  let joining = $state(false);
-
-  async function join() {
-    joining = true;
-    try {
-      await invoke("join_group");
-    } catch (e) {
-      alert("加入失败: " + e);
-    } finally {
-      joining = false;
-      await refreshStatus();
-    }
-  }
-
-  async function leave() {
-    try {
-      await invoke("leave_group");
-    } catch (e) {
-      console.warn("leave_group failed", e);
-    }
-    await refreshStatus();
-  }
-
-  let form = $state<ConfigView>({
-    port: 5858,
-    password: "",
-    device_name: "",
-    peer_hint: null,
-    device_id: "",
-  });
-
+  // ---- data loaders ----
   async function refreshStatus() {
     try {
       status = (await invoke("get_status")) as StatusKind;
@@ -116,22 +86,83 @@
     form = { ...cfg };
   }
 
+  async function loadLocalIp() {
+    try {
+      localIp = (await invoke("get_local_ip")) as string | null;
+    } catch (e) {
+      console.warn("get_local_ip failed", e);
+      localIp = null;
+    }
+  }
+
+  // ---- settings view actions ----
+  async function openSettings() {
+    await loadConfig();
+    await loadLocalIp();
+    showPassword = false;
+    view = "settings";
+  }
+
+  async function closeSettings() {
+    await loadConfig(); // 放弃未保存修改
+    showPassword = false;
+    view = "main";
+  }
+
   async function saveConfig() {
     try {
       const update = {
         port: form.port,
         password: form.password,
         device_name: form.device_name,
-        peer_hint:
-          form.peer_hint && form.peer_hint.trim() ? form.peer_hint.trim() : null,
       };
       form = (await invoke("set_config", { update })) as ConfigView;
-      settingsOpen = false;
+      view = "main";
     } catch (e) {
-      alert("保存失败: " + e);
+      banner = "保存失败: " + e;
     }
   }
 
+  // ---- join view actions ----
+  async function openJoin() {
+    await loadConfig();
+    // 用上次成功的 peer_hint 作为默认值
+    joinTarget = form.peer_hint || "";
+    view = "join";
+  }
+
+  function closeJoin() {
+    view = "main";
+  }
+
+  async function submitJoin() {
+    if (!joinTarget.trim()) {
+      banner = "请输入对方机器地址";
+      return;
+    }
+    banner = null;
+    joining = true;
+    try {
+      await invoke("join_group", { target: joinTarget.trim() });
+      view = "main";
+    } catch (e) {
+      banner = String(e);
+    } finally {
+      joining = false;
+      await refreshStatus();
+    }
+  }
+
+  async function leave() {
+    try {
+      await invoke("leave_group");
+    } catch (e) {
+      console.warn("leave_group failed", e);
+    }
+    await refreshStatus();
+  }
+
+  // ---- history actions ----
   async function deleteItem(id: string, ev: MouseEvent) {
     ev.stopPropagation();
     await invoke("delete_history_item", { id });
@@ -145,7 +176,6 @@
   }
 
   async function copyItem(text: string) {
-    // 让用户点击历史项就能把该条重新写回剪切板
     try {
       await navigator.clipboard.writeText(text);
     } catch (e) {
@@ -153,8 +183,21 @@
     }
   }
 
+  // ---- misc ----
+  async function copyLocalAddr() {
+    if (!localIp) return;
+    try {
+      await navigator.clipboard.writeText(`${localIp}:${form.port}`);
+      banner = "本机地址已复制";
+      setTimeout(() => {
+        if (banner === "本机地址已复制") banner = null;
+      }, 1500);
+    } catch (e) {
+      console.warn("copy failed", e);
+    }
+  }
+
   function onHeaderMouseDown(ev: MouseEvent) {
-    // 保险兜底：原生 data-tauri-drag-region 失效时用 JS startDragging
     if (ev.button !== 0) return;
     const t = ev.target as HTMLElement;
     if (t.closest("button") || t.closest("input")) return;
@@ -167,6 +210,7 @@
     refreshStatus();
     refreshHistory();
     loadConfig();
+    loadLocalIp();
     listen("history-updated", () => refreshHistory()).then((fn) =>
       unlistenFns.push(fn)
     );
@@ -178,6 +222,7 @@
     };
   });
 
+  // ---- derived ----
   const peerCount = $derived.by(() =>
     status.kind === "connected" ? status.peers : 0
   );
@@ -193,7 +238,7 @@
       case "connected":
         return `已连接 · ${peerCount} 台`;
       case "error":
-        return status.message || "错误";
+        return `出错 · ${peerCount} 台`;
     }
   });
 
@@ -236,7 +281,7 @@
 </script>
 
 <div class="window">
-  <!-- 顶部栏：状态 + 设置；data-tauri-drag-region 是 Tauri 原生拖拽 hook，onmousedown 作为兜底 -->
+  <!-- 顶部栏 -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="header"
@@ -246,28 +291,41 @@
   >
     <span class="dot" data-tauri-drag-region style="background:{statusColor}"></span>
     <span class="status" data-tauri-drag-region>{statusText}</span>
-    {#if !settingsOpen}
+    {#if view === "main"}
       {#if canJoin}
-        <button class="pill" onclick={join} disabled={joining} title="启动服务端，握手 peer_hint">
-          {joining ? "…" : "加入"}
-        </button>
+        <button class="pill" onclick={openJoin} disabled={joining}>加入</button>
       {:else if isOnline}
-        <button class="pill ghost-pill" onclick={leave} title="断开并停止服务">断开</button>
+        <button class="pill ghost-pill" onclick={leave} title="从小组下线并停止服务"
+          >下线</button
+        >
       {/if}
-      <button class="icon-btn" onclick={openSettings} title="设置">⚙</button>
-    {:else}
-      <button class="icon-btn" onclick={closeSettings} title="放弃修改并返回"
-        >×</button
-      >
+      <button class="icon-btn" onclick={openSettings} title="本机设置">⚙</button>
+    {:else if view === "settings"}
+      <button class="icon-btn" onclick={closeSettings} title="放弃修改并返回">×</button>
+    {:else if view === "join"}
+      <button class="icon-btn" onclick={closeJoin} title="取消加入">×</button>
     {/if}
   </div>
 
-  {#if !settingsOpen}
+  <!-- 全局横幅错误 / 提示 -->
+  {#if banner}
+    <div class="banner">
+      <span>{banner}</span>
+      <button class="banner-close" onclick={() => (banner = null)} aria-label="关闭"
+        >✕</button
+      >
+    </div>
+  {/if}
+
+  {#if view === "main"}
     <div class="history">
       {#if history.length === 0}
-        <div class="empty">还没有同步过<br /><span class="hint">复制一段文本试试</span></div>
+        <div class="empty">
+          还没有同步过<br /><span class="hint">复制一段文本试试</span>
+        </div>
       {:else}
         {#each history as item (item.id)}
+          <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
           <div
             role="button"
             tabindex="0"
@@ -303,10 +361,15 @@
       >
       <span class="device">{form.device_name || "…"}</span>
     </div>
-  {:else}
-    <div class="settings">
+  {:else if view === "settings"}
+    <div class="panel scrollable">
+      <div class="section-title">本机</div>
       <label>
-        <span>本机端口</span>
+        <span>设备名</span>
+        <input type="text" bind:value={form.device_name} />
+      </label>
+      <label>
+        <span>端口</span>
         <input type="number" min="1024" max="65535" bind:value={form.port} />
       </label>
       <label>
@@ -334,32 +397,58 @@
           >
         </div>
       </label>
+
+      <div class="divider"></div>
+
+      <div class="readonly-row">
+        <div class="label-small">本机地址（告诉其他设备连我）</div>
+        <div class="readonly-box">
+          <span class="mono">
+            {localIp ? `${localIp}:${form.port}` : "获取中…"}
+          </span>
+          <button
+            type="button"
+            class="mini-btn"
+            onclick={copyLocalAddr}
+            disabled={!localIp}
+            title="复制本机地址">📋</button
+          >
+        </div>
+      </div>
+
+      <button class="primary" onclick={saveConfig}>保存</button>
+    </div>
+  {:else if view === "join"}
+    <div class="panel">
+      <div class="section-title">加入小组</div>
       <label>
-        <span>设备名</span>
-        <input type="text" bind:value={form.device_name} />
-      </label>
-      <label>
-        <span>加入目标</span>
+        <span>对方机器地址</span>
         <input
           type="text"
-          bind:value={form.peer_hint}
-          placeholder="ip:port（可选，首次必填）"
+          bind:value={joinTarget}
+          placeholder="ip:port，例如 192.168.1.10:5858"
+          autofocus
         />
       </label>
-      <button class="primary" onclick={saveConfig}>保存</button>
+      <div class="hint-row">密码相同才能连上；密码在「⚙ 本机设置」里</div>
+      <div class="btn-row">
+        <button class="ghost" onclick={closeJoin} disabled={joining}>取消</button>
+        <button class="primary" onclick={submitJoin} disabled={joining}>
+          {joining ? "连接中…" : "加入"}
+        </button>
+      </div>
     </div>
   {/if}
 </div>
 
 <style>
-  /* 保证所有子元素使用 border-box，避免 width:100% + padding 撑破容器 */
   :global(*, *::before, *::after) {
     box-sizing: border-box;
   }
   .window {
     width: 100vw;
     height: 100vh;
-    padding: 8px 10px 8px 10px;
+    padding: 8px 10px;
     background: rgba(28, 28, 32, 0.88);
     color: #f3f4f6;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -377,8 +466,8 @@
   .header {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 4px 2px 4px 2px;
+    gap: 6px;
+    padding: 4px 2px;
     cursor: grab;
   }
   .header:active {
@@ -394,6 +483,9 @@
   .status {
     flex: 1;
     font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .icon-btn {
     background: transparent;
@@ -416,6 +508,7 @@
     font-size: 11px;
     cursor: pointer;
     line-height: 1.4;
+    flex-shrink: 0;
   }
   .pill:hover:not(:disabled) {
     background: #1d4ed8;
@@ -432,6 +525,37 @@
   .ghost-pill:hover:not(:disabled) {
     background: rgba(255, 255, 255, 0.08);
   }
+
+  /* 全局 banner */
+  .banner {
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #fecaca;
+    padding: 6px 8px;
+    border-radius: 6px;
+    font-size: 11px;
+    line-height: 1.4;
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    word-break: break-all;
+  }
+  .banner span {
+    flex: 1;
+  }
+  .banner-close {
+    background: transparent;
+    color: #fca5a5;
+    border: none;
+    cursor: pointer;
+    padding: 0 4px;
+    font-size: 11px;
+    flex-shrink: 0;
+  }
+  .banner-close:hover {
+    color: #fecaca;
+  }
+
   .history {
     flex: 1;
     min-height: 0;
@@ -532,7 +656,7 @@
     align-items: center;
     justify-content: space-between;
     gap: 6px;
-    padding: 2px 2px 0 2px;
+    padding: 2px 2px 0;
   }
   .ghost {
     background: transparent;
@@ -554,21 +678,33 @@
     font-size: 11px;
     color: #9ca3af;
   }
-  .settings {
+
+  /* settings/join 通用面板 */
+  .panel {
     display: flex;
     flex-direction: column;
     gap: 8px;
     padding: 2px;
+  }
+  .panel.scrollable {
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
   }
-  .settings label {
+  .section-title {
+    font-size: 11px;
+    color: #9ca3af;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .panel label {
     display: flex;
     flex-direction: column;
     gap: 2px;
     font-size: 11px;
     color: #9ca3af;
   }
-  .settings input {
+  .panel input {
     background: rgba(255, 255, 255, 0.06);
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 4px;
@@ -577,7 +713,7 @@
     font-size: 12px;
     outline: none;
   }
-  .settings input:focus {
+  .panel input:focus {
     border-color: rgba(96, 165, 250, 0.5);
   }
   .pwd-row {
@@ -600,20 +736,67 @@
     padding: 0 8px;
     cursor: pointer;
   }
-  .mini-btn:hover {
+  .mini-btn:hover:not(:disabled) {
     background: rgba(255, 255, 255, 0.12);
   }
+  .mini-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .divider {
+    height: 1px;
+    background: rgba(255, 255, 255, 0.08);
+    margin: 4px 0;
+  }
+  .readonly-row {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .label-small {
+    font-size: 11px;
+    color: #9ca3af;
+  }
+  .readonly-box {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px dashed rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    padding: 5px 7px;
+  }
+  .mono {
+    flex: 1;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: #e5e7eb;
+    user-select: text;
+  }
+  .hint-row {
+    font-size: 10px;
+    color: #9ca3af;
+    line-height: 1.4;
+  }
+  .btn-row {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+  }
   .primary {
-    margin-top: 4px;
     background: #2563eb;
     color: white;
     border: none;
     border-radius: 4px;
-    padding: 6px 12px;
+    padding: 6px 14px;
     font-size: 12px;
     cursor: pointer;
   }
-  .primary:hover {
+  .primary:hover:not(:disabled) {
     background: #1d4ed8;
+  }
+  .primary:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 </style>
