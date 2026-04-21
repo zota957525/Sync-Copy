@@ -15,10 +15,12 @@
 
   type HistoryItem = {
     id: string;
-    text: string;
     timestamp_ms: number;
     source: Source;
-  };
+  } & (
+    | { kind: "text"; text: string }
+    | { kind: "image"; width: number; height: number; data_url: string }
+  );
 
   type ConfigView = {
     port: number;
@@ -192,11 +194,13 @@
     await refreshHistory();
   }
 
-  async function copyItem(text: string) {
+  async function copyItem(item: HistoryItem) {
     try {
-      await navigator.clipboard.writeText(text);
+      // 走后端：文本和图片都能正确写回系统剪切板并抑制回传
+      await invoke("recopy_history_item", { id: item.id });
     } catch (e) {
-      console.warn("clipboard.writeText failed", e);
+      console.warn("recopy failed", e);
+      banner = "复制失败: " + e;
     }
   }
 
@@ -374,13 +378,21 @@
             role="button"
             tabindex="0"
             class="item"
-            onclick={() => copyItem(item.text)}
+            class:item-image={item.kind === "image"}
+            onclick={() => copyItem(item)}
             onkeydown={(e) => {
-              if (e.key === "Enter" || e.key === " ") copyItem(item.text);
+              if (e.key === "Enter" || e.key === " ") copyItem(item);
             }}
             title="点击复制到剪切板"
           >
-            <div class="item-text">{item.text}</div>
+            {#if item.kind === "text"}
+              <div class="item-text">{item.text}</div>
+            {:else}
+              <div class="item-img-wrap">
+                <img class="item-img" src={item.data_url} alt="image" />
+                <span class="item-img-dim">{item.width}×{item.height}</span>
+              </div>
+            {/if}
             <div class="item-meta">
               <span>{sourceLabel(item.source)}</span>
               <span class="dotsep">·</span>
@@ -657,6 +669,33 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .item-img-wrap {
+    position: relative;
+    max-height: 80px;
+    overflow: hidden;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.25);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .item-img {
+    max-height: 80px;
+    max-width: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  .item-img-dim {
+    position: absolute;
+    right: 4px;
+    bottom: 4px;
+    background: rgba(0, 0, 0, 0.65);
+    color: #e5e7eb;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
   }
   .item-meta {
     margin-top: 2px;

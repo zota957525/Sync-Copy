@@ -10,6 +10,8 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::oneshot;
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
 use super::protocol::{ClipboardReq, HandshakeReq, HandshakeResp, PeerPublic};
 use crate::{
     clipboard::ClipboardCmd,
@@ -199,29 +201,53 @@ async fn handle_clipboard(
             return Err(StatusCode::UNAUTHORIZED);
         }
     };
-    let text = match String::from_utf8(plaintext_bytes) {
-        Ok(s) => s,
-        Err(_) => {
-            return Err(StatusCode::BAD_REQUEST);
-        }
+
+    let source = Source::Remote {
+        device_name: req.origin_device_name.clone(),
     };
 
-    if ctx
-        .state
-        .history
-        .push(
-            text.clone(),
-            Source::Remote {
-                device_name: req.origin_device_name.clone(),
-            },
-        )
-        .is_some()
-    {
-        let _ = ctx.app.emit("history-updated", ());
-    }
-
-    if let Some(tx) = ctx.state.clipboard_tx.lock().as_ref() {
-        let _ = tx.send(ClipboardCmd::SetSuppress(text));
+    match req.kind.as_str() {
+        "image_png" => {
+            let width = req.image_width.unwrap_or(0);
+            let height = req.image_height.unwrap_or(0);
+            if width == 0 || height == 0 {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            let data_url = format!("data:image/png;base64,{}", B64.encode(&plaintext_bytes));
+            if ctx
+                .state
+                .history
+                .push_image(width, height, data_url, source)
+                .is_some()
+            {
+                let _ = ctx.app.emit("history-updated", ());
+            }
+            if let Some(tx) = ctx.state.clipboard_tx.lock().as_ref() {
+                let _ = tx.send(ClipboardCmd::SetImageSuppress {
+                    png: plaintext_bytes,
+                    width,
+                    height,
+                });
+            }
+        }
+        _ => {
+            // 默认文本
+            let text = match String::from_utf8(plaintext_bytes) {
+                Ok(s) => s,
+                Err(_) => return Err(StatusCode::BAD_REQUEST),
+            };
+            if ctx
+                .state
+                .history
+                .push_text(text.clone(), source)
+                .is_some()
+            {
+                let _ = ctx.app.emit("history-updated", ());
+            }
+            if let Some(tx) = ctx.state.clipboard_tx.lock().as_ref() {
+                let _ = tx.send(ClipboardCmd::SetTextSuppress(text));
+            }
+        }
     }
 
     Ok(StatusCode::OK)

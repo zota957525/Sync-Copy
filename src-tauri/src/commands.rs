@@ -4,9 +4,12 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::oneshot;
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
 use crate::{
+    clipboard::ClipboardCmd,
     config::Config,
-    history::HistoryItem,
+    history::{HistoryItem, HistoryPayload},
     network,
     peer::Peer,
     state::{AppState, ConnectionStatus},
@@ -99,6 +102,42 @@ pub fn delete_history_item(
 pub fn clear_history(state: State<'_, Arc<AppState>>, app: AppHandle) {
     state.history.clear();
     let _ = app.emit("history-updated", ());
+}
+
+/// 把某条历史条目重新写回系统剪切板（文本或图片都支持）
+#[tauri::command]
+pub fn recopy_history_item(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<(), String> {
+    let items = state.history.snapshot();
+    let item = items
+        .into_iter()
+        .find(|i| i.id == id)
+        .ok_or_else(|| "历史条目不存在".to_string())?;
+    let tx = state
+        .clipboard_tx
+        .lock()
+        .clone()
+        .ok_or_else(|| "剪切板子线程未就绪".to_string())?;
+    match item.payload {
+        HistoryPayload::Text { text } => {
+            let _ = tx.send(ClipboardCmd::SetTextSuppress(text));
+        }
+        HistoryPayload::Image {
+            width,
+            height,
+            data_url,
+        } => {
+            let b64 = data_url
+                .split_once(',')
+                .map(|(_, b)| b)
+                .ok_or_else(|| "data_url 格式异常".to_string())?;
+            let png = B64.decode(b64).map_err(|e| e.to_string())?;
+            let _ = tx.send(ClipboardCmd::SetImageSuppress { png, width, height });
+        }
+    }
+    Ok(())
 }
 
 /// 启动 HTTP server（幂等）

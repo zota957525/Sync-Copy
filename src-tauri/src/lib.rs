@@ -45,6 +45,7 @@ pub fn run() {
             commands::get_history,
             commands::delete_history_item,
             commands::clear_history,
+            commands::recopy_history_item,
             commands::join_group,
             commands::leave_group,
             commands::get_local_ip,

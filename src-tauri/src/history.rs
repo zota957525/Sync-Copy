@@ -7,18 +7,32 @@ const MAX_HISTORY: usize = 50;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Source {
-    /// 本机自己复制的内容
     Local,
-    /// 来自 LAN 里某台 peer 的同步
     Remote { device_name: String },
+}
+
+/// 历史条目内容：文本或图片
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HistoryPayload {
+    Text {
+        text: String,
+    },
+    Image {
+        width: u32,
+        height: u32,
+        /// PNG 图像 base64，用作前端 <img src="data:image/png;base64,..."> 的缩略图
+        data_url: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HistoryItem {
     pub id: String,
-    pub text: String,
     pub timestamp_ms: u64,
     pub source: Source,
+    #[serde(flatten)]
+    pub payload: HistoryPayload,
 }
 
 pub struct History {
@@ -32,25 +46,55 @@ impl History {
         }
     }
 
-    /// 推入新条目。若已有相同文本的条目，先移除旧的再插入（bump 到顶部）
-    /// 如果要推入的文本和当前顶部一致，直接返回 None，避免无意义的 bump/刷新
-    pub fn push(&self, text: String, source: Source) -> Option<HistoryItem> {
+    fn push_inner(&self, payload: HistoryPayload, source: Source) -> Option<HistoryItem> {
         let mut items = self.items.write();
-        if matches!(items.front(), Some(top) if top.text == text) {
+        // 去重：文本按内容，图片按 data_url
+        let matches_top = |top: &HistoryItem| match (&top.payload, &payload) {
+            (HistoryPayload::Text { text: a }, HistoryPayload::Text { text: b }) => a == b,
+            (
+                HistoryPayload::Image { data_url: a, .. },
+                HistoryPayload::Image { data_url: b, .. },
+            ) => a == b,
+            _ => false,
+        };
+        if matches!(items.front(), Some(top) if matches_top(top)) {
             return None;
         }
-        items.retain(|it| it.text != text);
+        // 删掉所有同内容的旧项，再 bump 到顶部
+        items.retain(|it| !matches_top(it));
+
         let item = HistoryItem {
             id: uuid::Uuid::new_v4().to_string(),
-            text,
             timestamp_ms: now_ms(),
             source,
+            payload,
         };
         items.push_front(item.clone());
         while items.len() > MAX_HISTORY {
             items.pop_back();
         }
         Some(item)
+    }
+
+    pub fn push_text(&self, text: String, source: Source) -> Option<HistoryItem> {
+        self.push_inner(HistoryPayload::Text { text }, source)
+    }
+
+    pub fn push_image(
+        &self,
+        width: u32,
+        height: u32,
+        data_url: String,
+        source: Source,
+    ) -> Option<HistoryItem> {
+        self.push_inner(
+            HistoryPayload::Image {
+                width,
+                height,
+                data_url,
+            },
+            source,
+        )
     }
 
     pub fn snapshot(&self) -> Vec<HistoryItem> {

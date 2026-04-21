@@ -38,5 +38,20 @@ pub struct ClipboardReq {
     /// 12 字节随机 nonce，base64
     pub nonce: String,
     /// AES-GCM 密文（含 tag），base64
+    /// 对于文本：UTF-8 编码的字符串
+    /// 对于图片：PNG 字节流
     pub ciphertext: String,
+    /// "text" 或 "image_png"；老版本默认 "text"
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// 图片宽（仅 image_png 有值）
+    #[serde(default)]
+    pub image_width: Option<u32>,
+    /// 图片高（仅 image_png 有值）
+    #[serde(default)]
+    pub image_height: Option<u32>,
+}
+
+fn default_kind() -> String {
+    "text".to_string()
 }

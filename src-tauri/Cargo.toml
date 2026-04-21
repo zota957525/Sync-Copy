@@ -36,3 +36,5 @@ hkdf = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+# PNG 编解码（剪切板图片同步）
+image = { version = "0.25", default-features = false, features = ["png"] }

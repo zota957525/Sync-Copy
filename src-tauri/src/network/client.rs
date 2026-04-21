@@ -90,8 +90,14 @@ pub async fn handshake(
     })
 }
 
-/// 把文本加密后广播给所有已知 peer
-pub async fn broadcast_clipboard(state: Arc<AppState>, text: String) {
+/// 把明文字节 + 元数据广播给所有 peer，内部使用
+async fn broadcast_payload(
+    state: Arc<AppState>,
+    plaintext: Vec<u8>,
+    kind: &'static str,
+    image_width: Option<u32>,
+    image_height: Option<u32>,
+) {
     let (device_id, device_name, seq) = {
         let cfg = state.config.read();
         let seq = state.next_seq();
@@ -108,9 +114,7 @@ pub async fn broadcast_clipboard(state: Arc<AppState>, text: String) {
             return;
         }
     };
-    let plaintext = text.as_bytes().to_vec();
     for peer in peers {
-        // 为每个 peer 单独加密（各自的 AES 密钥不同）
         let key = match state.peer_keys.get(&peer.device_id) {
             Some(k) => k,
             None => {
@@ -131,6 +135,9 @@ pub async fn broadcast_clipboard(state: Arc<AppState>, text: String) {
             seq,
             nonce: nonce_b64,
             ciphertext: ct_b64,
+            kind: kind.to_string(),
+            image_width,
+            image_height,
         };
         let url = format!("http://{}/clipboard", peer.addr);
         let client = client.clone();
@@ -142,4 +149,14 @@ pub async fn broadcast_clipboard(state: Arc<AppState>, text: String) {
             }
         });
     }
+}
+
+/// 广播文本
+pub async fn broadcast_text(state: Arc<AppState>, text: String) {
+    broadcast_payload(state, text.into_bytes(), "text", None, None).await
+}
+
+/// 广播图片（PNG 字节流）
+pub async fn broadcast_image(state: Arc<AppState>, png: Vec<u8>, width: u32, height: u32) {
+    broadcast_payload(state, png, "image_png", Some(width), Some(height)).await
 }
