@@ -44,6 +44,7 @@ pub fn get_config(state: State<'_, Arc<AppState>>) -> ConfigView {
 #[tauri::command]
 pub fn set_config(
     state: State<'_, Arc<AppState>>,
+    app: AppHandle,
     update: ConfigUpdate,
 ) -> Result<ConfigView, String> {
     let new_cfg: Config = {
@@ -54,6 +55,18 @@ pub fn set_config(
         cfg.clone()
     };
     new_cfg.save().map_err(|e| e.to_string())?;
+
+    // 如果保存后密码已配置并且服务端还没跑，自动起服务端
+    let should_auto_listen =
+        !new_cfg.password.is_empty() && state.server_shutdown.lock().is_none();
+    if should_auto_listen {
+        let state_c: Arc<AppState> = Arc::clone(state.inner());
+        let app_c = app.clone();
+        tauri::async_runtime::spawn(async move {
+            auto_listen_on_startup(state_c, app_c).await;
+        });
+    }
+
     Ok(ConfigView {
         port: new_cfg.port,
         password: new_cfg.password,
@@ -95,6 +108,42 @@ pub fn clear_history(state: State<'_, Arc<AppState>>, app: AppHandle) {
     let _ = app.emit("history-updated", ());
 }
 
+/// 如果本机 HTTP server 未启动，就启动它。幂等。
+pub async fn start_server_if_needed(state: Arc<AppState>, app: AppHandle) {
+    if state.server_shutdown.lock().is_some() {
+        return;
+    }
+    let port = state.config.read().port;
+    let (tx, rx) = oneshot::channel::<()>();
+    *state.server_shutdown.lock() = Some(tx);
+    let state_srv = Arc::clone(&state);
+    let app_srv = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = network::server::run(state_srv.clone(), app_srv.clone(), port, rx).await {
+            tracing::error!(error = %e, "server exited with error");
+            *state_srv.status.write() = ConnectionStatus::Error {
+                message: format!("服务端启动失败: {}", e),
+            };
+            let _ = app_srv.emit("status-updated", ());
+        }
+        *state_srv.server_shutdown.lock() = None;
+    });
+    // 给 socket 一点时间绑定
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+}
+
+/// 应用启动时调用：配了密码就自动上线（起 server，状态 → Listening）
+pub async fn auto_listen_on_startup(state: Arc<AppState>, app: AppHandle) {
+    if state.config.read().password.is_empty() {
+        tracing::info!("password not set, skipping auto-listen");
+        return;
+    }
+    start_server_if_needed(Arc::clone(&state), app.clone()).await;
+    *state.status.write() = ConnectionStatus::Listening;
+    let _ = app.emit("status-updated", ());
+    tracing::info!("auto-listen started on port {}", state.config.read().port);
+}
+
 /// 启动 HTTP 服务 + 可选地向 target 握手。
 ///
 /// - target 为空：仅上线（等别人来连我）
@@ -102,13 +151,13 @@ pub fn clear_history(state: State<'_, Arc<AppState>>, app: AppHandle) {
 #[tauri::command]
 pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
     let state: Arc<AppState> = Arc::clone(app.state::<Arc<AppState>>().inner());
-    let (port, password, device_id, device_name) = {
+    let (password, device_id, device_name, port) = {
         let cfg = state.config.read();
         (
-            cfg.port,
             cfg.password.clone(),
             cfg.device_id.clone(),
             cfg.device_name.clone(),
+            cfg.port,
         )
     };
     if password.is_empty() {
@@ -116,24 +165,7 @@ pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
     }
     let target = target.trim().to_string();
 
-    // 启动本机 server（如果还没启动）
-    let already_running = state.server_shutdown.lock().is_some();
-    if !already_running {
-        let (tx, rx) = oneshot::channel::<()>();
-        *state.server_shutdown.lock() = Some(tx);
-        let state_srv = Arc::clone(&state);
-        let app_srv = app.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = network::server::run(state_srv.clone(), app_srv, port, rx).await {
-                tracing::error!(error = %e, "server exited with error");
-                *state_srv.status.write() = ConnectionStatus::Error {
-                    message: format!("服务端启动失败: {}", e),
-                };
-            }
-            *state_srv.server_shutdown.lock() = None;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    }
+    start_server_if_needed(Arc::clone(&state), app.clone()).await;
 
     // 无 target：只上线等别人连
     if target.is_empty() {

@@ -54,6 +54,13 @@ pub fn run() {
             // 启动剪切板线程并把 tx 存进 AppState
             let tx = clipboard::spawn(app.handle().clone(), Arc::clone(&app_state));
             *app_state.clipboard_tx.lock() = Some(tx);
+
+            // 已配置密码 → 自动上线，省掉用户手动点「上线」
+            let state_cl = Arc::clone(&app_state);
+            let app_cl = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                commands::auto_listen_on_startup(state_cl, app_cl).await;
+            });
             Ok(())
         })
         .run(tauri::generate_context!())
