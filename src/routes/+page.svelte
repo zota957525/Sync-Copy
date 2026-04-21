@@ -22,7 +22,6 @@
 
   type ConfigView = {
     port: number;
-    password: string;
     device_name: string;
     peer_hint: string | null;
     device_id: string;
@@ -33,11 +32,10 @@
   let status = $state<StatusKind>({ kind: "idle" });
   let history = $state<HistoryItem[]>([]);
   let view = $state<View>("main");
-  let showPassword = $state(false);
   let localIp = $state<string | null>(null);
   let joining = $state(false);
   let joinTarget = $state("");
-  let banner = $state<string | null>(null); // 全局错误横幅（替代 alert）
+  let banner = $state<string | null>(null);
   let unlistenFns: UnlistenFn[] = [];
 
   type PendingApproval = {
@@ -46,30 +44,14 @@
     device_name: string;
   };
   let pendingApprovals = $state<PendingApproval[]>([]);
+  let approvalCountdown = $state(30);
 
   let form = $state<ConfigView>({
     port: 5858,
-    password: "",
     device_name: "",
     peer_hint: null,
     device_id: "",
   });
-
-  // ---- random password ----
-  function randomPassword(len = 8): string {
-    const pool =
-      "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    const arr = new Uint32Array(len);
-    crypto.getRandomValues(arr);
-    let out = "";
-    for (let i = 0; i < len; i++) out += pool[arr[i] % pool.length];
-    return out;
-  }
-
-  function generatePassword() {
-    form.password = randomPassword(8);
-    showPassword = true;
-  }
 
   // ---- data loaders ----
   async function refreshStatus() {
@@ -106,13 +88,11 @@
   async function openSettings() {
     await loadConfig();
     await loadLocalIp();
-    showPassword = false;
     view = "settings";
   }
 
   async function closeSettings() {
-    await loadConfig(); // 放弃未保存修改
-    showPassword = false;
+    await loadConfig();
     view = "main";
   }
 
@@ -120,13 +100,20 @@
     try {
       const update = {
         port: form.port,
-        password: form.password,
         device_name: form.device_name,
       };
       form = (await invoke("set_config", { update })) as ConfigView;
       view = "main";
     } catch (e) {
       banner = "保存失败: " + e;
+    }
+  }
+
+  async function quitApp() {
+    try {
+      await invoke("quit_app");
+    } catch (e) {
+      console.warn("quit_app", e);
     }
   }
 
@@ -248,12 +235,22 @@
       unlistenFns.push(fn)
     );
     listen<PendingApproval>("handshake-pending", (e) => {
-      // 追加到队列（多设备同时申请时依次处理）
       pendingApprovals = [...pendingApprovals, e.payload];
     }).then((fn) => unlistenFns.push(fn));
     return () => {
       unlistenFns.forEach((fn) => fn());
     };
+  });
+
+  // 审批倒计时：每当弹框队列头变化时重新计时
+  $effect(() => {
+    const current = pendingApprovals[0];
+    if (!current) return;
+    approvalCountdown = 30;
+    const id = setInterval(() => {
+      approvalCountdown = Math.max(0, approvalCountdown - 1);
+    }, 1000);
+    return () => clearInterval(id);
   });
 
   // ---- derived ----
@@ -346,13 +343,6 @@
           title="主动连对方机器">加入</button
         >
       {/if}
-      {#if isOnline}
-        <button
-          class="pill ghost-pill"
-          onclick={leave}
-          title="下线并停止服务">下线</button
-        >
-      {/if}
       <button class="icon-btn" onclick={openSettings} title="本机设置">⚙</button>
     {:else if view === "settings"}
       <button class="icon-btn" onclick={closeSettings} title="放弃修改并返回">×</button>
@@ -426,31 +416,6 @@
         <span>端口</span>
         <input type="number" min="1024" max="65535" bind:value={form.port} />
       </label>
-      <label>
-        <span>密码</span>
-        <div class="pwd-row">
-          <input
-            class="pwd-input"
-            type={showPassword ? "text" : "password"}
-            bind:value={form.password}
-            placeholder="小组共享密码"
-          />
-          <button
-            type="button"
-            class="mini-btn"
-            onclick={() => (showPassword = !showPassword)}
-            title={showPassword ? "隐藏密码" : "显示密码"}
-            aria-label="toggle password visibility">{showPassword ? "🙈" : "👁"}</button
-          >
-          <button
-            type="button"
-            class="mini-btn"
-            onclick={generatePassword}
-            title="随机生成 8 位密码"
-            aria-label="generate password">🎲</button
-          >
-        </div>
-      </label>
 
       <div class="divider"></div>
 
@@ -471,6 +436,7 @@
       </div>
 
       <button class="primary" onclick={saveConfig}>保存</button>
+      <button class="danger" onclick={quitApp}>退出应用</button>
     </div>
   {:else if view === "join"}
     <div class="panel">
@@ -502,7 +468,9 @@
         <div class="approval-icon">📥</div>
         <div class="approval-title">有设备希望加入</div>
         <div class="approval-device">{p.device_name}</div>
-        <div class="approval-hint">30 秒内未响应视为拒绝</div>
+        <div class="approval-hint">
+          还剩 <span class="countdown">{approvalCountdown}</span> 秒未响应视为拒绝
+        </div>
         <div class="approval-actions">
           <button class="ghost" onclick={() => respondApproval(p.request_id, false)}
             >拒绝</button
@@ -877,6 +845,19 @@
     opacity: 0.6;
     cursor: not-allowed;
   }
+  .danger {
+    margin-top: 6px;
+    background: #dc2626;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 14px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .danger:hover {
+    background: #b91c1c;
+  }
 
   /* 握手审批覆盖层 */
   .approval-overlay {
@@ -922,6 +903,11 @@
   .approval-hint {
     font-size: 10px;
     color: #9ca3af;
+  }
+  .approval-hint .countdown {
+    font-weight: 600;
+    color: #fde68a;
+    font-variant-numeric: tabular-nums;
   }
   .approval-actions {
     display: flex;

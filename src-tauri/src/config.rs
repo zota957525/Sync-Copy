@@ -6,8 +6,6 @@ use std::{fs, path::PathBuf};
 pub struct Config {
     /// 本地 HTTP 服务监听端口
     pub port: u16,
-    /// 端到端加密密码（明文保存在本地配置文件里；未来可加上操作系统 keychain）
-    pub password: String,
     /// 本机显示名
     pub device_name: String,
     /// 首次加入使用的 peer 提示，格式如 "192.168.1.10:5858"
@@ -21,7 +19,6 @@ impl Default for Config {
         let hostname = hostname().unwrap_or_else(|| "device".to_string());
         Self {
             port: 5858,
-            password: String::new(),
             device_name: hostname,
             peer_hint: None,
             device_id: uuid::Uuid::new_v4().to_string(),

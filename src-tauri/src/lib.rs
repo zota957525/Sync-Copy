@@ -48,6 +48,7 @@ pub fn run() {
             commands::leave_group,
             commands::get_local_ip,
             commands::respond_handshake,
+            commands::quit_app,
         ])
         .setup(move |app| {
             build_tray(app.handle())?;

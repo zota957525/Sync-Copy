@@ -15,17 +15,14 @@ use crate::{
 #[derive(Debug, Serialize)]
 pub struct ConfigView {
     pub port: u16,
-    pub password: String,
     pub device_name: String,
     pub peer_hint: Option<String>,
     pub device_id: String,
 }
 
-/// 前端可编辑的本机配置（不含 peer_hint —— 那是加入对象不是本机属性）
 #[derive(Debug, Deserialize)]
 pub struct ConfigUpdate {
     pub port: u16,
-    pub password: String,
     pub device_name: String,
 }
 
@@ -34,7 +31,6 @@ pub fn get_config(state: State<'_, Arc<AppState>>) -> ConfigView {
     let cfg = state.config.read();
     ConfigView {
         port: cfg.port,
-        password: cfg.password.clone(),
         device_name: cfg.device_name.clone(),
         peer_hint: cfg.peer_hint.clone(),
         device_id: cfg.device_id.clone(),
@@ -50,15 +46,13 @@ pub fn set_config(
     let new_cfg: Config = {
         let mut cfg = state.config.write();
         cfg.port = update.port;
-        cfg.password = update.password;
         cfg.device_name = update.device_name;
         cfg.clone()
     };
     new_cfg.save().map_err(|e| e.to_string())?;
 
-    // 如果保存后密码已配置并且服务端还没跑，自动起服务端
-    let should_auto_listen =
-        !new_cfg.password.is_empty() && state.server_shutdown.lock().is_none();
+    // 首次保存后如果服务端还没跑，自动起
+    let should_auto_listen = state.server_shutdown.lock().is_none();
     if should_auto_listen {
         let state_c: Arc<AppState> = Arc::clone(state.inner());
         let app_c = app.clone();
@@ -69,7 +63,6 @@ pub fn set_config(
 
     Ok(ConfigView {
         port: new_cfg.port,
-        password: new_cfg.password,
         device_name: new_cfg.device_name,
         peer_hint: new_cfg.peer_hint,
         device_id: new_cfg.device_id,
@@ -108,7 +101,7 @@ pub fn clear_history(state: State<'_, Arc<AppState>>, app: AppHandle) {
     let _ = app.emit("history-updated", ());
 }
 
-/// 如果本机 HTTP server 未启动，就启动它。幂等。
+/// 启动 HTTP server（幂等）
 pub async fn start_server_if_needed(state: Arc<AppState>, app: AppHandle) {
     if state.server_shutdown.lock().is_some() {
         return;
@@ -128,46 +121,79 @@ pub async fn start_server_if_needed(state: Arc<AppState>, app: AppHandle) {
         }
         *state_srv.server_shutdown.lock() = None;
     });
-    // 给 socket 一点时间绑定
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 }
 
-/// 应用启动时调用：配了密码就自动上线（起 server，状态 → Listening）
 pub async fn auto_listen_on_startup(state: Arc<AppState>, app: AppHandle) {
-    if state.config.read().password.is_empty() {
-        tracing::info!("password not set, skipping auto-listen");
-        return;
-    }
     start_server_if_needed(Arc::clone(&state), app.clone()).await;
     *state.status.write() = ConnectionStatus::Listening;
     let _ = app.emit("status-updated", ());
     tracing::info!("auto-listen started on port {}", state.config.read().port);
 }
 
-/// 启动 HTTP 服务 + 可选地向 target 握手。
-///
-/// - target 为空：仅上线（等别人来连我）
-/// - target 非空：上线 + 主动握手对方
+/// 尝试和 gossip 列表里的每个 peer 握手（已知的跳过）。并发、异步发起，不阻塞主 join。
+fn spawn_gossip_handshakes(
+    state: Arc<AppState>,
+    app: AppHandle,
+    gossip: Vec<network::protocol::PeerPublic>,
+    device_id: String,
+    device_name: String,
+    port: u16,
+) {
+    for p in gossip {
+        // 跳过自己
+        if p.device_id == device_id {
+            continue;
+        }
+        // 跳过已知的 peer
+        let already_known = state
+            .peers
+            .snapshot()
+            .iter()
+            .any(|kp| kp.device_id == p.device_id);
+        if already_known {
+            continue;
+        }
+
+        let state_c = Arc::clone(&state);
+        let app_c = app.clone();
+        let dev_id = device_id.clone();
+        let dev_name = device_name.clone();
+        let addr = p.addr.clone();
+        let peer_name = p.device_name.clone();
+        tauri::async_runtime::spawn(async move {
+            tracing::info!(addr = %addr, name = %peer_name, "gossip: attempting handshake");
+            match network::client::handshake(&addr, &dev_id, &dev_name, port).await {
+                Ok(result) => {
+                    state_c.peers.upsert(result.peer);
+                    crate::state::update_status_connected(&state_c);
+                    let _ = app_c.emit("status-updated", ());
+                    // 不递归进一步 gossip —— 简单起见停在一跳
+                }
+                Err(e) => {
+                    tracing::warn!(addr = %addr, error = %e, "gossip handshake failed");
+                }
+            }
+        });
+    }
+}
+
+/// 启动 HTTP 服务 + 可选地向 target 握手 + M5 gossip 扩展
 #[tauri::command]
 pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
     let state: Arc<AppState> = Arc::clone(app.state::<Arc<AppState>>().inner());
-    let (password, device_id, device_name, port) = {
+    let (device_id, device_name, port) = {
         let cfg = state.config.read();
         (
-            cfg.password.clone(),
             cfg.device_id.clone(),
             cfg.device_name.clone(),
             cfg.port,
         )
     };
-    if password.is_empty() {
-        return Err("请先在设置里填写密码".into());
-    }
     let target = target.trim().to_string();
 
     start_server_if_needed(Arc::clone(&state), app.clone()).await;
 
-    // 无 target：只上线等别人连
     if target.is_empty() {
         *state.status.write() = ConnectionStatus::Listening;
         let _ = app.emit("status-updated", ());
@@ -177,10 +203,10 @@ pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
     *state.status.write() = ConnectionStatus::Connecting;
     let _ = app.emit("status-updated", ());
 
-    match network::client::handshake(&target, &password, &device_id, &device_name, port).await {
-        Ok(peer) => {
-            let normalized = peer.addr.clone();
-            state.peers.upsert(peer);
+    match network::client::handshake(&target, &device_id, &device_name, port).await {
+        Ok(result) => {
+            let normalized = result.peer.addr.clone();
+            state.peers.upsert(result.peer);
             crate::state::update_status_connected(&state);
             {
                 let mut cfg = state.config.write();
@@ -188,12 +214,21 @@ pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
                 let _ = cfg.save();
             }
             let _ = app.emit("status-updated", ());
+
+            // M5: 自动握手对方告诉我的其它 peer
+            spawn_gossip_handshakes(
+                Arc::clone(&state),
+                app.clone(),
+                result.gossip_peers,
+                device_id,
+                device_name,
+                port,
+            );
             Ok(())
         }
         Err(e) => {
             let msg = format!("{:#}", e);
             tracing::warn!(error = %msg, "handshake failed");
-            // 握手失败时，服务端仍然是 Listening 状态（已经起来了）
             *state.status.write() = ConnectionStatus::Listening;
             let _ = app.emit("status-updated", ());
             Err(msg)
@@ -201,7 +236,33 @@ pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
     }
 }
 
-/// 响应握手审批：前端弹框里点「同意/拒绝」后调用
+#[tauri::command]
+pub fn leave_group(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> Result<(), String> {
+    state.peers.clear();
+    if let Some(tx) = state.server_shutdown.lock().take() {
+        let _ = tx.send(());
+    }
+    *state.status.write() = ConnectionStatus::Idle;
+    let _ = app.emit("status-updated", ());
+    Ok(())
+}
+
+/// 完全退出 app（会先下线）
+#[tauri::command]
+pub async fn quit_app(app: AppHandle) {
+    let state: Arc<AppState> = Arc::clone(app.state::<Arc<AppState>>().inner());
+    state.peers.clear();
+    if let Some(tx) = state.server_shutdown.lock().take() {
+        let _ = tx.send(());
+    }
+    // 让 server 优雅关闭
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    app.exit(0);
+}
+
 #[tauri::command]
 pub fn respond_handshake(
     state: State<'_, Arc<AppState>>,
@@ -214,13 +275,6 @@ pub fn respond_handshake(
     }
 }
 
-/// 返回本机在局域网中对外表现的 IPv4。
-///
-/// 策略：枚举所有网卡，过滤虚拟/回环/链路本地/benchmark 段，按优先级排序：
-///   1. 192.168/16  (家用/办公 WiFi / 小型路由器 NAT)
-///   2. 10/8        (大型企业网 / 某些运营商内网)
-///   3. 172.16/12   (Docker/WSL/Hyper-V 同段；真实 LAN 较少用)
-///   4. 其它非公网
 #[tauri::command]
 pub fn get_local_ip() -> Option<String> {
     use std::net::IpAddr;
@@ -232,7 +286,6 @@ pub fn get_local_ip() -> Option<String> {
         if iface.is_loopback() {
             continue;
         }
-        // 过滤常见虚拟网卡名（大小写不敏感）
         let name_lc = iface.name.to_lowercase();
         let looks_virtual = name_lc.contains("vethernet")
             || name_lc.contains("wsl")
@@ -240,9 +293,9 @@ pub fn get_local_ip() -> Option<String> {
             || name_lc.contains("vmware")
             || name_lc.contains("hyper-v")
             || name_lc.contains("docker")
-            || name_lc.starts_with("utun")    // macOS VPN 隧道
-            || name_lc.starts_with("awdl")    // Apple Wireless Direct Link
-            || name_lc.starts_with("llw")     // macOS link-local wireless
+            || name_lc.starts_with("utun")
+            || name_lc.starts_with("awdl")
+            || name_lc.starts_with("llw")
             || name_lc.contains("virtual")
             || name_lc.contains("loopback");
         if looks_virtual {
@@ -251,7 +304,6 @@ pub fn get_local_ip() -> Option<String> {
 
         let IpAddr::V4(v4) = iface.ip() else { continue };
         let [a, b, _, _] = v4.octets();
-
         if a == 169 && b == 254 {
             continue;
         }
@@ -259,7 +311,6 @@ pub fn get_local_ip() -> Option<String> {
             continue;
         }
 
-        // 细化优先级
         let priority: u8 = if a == 192 && b == 168 {
             0
         } else if a == 10 {
@@ -278,18 +329,4 @@ pub fn get_local_ip() -> Option<String> {
         }
     }
     best.map(|(_, s)| s)
-}
-
-#[tauri::command]
-pub fn leave_group(
-    state: State<'_, Arc<AppState>>,
-    app: AppHandle,
-) -> Result<(), String> {
-    state.peers.clear();
-    if let Some(tx) = state.server_shutdown.lock().take() {
-        let _ = tx.send(());
-    }
-    *state.status.write() = ConnectionStatus::Idle;
-    let _ = app.emit("status-updated", ());
-    Ok(())
 }

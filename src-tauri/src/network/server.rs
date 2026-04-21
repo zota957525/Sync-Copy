@@ -10,7 +10,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::oneshot;
 
-use super::protocol::{ClipboardReq, HandshakeReq, HandshakeResp};
+use super::protocol::{ClipboardReq, HandshakeReq, HandshakeResp, PeerPublic};
 use crate::{
     clipboard::ClipboardCmd,
     history::Source,
@@ -18,7 +18,6 @@ use crate::{
     state::AppState,
 };
 
-/// 前端审批超时：服务端收到握手后最多等这么久
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
@@ -41,14 +40,31 @@ pub async fn run(
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "HTTP server listening");
-    // 关键：把 SocketAddr 作为 ConnectInfo 注入，handler 才能读到对端 IP
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async move {
-            let _ = shutdown.await;
-            tracing::info!("HTTP server shutting down");
-        })
-        .await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown.await;
+        tracing::info!("HTTP server shutting down");
+    })
+    .await?;
     Ok(())
+}
+
+/// 把 PeerRegistry 的快照转成公开结构，排除指定 device_id（避免告诉请求方它自己）
+fn peer_list_excluding(state: &AppState, exclude_id: &str) -> Vec<PeerPublic> {
+    state
+        .peers
+        .snapshot()
+        .into_iter()
+        .filter(|p| p.device_id != exclude_id)
+        .map(|p| PeerPublic {
+            device_id: p.device_id,
+            device_name: p.device_name,
+            addr: p.addr,
+        })
+        .collect()
 }
 
 async fn handle_handshake(
@@ -56,27 +72,17 @@ async fn handle_handshake(
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
     Json(req): Json<HandshakeReq>,
 ) -> Result<Json<HandshakeResp>, StatusCode> {
-    // 从 TCP 连接里拿对端 IP，结合请求里的 listen_port 拼出可回连地址
-    // 这样即使发起方不知道自己 LAN IP（有 VPN/多网卡）也能正确回连
     let peer_addr = SocketAddr::new(remote.ip(), req.listen_port).to_string();
 
-    // 1. 密码校验（快速，不打扰用户）
-    let (my_id, my_name, my_pwd) = {
+    let (my_id, my_name) = {
         let cfg = ctx.state.config.read();
-        (
-            cfg.device_id.clone(),
-            cfg.device_name.clone(),
-            cfg.password.clone(),
-        )
+        (cfg.device_id.clone(), cfg.device_name.clone())
     };
-    if req.password != my_pwd {
-        tracing::warn!(remote = %req.device_name, "handshake password mismatch");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
     if req.device_id == my_id {
         return Err(StatusCode::CONFLICT);
     }
-    // 已经是已知 peer 就直接通过（但更新地址，以防对方换了 IP）
+
+    // 已经是已知 peer：更新地址，直接通过（幂等），把当前 peers 列表给它做 gossip 同步
     let known = ctx
         .state
         .peers
@@ -92,10 +98,11 @@ async fn handle_handshake(
         return Ok(Json(HandshakeResp {
             device_id: my_id,
             device_name: my_name,
+            peers: peer_list_excluding(&ctx.state, &req.device_id),
         }));
     }
 
-    // 2. 生成 request_id，挂 oneshot，发事件给前端
+    // 新设备：走审批流程
     let request_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = oneshot::channel::<bool>();
     {
@@ -110,13 +117,11 @@ async fn handle_handshake(
             "device_name": req.device_name,
         }),
     );
-    tracing::info!(peer = %req.device_name, "handshake pending user approval");
+    tracing::info!(peer = %req.device_name, addr = %peer_addr, "handshake pending user approval");
 
-    // 3. 最多等 30 秒
     let approved = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
         Ok(Ok(ok)) => ok,
         _ => {
-            // 超时或 sender drop：清理挂起项，返回 408
             ctx.state.pending_approvals.lock().remove(&request_id);
             tracing::warn!(peer = %req.device_name, "handshake approval timed out");
             return Err(StatusCode::REQUEST_TIMEOUT);
@@ -128,7 +133,6 @@ async fn handle_handshake(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // 4. 通过：登记 peer（使用拼好的可回连地址）
     ctx.state.peers.upsert(Peer {
         device_id: req.device_id.clone(),
         device_name: req.device_name.clone(),
@@ -141,6 +145,7 @@ async fn handle_handshake(
     Ok(Json(HandshakeResp {
         device_id: my_id,
         device_name: my_name,
+        peers: peer_list_excluding(&ctx.state, &req.device_id),
     }))
 }
 
@@ -148,11 +153,19 @@ async fn handle_clipboard(
     State(ctx): State<ServerCtx>,
     Json(req): Json<ClipboardReq>,
 ) -> Result<StatusCode, StatusCode> {
-    let my_pwd = ctx.state.config.read().password.clone();
-    if req.password != my_pwd {
-        return Err(StatusCode::UNAUTHORIZED);
+    // 只接受已认证过（=已通过握手审批）的 peer 的剪切板推送
+    let known = ctx
+        .state
+        .peers
+        .snapshot()
+        .iter()
+        .any(|p| p.device_id == req.origin_device_id);
+    if !known {
+        return Err(StatusCode::FORBIDDEN);
     }
-    if req.origin_device_id == ctx.state.config.read().device_id {
+
+    let my_id = ctx.state.config.read().device_id.clone();
+    if req.origin_device_id == my_id {
         return Ok(StatusCode::OK);
     }
     if !ctx.state.seen_seq_and_update(&req.origin_device_id, req.seq) {
