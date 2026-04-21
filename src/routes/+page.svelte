@@ -291,14 +291,18 @@
     }
   });
 
-  const canJoin = $derived.by(
-    () => status.kind === "idle" || status.kind === "error"
-  );
+  // 是否可以主动发起握手加入（连接过程中不行）
+  const canJoin = $derived.by(() => status.kind !== "connecting");
+  // 服务器是否在跑（listening/connecting/connected 都算）
   const isOnline = $derived.by(
     () =>
       status.kind === "listening" ||
       status.kind === "connecting" ||
       status.kind === "connected"
+  );
+  // 是否需要手动上线（服务器没起 + 不是正在连）
+  const needGoOnline = $derived.by(
+    () => status.kind === "idle" || status.kind === "error"
   );
 
   function timeAgo(ms: number): string {
@@ -326,19 +330,27 @@
     <span class="dot" data-tauri-drag-region style="background:{statusColor}"></span>
     <span class="status" data-tauri-drag-region>{statusText}</span>
     {#if view === "main"}
-      {#if canJoin}
+      {#if needGoOnline}
         <button
           class="pill ghost-pill"
           onclick={goOnline}
           disabled={joining}
           title="只启动本机服务端，等别人连我">上线</button
         >
-        <button class="pill" onclick={openJoin} disabled={joining} title="主动连对方机器"
-          >加入</button
+      {/if}
+      {#if canJoin}
+        <button
+          class="pill"
+          onclick={openJoin}
+          disabled={joining}
+          title="主动连对方机器">加入</button
         >
-      {:else if isOnline}
-        <button class="pill ghost-pill" onclick={leave} title="下线并停止服务"
-          >下线</button
+      {/if}
+      {#if isOnline}
+        <button
+          class="pill ghost-pill"
+          onclick={leave}
+          title="下线并停止服务">下线</button
         >
       {/if}
       <button class="icon-btn" onclick={openSettings} title="本机设置">⚙</button>
