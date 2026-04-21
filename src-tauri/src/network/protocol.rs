@@ -55,3 +55,17 @@ pub struct ClipboardReq {
 fn default_kind() -> String {
     "text".to_string()
 }
+
+/// 文件传输请求（整份加密，5MB 上限）
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FileReq {
+    pub origin_device_id: String,
+    pub origin_device_name: String,
+    pub seq: u64,
+    /// 文件名（不含路径）
+    pub filename: String,
+    /// 明文字节数（用于前端弹框显示大小 & 服务端校验）
+    pub size: u64,
+    pub nonce: String,
+    pub ciphertext: String,
+}

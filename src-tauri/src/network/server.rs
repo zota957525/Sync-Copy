@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::StatusCode,
     routing::post,
     Json, Router,
@@ -12,13 +12,13 @@ use tokio::sync::oneshot;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
-use super::protocol::{ClipboardReq, HandshakeReq, HandshakeResp, PeerPublic};
+use super::protocol::{ClipboardReq, FileReq, HandshakeReq, HandshakeResp, PeerPublic};
 use crate::{
     clipboard::ClipboardCmd,
     crypto,
     history::Source,
     peer::Peer,
-    state::AppState,
+    state::{AppState, PendingFileSave},
 };
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -39,6 +39,9 @@ pub async fn run(
     let router: Router = Router::new()
         .route("/handshake", post(handle_handshake))
         .route("/clipboard", post(handle_clipboard))
+        .route("/file", post(handle_file))
+        // 放宽 body 上限：5MB 文件 + base64 膨胀 + JSON 开销，留到 8MB
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(ctx);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
@@ -251,4 +254,126 @@ async fn handle_clipboard(
     }
 
     Ok(StatusCode::OK)
+}
+
+const MAX_FILE_SIZE: u64 = 5 * 1024 * 1024;
+
+async fn handle_file(
+    State(ctx): State<ServerCtx>,
+    Json(req): Json<FileReq>,
+) -> Result<StatusCode, StatusCode> {
+    let key = match ctx.state.peer_keys.get(&req.origin_device_id) {
+        Some(k) => k,
+        None => return Err(StatusCode::FORBIDDEN),
+    };
+    if req.size > MAX_FILE_SIZE {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let plaintext = match crypto::decrypt(&key, &req.nonce, &req.ciphertext) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "file decrypt failed");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
+    if plaintext.len() as u64 != req.size {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // 剥离路径，防止对方发 "../../etc/passwd" 写到奇怪位置
+    let safe_name = sanitize_filename(&req.filename);
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = oneshot::channel::<bool>();
+    {
+        let mut pending = ctx.state.pending_file_saves.lock();
+        pending.insert(
+            request_id.clone(),
+            PendingFileSave {
+                filename: safe_name.clone(),
+                size: req.size,
+                origin_device_name: req.origin_device_name.clone(),
+                tx,
+            },
+        );
+    }
+    let _ = ctx.app.emit(
+        "file-pending",
+        serde_json::json!({
+            "request_id": request_id,
+            "filename": safe_name,
+            "size": req.size,
+            "origin_device_name": req.origin_device_name,
+        }),
+    );
+    tracing::info!(peer = %req.origin_device_name, file = %safe_name, size = req.size, "file pending user approval");
+
+    let approved = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
+        Ok(Ok(ok)) => ok,
+        _ => {
+            ctx.state.pending_file_saves.lock().remove(&request_id);
+            return Err(StatusCode::REQUEST_TIMEOUT);
+        }
+    };
+    if !approved {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // 写到 Downloads（如果不存在用临时目录兜底）
+    let target_dir = directories::UserDirs::new()
+        .and_then(|u| u.download_dir().map(std::path::PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir);
+    let dest = unique_path(&target_dir, &safe_name);
+    if let Err(e) = tokio::fs::write(&dest, &plaintext).await {
+        tracing::error!(error = %e, "write file failed");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    tracing::info!(dest = %dest.display(), "file saved");
+    let _ = ctx.app.emit(
+        "file-saved",
+        serde_json::json!({
+            "path": dest.to_string_lossy(),
+            "filename": safe_name,
+        }),
+    );
+
+    Ok(StatusCode::OK)
+}
+
+fn sanitize_filename(name: &str) -> String {
+    // 取 basename；去掉斜杠和反斜杠；限制长度
+    let base = std::path::Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !matches!(c, '/' | '\\' | '\0'))
+        .collect();
+    if cleaned.is_empty() {
+        "file".to_string()
+    } else if cleaned.len() > 200 {
+        cleaned.chars().take(200).collect()
+    } else {
+        cleaned
+    }
+}
+
+/// 如果目标文件已存在，追加 _1, _2 ...
+fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let full = dir.join(name);
+    if !full.exists() {
+        return full;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{}", e)),
+        None => (name.to_string(), String::new()),
+    };
+    for i in 1..1000 {
+        let candidate = dir.join(format!("{}_{}{}", stem, i, ext));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!("{}_{}{}", stem, uuid::Uuid::new_v4(), ext))
 }

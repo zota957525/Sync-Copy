@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 
-use super::protocol::{ClipboardReq, HandshakeReq, HandshakeResp, PeerPublic};
+use super::protocol::{ClipboardReq, FileReq, HandshakeReq, HandshakeResp, PeerPublic};
 use crate::{crypto, peer::Peer, state::AppState};
 
 fn build_client() -> anyhow::Result<reqwest::Client> {
@@ -159,4 +159,81 @@ pub async fn broadcast_text(state: Arc<AppState>, text: String) {
 /// 广播图片（PNG 字节流）
 pub async fn broadcast_image(state: Arc<AppState>, png: Vec<u8>, width: u32, height: u32) {
     broadcast_payload(state, png, "image_png", Some(width), Some(height)).await
+}
+
+/// 广播文件：返回 (成功数, 总 peer 数)
+pub async fn broadcast_file(
+    state: Arc<AppState>,
+    filename: String,
+    bytes: Vec<u8>,
+) -> (usize, usize) {
+    let (device_id, device_name, seq) = {
+        let cfg = state.config.read();
+        let seq = state.next_seq();
+        (cfg.device_id.clone(), cfg.device_name.clone(), seq)
+    };
+    let peers = state.peers.snapshot();
+    let total = peers.len();
+    if total == 0 {
+        return (0, 0);
+    }
+    let size = bytes.len() as u64;
+    // 文件上传可能慢些（5MB 在慢 WiFi 上可能几秒）+ 对方要点「保存」
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot build reqwest client for file");
+            return (0, total);
+        }
+    };
+
+    let mut handles = Vec::with_capacity(total);
+    for peer in peers {
+        let Some(key) = state.peer_keys.get(&peer.device_id) else {
+            tracing::warn!(peer = %peer.device_name, "no AES key for peer, skip file");
+            continue;
+        };
+        let Ok((nonce_b64, ct_b64)) = crypto::encrypt(&key, &bytes) else {
+            tracing::error!(peer = %peer.device_name, "encrypt file failed");
+            continue;
+        };
+        let body = FileReq {
+            origin_device_id: device_id.clone(),
+            origin_device_name: device_name.clone(),
+            seq,
+            filename: filename.clone(),
+            size,
+            nonce: nonce_b64,
+            ciphertext: ct_b64,
+        };
+        let url = format!("http://{}/file", peer.addr);
+        let client = client.clone();
+        let peer_name = peer.device_name.clone();
+        handles.push(tauri::async_runtime::spawn(async move {
+            match client.post(&url).json(&body).send().await {
+                Ok(r) if r.status().is_success() => true,
+                Ok(r) => {
+                    tracing::warn!(peer = %peer_name, status = %r.status(), "file send non-2xx");
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %peer_name, error = %e, "file send failed");
+                    false
+                }
+            }
+        }));
+    }
+
+    let mut ok_count = 0usize;
+    for h in handles {
+        if let Ok(true) = h.await {
+            ok_count += 1;
+        }
+    }
+    (ok_count, total)
 }

@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { onMount } from "svelte";
 
   type StatusKind =
@@ -47,6 +48,22 @@
   };
   let pendingApprovals = $state<PendingApproval[]>([]);
   let approvalCountdown = $state(30);
+
+  type PendingFile = {
+    request_id: string;
+    filename: string;
+    size: number;
+    origin_device_name: string;
+  };
+  let pendingFiles = $state<PendingFile[]>([]);
+  let dragOver = $state(false);
+  let sendingFiles = $state(false);
+
+  function formatSize(n: number): string {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  }
 
   let form = $state<ConfigView>({
     port: 5858,
@@ -181,6 +198,28 @@
     pendingApprovals = pendingApprovals.filter((p) => p.request_id !== request_id);
   }
 
+  async function respondFile(request_id: string, accept: boolean) {
+    try {
+      await invoke("respond_file_save", { requestId: request_id, accept });
+    } catch (e) {
+      console.warn("respond_file_save failed", e);
+    }
+    pendingFiles = pendingFiles.filter((p) => p.request_id !== request_id);
+  }
+
+  async function handleDroppedFiles(paths: string[]) {
+    if (paths.length === 0) return;
+    sendingFiles = true;
+    try {
+      const report = (await invoke("send_files", { paths })) as string;
+      banner = report;
+    } catch (e) {
+      banner = "发送失败: " + e;
+    } finally {
+      sendingFiles = false;
+    }
+  }
+
   // ---- history actions ----
   async function deleteItem(id: string, ev: MouseEvent) {
     ev.stopPropagation();
@@ -241,6 +280,30 @@
     listen<PendingApproval>("handshake-pending", (e) => {
       pendingApprovals = [...pendingApprovals, e.payload];
     }).then((fn) => unlistenFns.push(fn));
+    listen<PendingFile>("file-pending", (e) => {
+      pendingFiles = [...pendingFiles, e.payload];
+    }).then((fn) => unlistenFns.push(fn));
+    listen<{ path: string; filename: string }>("file-saved", (e) => {
+      banner = `已保存 ${e.payload.filename}`;
+      setTimeout(() => {
+        if (banner && banner.startsWith("已保存")) banner = null;
+      }, 2500);
+    }).then((fn) => unlistenFns.push(fn));
+
+    // 拖文件到窗口 → 发送
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === "over" || event.payload.type === "enter") {
+          dragOver = true;
+        } else if (event.payload.type === "leave") {
+          dragOver = false;
+        } else if (event.payload.type === "drop") {
+          dragOver = false;
+          handleDroppedFiles(event.payload.paths);
+        }
+      })
+      .then((fn) => unlistenFns.push(fn));
+
     return () => {
       unlistenFns.forEach((fn) => fn());
     };
@@ -472,7 +535,7 @@
     </div>
   {/if}
 
-  <!-- 握手审批覆盖层：对方发起握手时弹这个，盖住整个浮窗直到用户做决定 -->
+  <!-- 握手审批覆盖层 -->
   {#if pendingApprovals.length > 0}
     {@const p = pendingApprovals[0]}
     <div class="approval-overlay">
@@ -494,6 +557,49 @@
         {#if pendingApprovals.length > 1}
           <div class="approval-queue">还有 {pendingApprovals.length - 1} 个待处理</div>
         {/if}
+      </div>
+    </div>
+  {:else if pendingFiles.length > 0}
+    <!-- 收到文件：另一种覆盖层 -->
+    {@const f = pendingFiles[0]}
+    <div class="approval-overlay">
+      <div class="approval-card">
+        <div class="approval-icon">📎</div>
+        <div class="approval-title">收到来自 {f.origin_device_name} 的文件</div>
+        <div class="approval-device">{f.filename}</div>
+        <div class="approval-hint">
+          {formatSize(f.size)} · 将保存到 Downloads
+        </div>
+        <div class="approval-actions">
+          <button class="ghost" onclick={() => respondFile(f.request_id, false)}
+            >拒绝</button
+          >
+          <button class="primary" onclick={() => respondFile(f.request_id, true)}
+            >保存</button
+          >
+        </div>
+        {#if pendingFiles.length > 1}
+          <div class="approval-queue">还有 {pendingFiles.length - 1} 个文件待处理</div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  <!-- 拖放视觉提示 -->
+  {#if dragOver}
+    <div class="drop-overlay">
+      <div class="drop-hint">
+        <div class="drop-icon">📤</div>
+        <div>松开即发送给所有设备</div>
+        <div class="drop-sub">单文件 ≤ 5 MB</div>
+      </div>
+    </div>
+  {/if}
+  {#if sendingFiles}
+    <div class="drop-overlay dim">
+      <div class="drop-hint">
+        <div class="drop-icon">⏳</div>
+        <div>发送中…</div>
       </div>
     </div>
   {/if}
@@ -962,5 +1068,40 @@
     font-size: 10px;
     color: #9ca3af;
     font-style: italic;
+  }
+
+  /* 拖放覆盖层 */
+  .drop-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(37, 99, 235, 0.25);
+    border: 2px dashed #60a5fa;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 90;
+    pointer-events: none;
+  }
+  .drop-overlay.dim {
+    background: rgba(0, 0, 0, 0.5);
+    border-style: solid;
+    border-color: rgba(255, 255, 255, 0.15);
+  }
+  .drop-hint {
+    text-align: center;
+    color: #f3f4f6;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .drop-icon {
+    font-size: 32px;
+    line-height: 1;
+    margin-bottom: 4px;
+  }
+  .drop-sub {
+    font-size: 10px;
+    color: #d1d5db;
+    opacity: 0.8;
   }
 </style>

@@ -320,6 +320,65 @@ pub fn respond_handshake(
 }
 
 #[tauri::command]
+pub fn respond_file_save(
+    state: State<'_, Arc<AppState>>,
+    request_id: String,
+    accept: bool,
+) {
+    let mut pending = state.pending_file_saves.lock();
+    if let Some(meta) = pending.remove(&request_id) {
+        let _ = meta.tx.send(accept);
+    }
+}
+
+const MAX_SEND_SIZE: u64 = 5 * 1024 * 1024;
+
+/// 前端拖文件到浮窗后调用，把每个文件发给所有 peer
+#[tauri::command]
+pub async fn send_files(app: AppHandle, paths: Vec<String>) -> Result<String, String> {
+    let state: Arc<AppState> = Arc::clone(app.state::<Arc<AppState>>().inner());
+    if state.peers.count() == 0 {
+        return Err("还没有连接的设备".into());
+    }
+
+    let mut reports = Vec::new();
+    for raw in paths {
+        let path = std::path::PathBuf::from(&raw);
+        if !path.is_file() {
+            reports.push(format!("{}: 不是文件或不存在，跳过", raw));
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let meta = match tokio::fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(e) => {
+                reports.push(format!("{}: 读取元信息失败 ({})", filename, e));
+                continue;
+            }
+        };
+        if meta.len() > MAX_SEND_SIZE {
+            reports.push(format!("{}: 超过 5MB 上限 ({} 字节)", filename, meta.len()));
+            continue;
+        }
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(e) => {
+                reports.push(format!("{}: 读取失败 ({})", filename, e));
+                continue;
+            }
+        };
+        let (ok, total) =
+            network::client::broadcast_file(Arc::clone(&state), filename.clone(), bytes).await;
+        reports.push(format!("{}: 已送达 {}/{} 台", filename, ok, total));
+    }
+    Ok(reports.join("\n"))
+}
+
+#[tauri::command]
 pub fn get_local_ip() -> Option<String> {
     use std::net::IpAddr;
 

@@ -69,8 +69,19 @@ pub struct AppState {
     /// 握手审批队列：服务端收到握手后挂在这里，等前端点「同意/拒绝」再继续
     pub pending_approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
 
+    /// 文件保存审批队列
+    pub pending_file_saves: Mutex<HashMap<String, PendingFileSave>>,
+
     /// 每个 peer 的对称加密密钥
     pub peer_keys: PeerKeys,
+}
+
+#[allow(dead_code)]
+pub struct PendingFileSave {
+    pub filename: String,
+    pub size: u64,
+    pub origin_device_name: String,
+    pub tx: oneshot::Sender<bool>,
 }
 
 impl AppState {
@@ -85,6 +96,7 @@ impl AppState {
             seq: AtomicU64::new(1),
             last_seen_seq: RwLock::new(HashMap::new()),
             pending_approvals: Mutex::new(HashMap::new()),
+            pending_file_saves: Mutex::new(HashMap::new()),
             peer_keys: PeerKeys::new(),
         })
     }
