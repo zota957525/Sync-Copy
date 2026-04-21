@@ -1,7 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::StatusCode,
     routing::post,
     Json, Router,
@@ -41,7 +41,8 @@ pub async fn run(
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "HTTP server listening");
-    axum::serve(listener, router)
+    // 关键：把 SocketAddr 作为 ConnectInfo 注入，handler 才能读到对端 IP
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async move {
             let _ = shutdown.await;
             tracing::info!("HTTP server shutting down");
@@ -52,8 +53,13 @@ pub async fn run(
 
 async fn handle_handshake(
     State(ctx): State<ServerCtx>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
     Json(req): Json<HandshakeReq>,
 ) -> Result<Json<HandshakeResp>, StatusCode> {
+    // 从 TCP 连接里拿对端 IP，结合请求里的 listen_port 拼出可回连地址
+    // 这样即使发起方不知道自己 LAN IP（有 VPN/多网卡）也能正确回连
+    let peer_addr = SocketAddr::new(remote.ip(), req.listen_port).to_string();
+
     // 1. 密码校验（快速，不打扰用户）
     let (my_id, my_name, my_pwd) = {
         let cfg = ctx.state.config.read();
@@ -67,18 +73,22 @@ async fn handle_handshake(
         tracing::warn!(remote = %req.device_name, "handshake password mismatch");
         return Err(StatusCode::UNAUTHORIZED);
     }
-    // 自己不能加入自己
     if req.device_id == my_id {
         return Err(StatusCode::CONFLICT);
     }
-    // 已经是已知 peer 就直接通过（幂等）
-    if ctx
+    // 已经是已知 peer 就直接通过（但更新地址，以防对方换了 IP）
+    let known = ctx
         .state
         .peers
         .snapshot()
         .iter()
-        .any(|p| p.device_id == req.device_id)
-    {
+        .any(|p| p.device_id == req.device_id);
+    if known {
+        ctx.state.peers.upsert(Peer {
+            device_id: req.device_id.clone(),
+            device_name: req.device_name.clone(),
+            addr: peer_addr.clone(),
+        });
         return Ok(Json(HandshakeResp {
             device_id: my_id,
             device_name: my_name,
@@ -118,15 +128,15 @@ async fn handle_handshake(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // 4. 通过：登记 peer
+    // 4. 通过：登记 peer（使用拼好的可回连地址）
     ctx.state.peers.upsert(Peer {
         device_id: req.device_id.clone(),
         device_name: req.device_name.clone(),
-        addr: req.listen_addr.clone(),
+        addr: peer_addr.clone(),
     });
     crate::state::update_status_connected(&ctx.state);
     let _ = ctx.app.emit("status-updated", ());
-    tracing::info!(peer = %req.device_name, "peer approved and joined");
+    tracing::info!(peer = %req.device_name, addr = %peer_addr, "peer approved and joined");
 
     Ok(Json(HandshakeResp {
         device_id: my_id,

@@ -44,7 +44,7 @@ pub async fn handshake(
         password: my_password.to_string(),
         device_id: my_device_id.to_string(),
         device_name: my_device_name.to_string(),
-        listen_addr: format!("0.0.0.0:{}", my_listen_port),
+        listen_port: my_listen_port,
     };
     let client = build_client()?;
     // 对方要等用户点"同意/拒绝"，给足 35 秒（服务端审批超时是 30s）

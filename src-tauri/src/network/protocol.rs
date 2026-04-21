@@ -7,8 +7,9 @@ pub struct HandshakeReq {
     pub password: String,
     pub device_id: String,
     pub device_name: String,
-    /// 对方应当如何回连我（我的 "ip:port"，ip 由调用方填 LAN IP）
-    pub listen_addr: String,
+    /// 本机 HTTP 服务端口。IP 由服务端从 TCP 连接信息中提取
+    /// （避免发起方不知道自己真实 LAN IP 的问题）
+    pub listen_port: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
