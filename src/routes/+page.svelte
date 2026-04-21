@@ -160,6 +160,20 @@
     }
   }
 
+  async function goOnline() {
+    banner = null;
+    joining = true;
+    try {
+      // 空 target = 仅上线，等别人连我
+      await invoke("join_group", { target: "" });
+    } catch (e) {
+      banner = String(e);
+    } finally {
+      joining = false;
+      await refreshStatus();
+    }
+  }
+
   async function leave() {
     try {
       await invoke("leave_group");
@@ -313,9 +327,17 @@
     <span class="status" data-tauri-drag-region>{statusText}</span>
     {#if view === "main"}
       {#if canJoin}
-        <button class="pill" onclick={openJoin} disabled={joining}>加入</button>
+        <button
+          class="pill ghost-pill"
+          onclick={goOnline}
+          disabled={joining}
+          title="只启动本机服务端，等别人连我">上线</button
+        >
+        <button class="pill" onclick={openJoin} disabled={joining} title="主动连对方机器"
+          >加入</button
+        >
       {:else if isOnline}
-        <button class="pill ghost-pill" onclick={leave} title="从小组下线并停止服务"
+        <button class="pill ghost-pill" onclick={leave} title="下线并停止服务"
           >下线</button
         >
       {/if}

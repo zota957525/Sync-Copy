@@ -95,7 +95,10 @@ pub fn clear_history(state: State<'_, Arc<AppState>>, app: AppHandle) {
     let _ = app.emit("history-updated", ());
 }
 
-/// 启动 HTTP 服务 + 握手到对方机器。target 必填，由前端 Join 对话框传入
+/// 启动 HTTP 服务 + 可选地向 target 握手。
+///
+/// - target 为空：仅上线（等别人来连我）
+/// - target 非空：上线 + 主动握手对方
 #[tauri::command]
 pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
     let state: Arc<AppState> = Arc::clone(app.state::<Arc<AppState>>().inner());
@@ -112,9 +115,6 @@ pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
         return Err("请先在设置里填写密码".into());
     }
     let target = target.trim().to_string();
-    if target.is_empty() {
-        return Err("请输入对方机器地址（ip:port）".into());
-    }
 
     // 启动本机 server（如果还没启动）
     let already_running = state.server_shutdown.lock().is_some();
@@ -135,6 +135,13 @@ pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
 
+    // 无 target：只上线等别人连
+    if target.is_empty() {
+        *state.status.write() = ConnectionStatus::Listening;
+        let _ = app.emit("status-updated", ());
+        return Ok(());
+    }
+
     *state.status.write() = ConnectionStatus::Connecting;
     let _ = app.emit("status-updated", ());
 
@@ -143,7 +150,6 @@ pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
             let normalized = peer.addr.clone();
             state.peers.upsert(peer);
             crate::state::update_status_connected(&state);
-            // 握手成功，把 target 存为 peer_hint（下次加入对话框默认填这个）
             {
                 let mut cfg = state.config.write();
                 cfg.peer_hint = Some(normalized);
@@ -155,7 +161,8 @@ pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
         Err(e) => {
             let msg = format!("{:#}", e);
             tracing::warn!(error = %msg, "handshake failed");
-            *state.status.write() = ConnectionStatus::Error { message: msg.clone() };
+            // 握手失败时，服务端仍然是 Listening 状态（已经起来了）
+            *state.status.write() = ConnectionStatus::Listening;
             let _ = app.emit("status-updated", ());
             Err(msg)
         }
@@ -177,9 +184,11 @@ pub fn respond_handshake(
 
 /// 返回本机在局域网中对外表现的 IPv4。
 ///
-/// 之前用 `UdpSocket::connect("8.8.8.8:80")` 让 OS 选路的套路，在有 Clash/VPN
-/// 劫持了 DNS 或 198.18.0.0/15 路由时会返回 fake-IP（比如 198.18.0.1），
-/// 所以改为枚举所有网卡，过滤回环/链路本地/benchmark 段，优先返回 RFC1918 私网地址。
+/// 策略：枚举所有网卡，过滤虚拟/回环/链路本地/benchmark 段，按优先级排序：
+///   1. 192.168/16  (家用/办公 WiFi / 小型路由器 NAT)
+///   2. 10/8        (大型企业网 / 某些运营商内网)
+///   3. 172.16/12   (Docker/WSL/Hyper-V 同段；真实 LAN 较少用)
+///   4. 其它非公网
 #[tauri::command]
 pub fn get_local_ip() -> Option<String> {
     use std::net::IpAddr;
@@ -191,23 +200,44 @@ pub fn get_local_ip() -> Option<String> {
         if iface.is_loopback() {
             continue;
         }
+        // 过滤常见虚拟网卡名（大小写不敏感）
+        let name_lc = iface.name.to_lowercase();
+        let looks_virtual = name_lc.contains("vethernet")
+            || name_lc.contains("wsl")
+            || name_lc.contains("virtualbox")
+            || name_lc.contains("vmware")
+            || name_lc.contains("hyper-v")
+            || name_lc.contains("docker")
+            || name_lc.starts_with("utun")    // macOS VPN 隧道
+            || name_lc.starts_with("awdl")    // Apple Wireless Direct Link
+            || name_lc.starts_with("llw")     // macOS link-local wireless
+            || name_lc.contains("virtual")
+            || name_lc.contains("loopback");
+        if looks_virtual {
+            continue;
+        }
+
         let IpAddr::V4(v4) = iface.ip() else { continue };
         let [a, b, _, _] = v4.octets();
 
-        // 169.254/16 自动专用（APIPA）—— 未拿到 DHCP 时才有
         if a == 169 && b == 254 {
             continue;
         }
-        // 198.18/15 benchmarking 段 —— Clash fake-IP / 网卡测试常用
         if a == 198 && (b == 18 || b == 19) {
             continue;
         }
 
-        // 优先级：RFC1918 私网 > 其它
-        let is_private = (a == 192 && b == 168)
-            || a == 10
-            || (a == 172 && (16..=31).contains(&b));
-        let priority: u8 = if is_private { 0 } else { 1 };
+        // 细化优先级
+        let priority: u8 = if a == 192 && b == 168 {
+            0
+        } else if a == 10 {
+            1
+        } else if a == 172 && (16..=31).contains(&b) {
+            2
+        } else {
+            3
+        };
+
         let ip_str = v4.to_string();
         match &best {
             None => best = Some((priority, ip_str)),

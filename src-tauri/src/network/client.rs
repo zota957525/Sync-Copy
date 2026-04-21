@@ -7,6 +7,10 @@ use crate::{peer::Peer, state::AppState};
 
 fn build_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
+        // 关键：LAN 直连，必须绕过系统 HTTP 代理
+        // 否则 Clash/ClashX / HTTP_PROXY 环境变量会拦截 http://192.168.x.x
+        // 返回 502/503 "Bad Gateway" 或直接黑洞
+        .no_proxy()
         .timeout(Duration::from_secs(5))
         .connect_timeout(Duration::from_secs(3))
         .build()
