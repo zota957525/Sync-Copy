@@ -1,6 +1,7 @@
 mod clipboard;
 mod commands;
 mod config;
+mod crypto;
 mod history;
 mod network;
 mod peer;

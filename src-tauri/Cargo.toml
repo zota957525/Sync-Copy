@@ -29,3 +29,10 @@ axum = "0.8"
 # 让 reqwest 用系统默认 TLS 后端（Windows schannel / macOS SecureTransport），避免 rustls 在 Windows 的 crypto provider 坑
 reqwest = { version = "0.12", features = ["json"] }
 if-addrs = "0.13"
+# --- crypto (M4: per-pair X25519 ECDH + HKDF-SHA256 → AES-256-GCM) ---
+x25519-dalek = "2"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"

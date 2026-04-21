@@ -1,15 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-/// 握手请求。没有密码字段——身份验证靠对方点「同意」
+/// 握手请求：没有密码，身份由对方点「同意」决定
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HandshakeReq {
     pub device_id: String,
     pub device_name: String,
     /// 本机 HTTP 服务端口；IP 由服务端从 TCP 连接信息提取
     pub listen_port: u16,
+    /// 我的 X25519 临时公钥（32 字节，base64）—— 用于端到端加密密钥协商
+    pub pubkey: String,
 }
 
-/// 公开的 peer 信息（用于 gossip）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerPublic {
     pub device_id: String,
@@ -21,16 +22,21 @@ pub struct PeerPublic {
 pub struct HandshakeResp {
     pub device_id: String,
     pub device_name: String,
-    /// 当前节点已知的其它 peer 列表。新节点收到后会自动去握手这些
-    /// 以形成完整 mesh：连上一个 == 连上整个组
+    /// 当前节点已知的其它 peer 列表（用于 gossip 形成完整 mesh）
     #[serde(default)]
     pub peers: Vec<PeerPublic>,
+    /// 我的 X25519 临时公钥（32 字节，base64）
+    pub pubkey: String,
 }
 
+/// 剪切板推送：内容经 AES-256-GCM 加密
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClipboardReq {
     pub origin_device_id: String,
     pub origin_device_name: String,
     pub seq: u64,
-    pub text: String,
+    /// 12 字节随机 nonce，base64
+    pub nonce: String,
+    /// AES-GCM 密文（含 tag），base64
+    pub ciphertext: String,
 }

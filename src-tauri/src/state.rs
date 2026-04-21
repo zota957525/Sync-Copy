@@ -8,6 +8,29 @@ use tokio::sync::oneshot;
 
 use crate::{clipboard::ClipboardCmd, config::Config, history::History, peer::PeerRegistry};
 
+/// 每个 peer 对应的对称密钥（X25519 ECDH → HKDF → AES-256-GCM key）
+/// 只存内存，进程重启后丢失，下次握手重新协商
+pub struct PeerKeys {
+    keys: RwLock<HashMap<String, [u8; 32]>>,
+}
+
+impl PeerKeys {
+    pub fn new() -> Self {
+        Self {
+            keys: RwLock::new(HashMap::new()),
+        }
+    }
+    pub fn set(&self, device_id: String, key: [u8; 32]) {
+        self.keys.write().insert(device_id, key);
+    }
+    pub fn get(&self, device_id: &str) -> Option<[u8; 32]> {
+        self.keys.read().get(device_id).copied()
+    }
+    pub fn clear(&self) {
+        self.keys.write().clear();
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConnectionStatus {
@@ -45,6 +68,9 @@ pub struct AppState {
 
     /// 握手审批队列：服务端收到握手后挂在这里，等前端点「同意/拒绝」再继续
     pub pending_approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+
+    /// 每个 peer 的对称加密密钥
+    pub peer_keys: PeerKeys,
 }
 
 impl AppState {
@@ -59,6 +85,7 @@ impl AppState {
             seq: AtomicU64::new(1),
             last_seen_seq: RwLock::new(HashMap::new()),
             pending_approvals: Mutex::new(HashMap::new()),
+            peer_keys: PeerKeys::new(),
         })
     }
 

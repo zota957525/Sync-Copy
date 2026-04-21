@@ -165,7 +165,9 @@ fn spawn_gossip_handshakes(
             tracing::info!(addr = %addr, name = %peer_name, "gossip: attempting handshake");
             match network::client::handshake(&addr, &dev_id, &dev_name, port).await {
                 Ok(result) => {
+                    let peer_id = result.peer.device_id.clone();
                     state_c.peers.upsert(result.peer);
+                    state_c.peer_keys.set(peer_id, result.aes_key);
                     crate::state::update_status_connected(&state_c);
                     let _ = app_c.emit("status-updated", ());
                     // 不递归进一步 gossip —— 简单起见停在一跳
@@ -206,7 +208,9 @@ pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
     match network::client::handshake(&target, &device_id, &device_name, port).await {
         Ok(result) => {
             let normalized = result.peer.addr.clone();
+            let peer_id = result.peer.device_id.clone();
             state.peers.upsert(result.peer);
+            state.peer_keys.set(peer_id, result.aes_key);
             crate::state::update_status_connected(&state);
             {
                 let mut cfg = state.config.write();
@@ -242,6 +246,7 @@ pub fn leave_group(
     app: AppHandle,
 ) -> Result<(), String> {
     state.peers.clear();
+    state.peer_keys.clear();
     if let Some(tx) = state.server_shutdown.lock().take() {
         let _ = tx.send(());
     }
@@ -255,10 +260,10 @@ pub fn leave_group(
 pub async fn quit_app(app: AppHandle) {
     let state: Arc<AppState> = Arc::clone(app.state::<Arc<AppState>>().inner());
     state.peers.clear();
+    state.peer_keys.clear();
     if let Some(tx) = state.server_shutdown.lock().take() {
         let _ = tx.send(());
     }
-    // 让 server 优雅关闭
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     app.exit(0);
 }

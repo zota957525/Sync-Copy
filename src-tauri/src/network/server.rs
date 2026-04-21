@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 use super::protocol::{ClipboardReq, HandshakeReq, HandshakeResp, PeerPublic};
 use crate::{
     clipboard::ClipboardCmd,
+    crypto,
     history::Source,
     peer::Peer,
     state::AppState,
@@ -52,7 +53,6 @@ pub async fn run(
     Ok(())
 }
 
-/// 把 PeerRegistry 的快照转成公开结构，排除指定 device_id（避免告诉请求方它自己）
 fn peer_list_excluding(state: &AppState, exclude_id: &str) -> Vec<PeerPublic> {
     state
         .peers
@@ -74,6 +74,19 @@ async fn handle_handshake(
 ) -> Result<Json<HandshakeResp>, StatusCode> {
     let peer_addr = SocketAddr::new(remote.ip(), req.listen_port).to_string();
 
+    // 解析对方公钥
+    let their_pub = match crypto::pubkey_from_b64(&req.pubkey) {
+        Ok(pk) => pk,
+        Err(e) => {
+            tracing::warn!(error = %e, "bad pubkey in handshake");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    // 我自己的临时密钥对
+    let (my_secret, my_public) = crypto::new_ephemeral();
+    let my_pubkey_b64 = crypto::pubkey_to_b64(&my_public);
+
     let (my_id, my_name) = {
         let cfg = ctx.state.config.read();
         (cfg.device_id.clone(), cfg.device_name.clone())
@@ -82,7 +95,7 @@ async fn handle_handshake(
         return Err(StatusCode::CONFLICT);
     }
 
-    // 已经是已知 peer：更新地址，直接通过（幂等），把当前 peers 列表给它做 gossip 同步
+    // 已知 peer：直接更新，重新协商密钥
     let known = ctx
         .state
         .peers
@@ -90,15 +103,19 @@ async fn handle_handshake(
         .iter()
         .any(|p| p.device_id == req.device_id);
     if known {
+        let aes_key = crypto::derive_aes_key(my_secret, &their_pub);
+        ctx.state.peer_keys.set(req.device_id.clone(), aes_key);
         ctx.state.peers.upsert(Peer {
             device_id: req.device_id.clone(),
             device_name: req.device_name.clone(),
             addr: peer_addr.clone(),
         });
+        tracing::info!(peer = %req.device_name, addr = %peer_addr, "re-handshake with known peer, key refreshed");
         return Ok(Json(HandshakeResp {
             device_id: my_id,
             device_name: my_name,
             peers: peer_list_excluding(&ctx.state, &req.device_id),
+            pubkey: my_pubkey_b64,
         }));
     }
 
@@ -133,6 +150,9 @@ async fn handle_handshake(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    // 用户同意 → ECDH 派生共享 AES 密钥并持久化
+    let aes_key = crypto::derive_aes_key(my_secret, &their_pub);
+    ctx.state.peer_keys.set(req.device_id.clone(), aes_key);
     ctx.state.peers.upsert(Peer {
         device_id: req.device_id.clone(),
         device_name: req.device_name.clone(),
@@ -140,12 +160,13 @@ async fn handle_handshake(
     });
     crate::state::update_status_connected(&ctx.state);
     let _ = ctx.app.emit("status-updated", ());
-    tracing::info!(peer = %req.device_name, addr = %peer_addr, "peer approved and joined");
+    tracing::info!(peer = %req.device_name, addr = %peer_addr, "peer approved, key exchanged");
 
     Ok(Json(HandshakeResp {
         device_id: my_id,
         device_name: my_name,
         peers: peer_list_excluding(&ctx.state, &req.device_id),
+        pubkey: my_pubkey_b64,
     }))
 }
 
@@ -153,16 +174,14 @@ async fn handle_clipboard(
     State(ctx): State<ServerCtx>,
     Json(req): Json<ClipboardReq>,
 ) -> Result<StatusCode, StatusCode> {
-    // 只接受已认证过（=已通过握手审批）的 peer 的剪切板推送
-    let known = ctx
-        .state
-        .peers
-        .snapshot()
-        .iter()
-        .any(|p| p.device_id == req.origin_device_id);
-    if !known {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    // 必须是已协商密钥的 peer
+    let key = match ctx.state.peer_keys.get(&req.origin_device_id) {
+        Some(k) => k,
+        None => {
+            tracing::warn!(origin = %req.origin_device_id, "clipboard from unknown peer (no key)");
+            return Err(StatusCode::FORBIDDEN);
+        }
+    };
 
     let my_id = ctx.state.config.read().device_id.clone();
     if req.origin_device_id == my_id {
@@ -172,11 +191,26 @@ async fn handle_clipboard(
         return Ok(StatusCode::OK);
     }
 
+    // 解密
+    let plaintext_bytes = match crypto::decrypt(&key, &req.nonce, &req.ciphertext) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, origin = %req.origin_device_name, "clipboard decrypt failed");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
+    let text = match String::from_utf8(plaintext_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
     if ctx
         .state
         .history
         .push(
-            req.text.clone(),
+            text.clone(),
             Source::Remote {
                 device_name: req.origin_device_name.clone(),
             },
@@ -187,7 +221,7 @@ async fn handle_clipboard(
     }
 
     if let Some(tx) = ctx.state.clipboard_tx.lock().as_ref() {
-        let _ = tx.send(ClipboardCmd::SetSuppress(req.text));
+        let _ = tx.send(ClipboardCmd::SetSuppress(text));
     }
 
     Ok(StatusCode::OK)

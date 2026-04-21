@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Context;
 
 use super::protocol::{ClipboardReq, HandshakeReq, HandshakeResp, PeerPublic};
-use crate::{peer::Peer, state::AppState};
+use crate::{crypto, peer::Peer, state::AppState};
 
 fn build_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
@@ -23,13 +23,13 @@ pub fn normalize_addr(raw: &str) -> String {
         .to_string()
 }
 
-/// 一次握手的完整结果：对方的 Peer 信息 + 它告诉我的其它 peer（用于 gossip）
+/// 握手结果：对方 Peer 信息 + gossip 列表 + 协商好的 AES 密钥
 pub struct HandshakeResult {
     pub peer: Peer,
     pub gossip_peers: Vec<PeerPublic>,
+    pub aes_key: [u8; 32],
 }
 
-/// 向目标 addr 握手
 pub async fn handshake(
     target_addr: &str,
     my_device_id: &str,
@@ -41,10 +41,16 @@ pub async fn handshake(
         anyhow::bail!("加入目标格式不对，应该是 ip:port，例如 192.168.1.10:5858");
     }
     let url = format!("http://{}/handshake", target);
+
+    // 临时 X25519 密钥对
+    let (my_secret, my_public) = crypto::new_ephemeral();
+    let my_pubkey_b64 = crypto::pubkey_to_b64(&my_public);
+
     let req = HandshakeReq {
         device_id: my_device_id.to_string(),
         device_name: my_device_name.to_string(),
         listen_port: my_listen_port,
+        pubkey: my_pubkey_b64,
     };
     let client = build_client()?;
     let resp = client
@@ -57,6 +63,7 @@ pub async fn handshake(
     if !resp.status().is_success() {
         let status = resp.status();
         match status.as_u16() {
+            400 => anyhow::bail!("握手请求被对方视为无效（协议版本不匹配？）"),
             403 => anyhow::bail!("对方拒绝了你的加入请求"),
             408 => anyhow::bail!("对方没有在 30 秒内确认，请让对方点「同意」后重试"),
             409 => anyhow::bail!("冲突：device_id 与对方相同（可能是同一份配置复制到两台机器）"),
@@ -67,6 +74,11 @@ pub async fn handshake(
         }
     }
     let body: HandshakeResp = resp.json().await.context("解析握手响应 JSON 失败")?;
+
+    // 对方公钥 → 派生共享 AES 密钥
+    let their_pub = crypto::pubkey_from_b64(&body.pubkey).context("对方返回的公钥无效")?;
+    let aes_key = crypto::derive_aes_key(my_secret, &their_pub);
+
     Ok(HandshakeResult {
         peer: Peer {
             device_id: body.device_id,
@@ -74,10 +86,11 @@ pub async fn handshake(
             addr: target,
         },
         gossip_peers: body.peers,
+        aes_key,
     })
 }
 
-/// 把文本广播给所有已知 peer
+/// 把文本加密后广播给所有已知 peer
 pub async fn broadcast_clipboard(state: Arc<AppState>, text: String) {
     let (device_id, device_name, seq) = {
         let cfg = state.config.read();
@@ -88,12 +101,6 @@ pub async fn broadcast_clipboard(state: Arc<AppState>, text: String) {
     if peers.is_empty() {
         return;
     }
-    let body = ClipboardReq {
-        origin_device_id: device_id,
-        origin_device_name: device_name,
-        seq,
-        text,
-    };
     let client = match build_client() {
         Ok(c) => c,
         Err(e) => {
@@ -101,9 +108,31 @@ pub async fn broadcast_clipboard(state: Arc<AppState>, text: String) {
             return;
         }
     };
+    let plaintext = text.as_bytes().to_vec();
     for peer in peers {
+        // 为每个 peer 单独加密（各自的 AES 密钥不同）
+        let key = match state.peer_keys.get(&peer.device_id) {
+            Some(k) => k,
+            None => {
+                tracing::warn!(peer = %peer.device_name, "no AES key for peer, skip broadcast");
+                continue;
+            }
+        };
+        let (nonce_b64, ct_b64) = match crypto::encrypt(&key, &plaintext) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, peer = %peer.device_name, "encrypt failed");
+                continue;
+            }
+        };
+        let body = ClipboardReq {
+            origin_device_id: device_id.clone(),
+            origin_device_name: device_name.clone(),
+            seq,
+            nonce: nonce_b64,
+            ciphertext: ct_b64,
+        };
         let url = format!("http://{}/clipboard", peer.addr);
-        let body = body.clone();
         let client = client.clone();
         tauri::async_runtime::spawn(async move {
             match client.post(&url).json(&body).send().await {
