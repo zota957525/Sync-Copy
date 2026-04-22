@@ -581,15 +581,6 @@
     }
   }
 
-  function onHeaderMouseDown(ev: MouseEvent) {
-    if (ev.button !== 0) return;
-    const t = ev.target as HTMLElement;
-    if (t.closest("button") || t.closest("input")) return;
-    getCurrentWindow().startDragging().catch((e) =>
-      console.warn("startDragging failed:", e)
-    );
-  }
-
   // 挂载时防御：如果窗口已是球大小但 collapsed=false（可能 HMR 重建了组件
   // 但 OS 窗口还是球），把它恢复成默认大小，避免正常 UI 挤在 48×48 里没法用
   async function restoreIfStuckSmall() {
@@ -656,6 +647,12 @@
         }
       })
       .then((fn) => unlistenFns.push(fn));
+
+    // 每 3 秒拉一次状态，防止 push 事件丢失导致计数不准
+    const statusPoll = window.setInterval(() => {
+      void refreshStatus();
+    }, 3000);
+    unlistenFns.push(() => clearInterval(statusPoll));
 
     // 窗口位置变化：用户拖拽结束后检测是否吸附到屏幕边缘
     getCurrentWindow()
@@ -763,7 +760,7 @@
       alt="Sync Copy"
       draggable="false"
     />
-    <div class="ball-status-dot" style="background:{statusColor}"></div>
+    <div class="ball-count" style="background:{statusColor}">{groupTotal}</div>
     {#if pendingApprovals.length + pendingFiles.length > 0}
       <div class="ball-badge">{pendingApprovals.length + pendingFiles.length}</div>
     {/if}
@@ -783,7 +780,6 @@
   <div
     class="header"
     data-tauri-drag-region
-    onmousedown={onHeaderMouseDown}
     ondblclick={(e) => e.preventDefault()}
   >
     <span class="dot" data-tauri-drag-region style="background:{statusColor}"></span>
@@ -914,9 +910,8 @@
     <div class="brand">Powered by Tao</div>
   {:else if view === "settings"}
     <div class="panel scrollable">
-      <div class="section-title">本机</div>
       <label>
-        <span>设备名</span>
+        <span>本机设备名</span>
         <input type="text" bind:value={form.device_name} />
       </label>
 
@@ -939,7 +934,9 @@
           autofocus
         />
       </label>
-      <div class="hint-row">密码相同才能连上；密码在「⚙ 本机设置」里</div>
+      <div class="hint-row">
+        在对方设备的浮窗左下角能看到它的 IP:PORT，点一下可复制
+      </div>
       <div class="btn-row">
         <button class="ghost" onclick={closeJoin} disabled={joining}>取消</button>
         <button class="primary" onclick={submitJoin} disabled={joining}>
@@ -1051,16 +1048,23 @@
     -webkit-user-drag: none;
     filter: drop-shadow(0 3px 8px rgba(0, 0, 0, 0.35));
   }
-  .ball-status-dot {
+  .ball-count {
     position: absolute;
-    bottom: 0;
-    right: 0;
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
+    bottom: -2px;
+    right: -2px;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 8px;
+    color: white;
+    font-size: 10px;
+    line-height: 16px;
+    font-weight: 600;
+    text-align: center;
     border: 2px solid #ffffff;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
     pointer-events: none;
+    font-variant-numeric: tabular-nums;
   }
   .ball-badge {
     position: absolute;
