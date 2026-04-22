@@ -5,6 +5,7 @@
     getCurrentWindow,
     PhysicalPosition,
     PhysicalSize,
+    LogicalSize,
     currentMonitor,
   } from "@tauri-apps/api/window";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -421,16 +422,19 @@
   }
 
   // ---- 悬浮球形态 ----
-  const BALL_SIZE = 56;
+  // 48 逻辑像素 ≈ 1.2cm（不同 DPI 下物理尺寸大致一致）
+  const BALL_SIZE = 48;
+  // 默认展开尺寸（首次无记录时用）
+  const DEFAULT_EXPANDED = { w: 320, h: 420 };
   let collapsed = $state(false);
-  let lastExpandedSize = { w: 320, h: 420 };
+  // 用逻辑像素存，setSize 也用 LogicalSize，避免 Retina 屏物理/逻辑混淆
+  let lastExpandedSize = { w: DEFAULT_EXPANDED.w, h: DEFAULT_EXPANDED.h };
 
   async function collapseToBall() {
-    // 如果是"滑出屏幕"状态，先滑回来再缩
+    console.log("[collapseToBall] enter");
     if (snapEdge && snapHidden) {
       await revealFromEdge();
     }
-    // 清空吸附 state
     snapEdge = null;
     snapHidden = false;
     if (hideTimer) {
@@ -438,29 +442,42 @@
       hideTimer = null;
     }
     const win = getCurrentWindow();
-    // 记录当前窗口尺寸，展开时恢复
+    // outerSize 返回物理像素；要转为逻辑像素记下来
     const sz = await win.outerSize();
-    lastExpandedSize = { w: sz.width, h: sz.height };
+    const scale = await win.scaleFactor();
+    lastExpandedSize = {
+      w: Math.round(sz.width / scale),
+      h: Math.round(sz.height / scale),
+    };
+    console.log("[collapseToBall] physical=", sz, "scale=", scale, "logical saved=", lastExpandedSize);
+
     programmaticMove = true;
-    await win.setSize(new PhysicalSize(BALL_SIZE, BALL_SIZE));
-    setTimeout(() => (programmaticMove = false), 200);
     collapsed = true;
+    // 用 LogicalSize：config 的 minWidth 也是逻辑像素，保持一致
+    await win.setSize(new LogicalSize(BALL_SIZE, BALL_SIZE));
+    console.log("[collapseToBall] setSize ok, now=", await win.outerSize());
+    setTimeout(() => (programmaticMove = false), 200);
   }
 
   async function expandFromBall() {
+    console.log("[expandFromBall] enter, lastExpandedSize=", lastExpandedSize);
     const win = getCurrentWindow();
-    const w = lastExpandedSize.w || 320;
-    const h = lastExpandedSize.h || 420;
+    const w = lastExpandedSize.w || DEFAULT_EXPANDED.w;
+    const h = lastExpandedSize.h || DEFAULT_EXPANDED.h;
     programmaticMove = true;
-    await win.setSize(new PhysicalSize(w, h));
+    collapsed = false;
+    await win.setSize(new LogicalSize(w, h));
+    console.log("[expandFromBall] setSize ok, now=", await win.outerSize());
+
     // 展开后如果超出屏幕，挪一下让它完全可见
     const pos = await win.outerPosition();
+    const sz = await win.outerSize();
     const mon = await currentMonitor();
     if (mon) {
       let nx = pos.x;
       let ny = pos.y;
-      const maxX = mon.position.x + mon.size.width - w;
-      const maxY = mon.position.y + mon.size.height - h;
+      const maxX = mon.position.x + mon.size.width - sz.width;
+      const maxY = mon.position.y + mon.size.height - sz.height;
       if (nx > maxX) nx = maxX;
       if (ny > maxY) ny = maxY;
       if (nx < mon.position.x) nx = mon.position.x;
@@ -470,10 +487,9 @@
       }
     }
     setTimeout(() => (programmaticMove = false), 200);
-    collapsed = false;
   }
 
-  // 悬浮球上的鼠标：短按抬起 = 点击展开；移动超过 4px = 拖动窗口
+  // 悬浮球上的鼠标：短按抬起 = 点击展开；移动超过 8px = 拖动窗口
   function onBallMouseDown(ev: MouseEvent) {
     if (ev.button !== 0) return;
     const startX = ev.screenX;
@@ -484,7 +500,7 @@
     const onMove = (mv: MouseEvent) => {
       const dx = Math.abs(mv.screenX - startX);
       const dy = Math.abs(mv.screenY - startY);
-      if (!didDrag && (dx > 4 || dy > 4)) {
+      if (!didDrag && (dx > 8 || dy > 8)) {
         didDrag = true;
         cleanup();
         getCurrentWindow()
@@ -495,7 +511,8 @@
     const onUp = () => {
       cleanup();
       const elapsed = Date.now() - startAt;
-      if (!didDrag && elapsed < 500) {
+      console.log("[ball onUp] didDrag=", didDrag, "elapsed=", elapsed);
+      if (!didDrag && elapsed < 1500) {
         void expandFromBall();
       }
     };
@@ -507,9 +524,24 @@
     window.addEventListener("mouseup", onUp);
   }
 
+  // 双击兜底：万一 click-vs-drag 逻辑没识别到单击，双击必定展开
+  function onBallDblClick() {
+    console.log("[ball dblclick] → expand");
+    void expandFromBall();
+  }
+
   // 旧的 hide（托盘 OS 级隐藏）保留备用，但 `−` 按钮现在用 collapseToBall
   async function hideWindow() {
-    await collapseToBall();
+    console.log("[hideWindow] start, collapsed=", collapsed);
+    banner = "收缩中…";
+    try {
+      await collapseToBall();
+      console.log("[hideWindow] ok, collapsed=", collapsed);
+      banner = null;
+    } catch (e) {
+      console.error("[hideWindow] failed", e);
+      banner = "收缩失败: " + String(e);
+    }
   }
 
   // ---- misc ----
@@ -681,6 +713,7 @@
   <div
     class="ball"
     onmousedown={onBallMouseDown}
+    ondblclick={onBallDblClick}
     title="点击展开，拖动移动"
   >
     <div class="ball-status-dot" style="background:{statusColor}"></div>
@@ -979,32 +1012,32 @@
     transform: scale(0.95);
   }
   .ball-icon {
-    font-size: 24px;
+    font-size: 20px;
     line-height: 1;
     pointer-events: none;
   }
   .ball-status-dot {
     position: absolute;
-    bottom: 4px;
-    right: 4px;
-    width: 10px;
-    height: 10px;
+    bottom: 2px;
+    right: 2px;
+    width: 8px;
+    height: 8px;
     border-radius: 50%;
-    border: 2px solid rgba(30, 64, 175, 0.95);
+    border: 1.5px solid rgba(30, 64, 175, 0.95);
     pointer-events: none;
   }
   .ball-badge {
     position: absolute;
-    top: 2px;
-    right: 2px;
-    min-width: 16px;
-    height: 16px;
+    top: 1px;
+    right: 1px;
+    min-width: 14px;
+    height: 14px;
     padding: 0 3px;
-    border-radius: 8px;
+    border-radius: 7px;
     background: #ef4444;
     color: white;
-    font-size: 10px;
-    line-height: 16px;
+    font-size: 9px;
+    line-height: 14px;
     font-weight: 600;
     text-align: center;
     pointer-events: none;
