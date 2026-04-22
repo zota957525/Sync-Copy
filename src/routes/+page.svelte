@@ -119,28 +119,43 @@
   }
 
   // ---- settings view actions ----
+  // 打开设置时记录一下设备名的初始值，关闭时判断是否变化再决定要不要自动保存
+  let settingsInitialDeviceName = "";
+
   async function openSettings() {
     await loadConfig();
     await loadLocalIp();
+    settingsInitialDeviceName = form.device_name;
     view = "settings";
   }
 
   async function closeSettings() {
-    await loadConfig();
+    // 设备名变化了就自动保存；没变化直接丢弃（无副作用）
+    if (form.device_name.trim() && form.device_name !== settingsInitialDeviceName) {
+      try {
+        const update = {
+          port: form.port, // 保持不变
+          device_name: form.device_name.trim(),
+        };
+        form = (await invoke("set_config", { update })) as ConfigView;
+      } catch (e) {
+        banner = "保存设备名失败: " + e;
+      }
+    } else {
+      // 没改动，恢复原状
+      await loadConfig();
+    }
     view = "main";
   }
 
-  async function saveConfig() {
+  async function clearHistoryAndClose() {
     try {
-      const update = {
-        port: form.port,
-        device_name: form.device_name,
-      };
-      form = (await invoke("set_config", { update })) as ConfigView;
-      view = "main";
+      await invoke("clear_history");
     } catch (e) {
-      banner = "保存失败: " + e;
+      console.warn("clear_history failed", e);
     }
+    await refreshHistory();
+    view = "main";
   }
 
   async function quitApp() {
@@ -524,11 +539,6 @@
     window.addEventListener("mouseup", onUp);
   }
 
-  // 双击兜底：万一 click-vs-drag 逻辑没识别到单击，双击必定展开
-  function onBallDblClick() {
-    console.log("[ball dblclick] → expand");
-    void expandFromBall();
-  }
 
   // 旧的 hide（托盘 OS 级隐藏）保留备用，但 `−` 按钮现在用 collapseToBall
   async function hideWindow() {
@@ -553,6 +563,19 @@
       setTimeout(() => {
         if (banner === "本机地址已复制") banner = null;
       }, 1500);
+    } catch (e) {
+      console.warn("copy failed", e);
+    }
+  }
+
+  // 底部 IP:PORT 点击复制 + inline "已复制" 闪烁
+  let addrCopied = $state(false);
+  async function copyLocalAddrInline() {
+    if (!localIp) return;
+    try {
+      await navigator.clipboard.writeText(`${localIp}:${form.port}`);
+      addrCopied = true;
+      setTimeout(() => (addrCopied = false), 1200);
     } catch (e) {
       console.warn("copy failed", e);
     }
@@ -732,12 +755,11 @@
   <div
     class="ball"
     onmousedown={onBallMouseDown}
-    ondblclick={onBallDblClick}
     title="点击展开，拖动移动"
   >
     <img
       class="ball-icon-img"
-      src="/app-icon.png"
+      src="/app-icon.svg"
       alt="Sync Copy"
       draggable="false"
     />
@@ -762,7 +784,7 @@
     class="header"
     data-tauri-drag-region
     onmousedown={onHeaderMouseDown}
-    ondblclick={() => getCurrentWindow().setFocus()}
+    ondblclick={(e) => e.preventDefault()}
   >
     <span class="dot" data-tauri-drag-region style="background:{statusColor}"></span>
     <span class="status" data-tauri-drag-region>{statusText}</span>
@@ -870,12 +892,23 @@
       {/if}
     </div>
     <div class="footer">
-      <button
-        class="ghost"
-        onclick={clearAll}
-        disabled={history.length === 0}
-        title="清除所有历史">清除</button
+      <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+      <span
+        class="local-addr"
+        role="button"
+        tabindex="0"
+        onclick={copyLocalAddrInline}
+        onkeydown={(e) => {
+          if (e.key === "Enter" || e.key === " ") copyLocalAddrInline();
+        }}
+        title="点击复制本机地址"
       >
+        {#if addrCopied}
+          <span class="addr-copied">已复制</span>
+        {:else}
+          {localIp ? `${localIp}:${form.port}` : "…"}
+        {/if}
+      </span>
       <span class="device">{form.device_name || "…"}</span>
     </div>
     <div class="brand">Powered by Tao</div>
@@ -886,30 +919,12 @@
         <span>设备名</span>
         <input type="text" bind:value={form.device_name} />
       </label>
-      <label>
-        <span>端口</span>
-        <input type="number" min="1024" max="65535" bind:value={form.port} />
-      </label>
 
       <div class="divider"></div>
 
-      <div class="readonly-row">
-        <div class="label-small">本机地址（告诉其他设备连我）</div>
-        <div class="readonly-box">
-          <span class="mono">
-            {localIp ? `${localIp}:${form.port}` : "获取中…"}
-          </span>
-          <button
-            type="button"
-            class="mini-btn"
-            onclick={copyLocalAddr}
-            disabled={!localIp}
-            title="复制本机地址">📋</button
-          >
-        </div>
-      </div>
-
-      <button class="primary" onclick={saveConfig}>保存</button>
+      <button class="ghost wide" onclick={clearHistoryAndClose} disabled={history.length === 0}
+        >清除历史</button
+      >
       <button class="danger" onclick={quitApp}>退出应用</button>
     </div>
   {:else if view === "join"}
@@ -1010,21 +1025,18 @@
     box-sizing: border-box;
   }
 
-  /* 悬浮球形态：窗口缩小成圆形应用图标 */
+  /* 悬浮球形态：窗口缩小成圆角方 app icon */
   .ball {
     width: 100vw;
     height: 100vh;
-    border-radius: 50%;
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: transparent;
     display: flex;
     align-items: center;
     justify-content: center;
     position: relative;
     cursor: grab;
-    overflow: hidden;
+    overflow: visible;
     user-select: none;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
     transition: transform 120ms ease-out;
   }
   .ball:active {
@@ -1032,20 +1044,22 @@
     transform: scale(0.95);
   }
   .ball-icon-img {
-    width: 80%;
-    height: 80%;
+    width: 100%;
+    height: 100%;
     object-fit: contain;
     pointer-events: none;
     -webkit-user-drag: none;
+    filter: drop-shadow(0 3px 8px rgba(0, 0, 0, 0.35));
   }
   .ball-status-dot {
     position: absolute;
-    bottom: 2px;
-    right: 2px;
-    width: 8px;
-    height: 8px;
+    bottom: 0;
+    right: 0;
+    width: 10px;
+    height: 10px;
     border-radius: 50%;
-    border: 1.5px solid rgba(28, 28, 32, 0.85);
+    border: 2px solid #ffffff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
     pointer-events: none;
   }
   .ball-badge {
@@ -1405,9 +1419,36 @@
     opacity: 0.35;
     cursor: not-allowed;
   }
+  .ghost.wide {
+    width: 100%;
+    padding: 7px 10px;
+  }
   .device {
     font-size: 11px;
     color: #9ca3af;
+    white-space: nowrap;
+  }
+  .local-addr {
+    font-size: 11px;
+    color: #9ca3af;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    cursor: pointer;
+    user-select: none;
+    padding: 1px 4px;
+    border-radius: 3px;
+    transition: background 120ms, color 120ms;
+    white-space: nowrap;
+  }
+  .local-addr:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: #e5e7eb;
+  }
+  .local-addr:active {
+    background: rgba(255, 255, 255, 0.12);
+  }
+  .addr-copied {
+    color: #86efac;
+    font-weight: 500;
   }
   .brand {
     text-align: center;

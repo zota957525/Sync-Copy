@@ -1,0 +1,18 @@
+<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" shape-rendering="geometricPrecision">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#2563eb"/>
+    </linearGradient>
+  </defs>
+  <!-- 圆角方形底板 -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#bg)"/>
+  <!-- 后景那张纸（半透明） -->
+  <rect x="22" y="14" width="24" height="30" rx="3" fill="#ffffff" opacity="0.42"/>
+  <!-- 前景那张纸（实色） -->
+  <rect x="16" y="22" width="24" height="30" rx="3" fill="#ffffff"/>
+  <!-- 文字线 -->
+  <rect x="20" y="30" width="16" height="2.2" rx="1.1" fill="#2563eb"/>
+  <rect x="20" y="36" width="16" height="2.2" rx="1.1" fill="#2563eb"/>
+  <rect x="20" y="42" width="10" height="2.2" rx="1.1" fill="#2563eb"/>
+</svg>
