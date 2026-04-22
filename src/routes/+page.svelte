@@ -4,6 +4,7 @@
   import {
     getCurrentWindow,
     PhysicalPosition,
+    PhysicalSize,
     currentMonitor,
   } from "@tauri-apps/api/window";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -272,6 +273,8 @@
   }
 
   async function detectSnap() {
+    // 悬浮球形态下不吸附，用户自由放置
+    if (collapsed) return;
     const win = getCurrentWindow();
     const pos = await win.outerPosition();
     const size = await win.outerSize();
@@ -417,24 +420,96 @@
     }
   }
 
-  async function hideWindow() {
-    // 如果当前是"滑出屏幕只剩 4px"状态，先把位置滑回可见的边缘
-    // 否则等托盘点出来时窗口还在屏幕外
+  // ---- 悬浮球形态 ----
+  const BALL_SIZE = 56;
+  let collapsed = $state(false);
+  let lastExpandedSize = { w: 320, h: 420 };
+
+  async function collapseToBall() {
+    // 如果是"滑出屏幕"状态，先滑回来再缩
     if (snapEdge && snapHidden) {
       await revealFromEdge();
     }
-    // 清空吸附相关状态，避免再次显示后立刻又倒计时隐藏
+    // 清空吸附 state
     snapEdge = null;
     snapHidden = false;
     if (hideTimer) {
       clearTimeout(hideTimer);
       hideTimer = null;
     }
-    try {
-      await invoke("hide_window");
-    } catch (e) {
-      console.warn("hide_window", e);
+    const win = getCurrentWindow();
+    // 记录当前窗口尺寸，展开时恢复
+    const sz = await win.outerSize();
+    lastExpandedSize = { w: sz.width, h: sz.height };
+    programmaticMove = true;
+    await win.setSize(new PhysicalSize(BALL_SIZE, BALL_SIZE));
+    setTimeout(() => (programmaticMove = false), 200);
+    collapsed = true;
+  }
+
+  async function expandFromBall() {
+    const win = getCurrentWindow();
+    const w = lastExpandedSize.w || 320;
+    const h = lastExpandedSize.h || 420;
+    programmaticMove = true;
+    await win.setSize(new PhysicalSize(w, h));
+    // 展开后如果超出屏幕，挪一下让它完全可见
+    const pos = await win.outerPosition();
+    const mon = await currentMonitor();
+    if (mon) {
+      let nx = pos.x;
+      let ny = pos.y;
+      const maxX = mon.position.x + mon.size.width - w;
+      const maxY = mon.position.y + mon.size.height - h;
+      if (nx > maxX) nx = maxX;
+      if (ny > maxY) ny = maxY;
+      if (nx < mon.position.x) nx = mon.position.x;
+      if (ny < mon.position.y) ny = mon.position.y;
+      if (nx !== pos.x || ny !== pos.y) {
+        await win.setPosition(new PhysicalPosition(nx, ny));
+      }
     }
+    setTimeout(() => (programmaticMove = false), 200);
+    collapsed = false;
+  }
+
+  // 悬浮球上的鼠标：短按抬起 = 点击展开；移动超过 4px = 拖动窗口
+  function onBallMouseDown(ev: MouseEvent) {
+    if (ev.button !== 0) return;
+    const startX = ev.screenX;
+    const startY = ev.screenY;
+    const startAt = Date.now();
+    let didDrag = false;
+
+    const onMove = (mv: MouseEvent) => {
+      const dx = Math.abs(mv.screenX - startX);
+      const dy = Math.abs(mv.screenY - startY);
+      if (!didDrag && (dx > 4 || dy > 4)) {
+        didDrag = true;
+        cleanup();
+        getCurrentWindow()
+          .startDragging()
+          .catch((e) => console.warn(e));
+      }
+    };
+    const onUp = () => {
+      cleanup();
+      const elapsed = Date.now() - startAt;
+      if (!didDrag && elapsed < 500) {
+        void expandFromBall();
+      }
+    };
+    function cleanup() {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  // 旧的 hide（托盘 OS 级隐藏）保留备用，但 `−` 按钮现在用 collapseToBall
+  async function hideWindow() {
+    await collapseToBall();
   }
 
   // ---- misc ----
@@ -601,6 +676,20 @@
   }
 </script>
 
+{#if collapsed}
+  <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
+  <div
+    class="ball"
+    onmousedown={onBallMouseDown}
+    title="点击展开，拖动移动"
+  >
+    <div class="ball-status-dot" style="background:{statusColor}"></div>
+    <div class="ball-icon">📋</div>
+    {#if pendingApprovals.length + pendingFiles.length > 0}
+      <div class="ball-badge">{pendingApprovals.length + pendingFiles.length}</div>
+    {/if}
+  </div>
+{:else}
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
   class="window"
@@ -857,11 +946,70 @@
     </div>
   {/if}
 </div>
+{/if}
 
 <style>
   :global(*, *::before, *::after) {
     box-sizing: border-box;
   }
+
+  /* 悬浮球形态：窗口缩小成圆形图标 */
+  .ball {
+    width: 100vw;
+    height: 100vh;
+    border-radius: 50%;
+    background: radial-gradient(
+      circle at 30% 30%,
+      rgba(59, 130, 246, 0.85),
+      rgba(30, 64, 175, 0.95)
+    );
+    border: 2px solid rgba(255, 255, 255, 0.2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    cursor: grab;
+    overflow: hidden;
+    user-select: none;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+    transition: transform 120ms ease-out;
+  }
+  .ball:active {
+    cursor: grabbing;
+    transform: scale(0.95);
+  }
+  .ball-icon {
+    font-size: 24px;
+    line-height: 1;
+    pointer-events: none;
+  }
+  .ball-status-dot {
+    position: absolute;
+    bottom: 4px;
+    right: 4px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 2px solid rgba(30, 64, 175, 0.95);
+    pointer-events: none;
+  }
+  .ball-badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 3px;
+    border-radius: 8px;
+    background: #ef4444;
+    color: white;
+    font-size: 10px;
+    line-height: 16px;
+    font-weight: 600;
+    text-align: center;
+    pointer-events: none;
+  }
+
   .window {
     width: 100vw;
     height: 100vh;
