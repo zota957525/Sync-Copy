@@ -408,6 +408,9 @@ pub async fn send_files(app: AppHandle, paths: Vec<String>) -> Result<String, St
 pub fn hide_window(app: AppHandle) {
     use tauri::Manager;
     if let Some(w) = app.get_webview_window("main") {
+        // 防御：如果窗口当前已经滑到屏幕外（吸附隐藏状态），先拉回屏幕，
+        // 这样下次 show 不会直接显示在屏幕外看不到
+        crate::ensure_on_screen(&w);
         let _ = w.hide();
     }
 }

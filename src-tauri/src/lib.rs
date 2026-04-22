@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager,
+    Emitter, Manager, PhysicalPosition, WebviewWindow,
 };
 
 use crate::{config::Config, state::AppState};
@@ -74,6 +74,43 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+/// 如果窗口大部分在屏幕外（边缘吸附隐藏 / 多屏幕切换等情况），把它挪回当前显示器中央。
+/// 不破坏用户自己拖到的正常位置。
+pub fn ensure_on_screen(w: &WebviewWindow) {
+    let (Ok(pos), Ok(size), Ok(Some(monitor))) = (
+        w.outer_position(),
+        w.outer_size(),
+        w.current_monitor(),
+    ) else {
+        return;
+    };
+    let mpos = monitor.position();
+    let msize = monitor.size();
+
+    let size_w = size.width as i32;
+    let size_h = size.height as i32;
+    let msize_w = msize.width as i32;
+    let msize_h = msize.height as i32;
+
+    let vx0 = pos.x.max(mpos.x);
+    let vy0 = pos.y.max(mpos.y);
+    let vx1 = (pos.x + size_w).min(mpos.x + msize_w);
+    let vy1 = (pos.y + size_h).min(mpos.y + msize_h);
+    let visible_w = (vx1 - vx0).max(0);
+    let visible_h = (vy1 - vy0).max(0);
+
+    // 至少一半宽高都在屏幕内才算"没丢"
+    let mostly_visible = visible_w * 2 >= size_w && visible_h * 2 >= size_h;
+    if mostly_visible {
+        return;
+    }
+
+    let cx = mpos.x + (msize_w - size_w) / 2;
+    let cy = mpos.y + (msize_h - size_h) / 2;
+    let _ = w.set_position(PhysicalPosition::new(cx, cy));
+    tracing::info!(new_x = cx, new_y = cy, "window was mostly off-screen, recentered");
+}
+
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show_i = MenuItem::with_id(app, "show", "显示浮窗", true, None::<&str>)?;
     let hide_i = MenuItem::with_id(app, "hide", "隐藏浮窗", true, None::<&str>)?;
@@ -88,8 +125,10 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
                 if let Some(w) = app.get_webview_window("main") {
+                    ensure_on_screen(&w);
                     let _ = w.show();
                     let _ = w.set_focus();
+                    let _ = app.emit("window-shown", ());
                 }
             }
             "hide" => {
@@ -112,8 +151,10 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                     if w.is_visible().unwrap_or(false) {
                         let _ = w.hide();
                     } else {
+                        ensure_on_screen(&w);
                         let _ = w.show();
                         let _ = w.set_focus();
+                        let _ = app.emit("window-shown", ());
                     }
                 }
             }

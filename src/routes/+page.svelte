@@ -418,6 +418,18 @@
   }
 
   async function hideWindow() {
+    // 如果当前是"滑出屏幕只剩 4px"状态，先把位置滑回可见的边缘
+    // 否则等托盘点出来时窗口还在屏幕外
+    if (snapEdge && snapHidden) {
+      await revealFromEdge();
+    }
+    // 清空吸附相关状态，避免再次显示后立刻又倒计时隐藏
+    snapEdge = null;
+    snapHidden = false;
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = null;
+    }
     try {
       await invoke("hide_window");
     } catch (e) {
@@ -470,6 +482,16 @@
       setTimeout(() => {
         if (banner && banner.startsWith("已保存")) banner = null;
       }, 2500);
+    }).then((fn) => unlistenFns.push(fn));
+
+    // 托盘重新打开窗口时，清掉吸附状态（后端已 recenter）
+    listen("window-shown", () => {
+      snapEdge = null;
+      snapHidden = false;
+      if (hideTimer) {
+        clearTimeout(hideTimer);
+        hideTimer = null;
+      }
     }).then((fn) => unlistenFns.push(fn));
 
     // 拖文件到窗口 → 发送
