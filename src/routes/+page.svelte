@@ -1,7 +1,11 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { getCurrentWindow } from "@tauri-apps/api/window";
+  import {
+    getCurrentWindow,
+    PhysicalPosition,
+    currentMonitor,
+  } from "@tauri-apps/api/window";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { onMount } from "svelte";
 
@@ -245,6 +249,148 @@
   // 记录刚刚点击的条目 id，用于按下时变色 + 显示 "已复制" 微提示
   let flashId = $state<string | null>(null);
 
+  // ---- 边缘吸附状态 ----
+  type SnapEdge = "left" | "right" | null;
+  let snapEdge = $state<SnapEdge>(null);
+  let snapHidden = $state(false); // 是否已滑入屏幕边缘隐藏
+  let mouseInside = $state(false);
+  let moveDebounceTimer: number | null = null;
+  let hideTimer: number | null = null;
+  let programmaticMove = false; // 我们自己调 setPosition 时别重入
+  const SNAP_THRESHOLD = 20; // 距离边缘多少像素内算吸附
+  const HIDE_DELAY_MS = 1500; // 吸附后多久无鼠标悬停就隐藏
+  const SLIVER_PX = 4; // 隐藏后露出的像素
+
+  /** 是否允许自动隐藏（设置/加入/审批界面时禁止） */
+  function canAutoHide(): boolean {
+    return (
+      view === "main" &&
+      pendingApprovals.length === 0 &&
+      pendingFiles.length === 0 &&
+      !sendingFiles
+    );
+  }
+
+  async function detectSnap() {
+    const win = getCurrentWindow();
+    const pos = await win.outerPosition();
+    const size = await win.outerSize();
+    const mon = await currentMonitor();
+    if (!mon) return;
+    const mx = mon.position.x;
+    const mw = mon.size.width;
+
+    const distLeft = pos.x - mx;
+    const distRight = mx + mw - (pos.x + size.width);
+
+    if (distLeft >= 0 && distLeft <= SNAP_THRESHOLD) {
+      await snapTo("left", mon, size);
+    } else if (distRight >= 0 && distRight <= SNAP_THRESHOLD) {
+      await snapTo("right", mon, size);
+    } else {
+      // 不在吸附范围 → 解除吸附
+      snapEdge = null;
+      snapHidden = false;
+      if (hideTimer) {
+        clearTimeout(hideTimer);
+        hideTimer = null;
+      }
+    }
+  }
+
+  async function snapTo(edge: "left" | "right", mon: any, size: { width: number; height: number }) {
+    const win = getCurrentWindow();
+    const pos = await win.outerPosition();
+    const targetX =
+      edge === "left"
+        ? mon.position.x
+        : mon.position.x + mon.size.width - size.width;
+    programmaticMove = true;
+    await win.setPosition(new PhysicalPosition(targetX, pos.y));
+    setTimeout(() => (programmaticMove = false), 120);
+    snapEdge = edge;
+    snapHidden = false;
+    // 鼠标还在窗口内时不隐藏，等鼠标离开再倒计时
+    if (!mouseInside) scheduleHide();
+  }
+
+  function scheduleHide() {
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = window.setTimeout(() => {
+      if (snapEdge && canAutoHide()) {
+        void hideToEdge();
+      }
+    }, HIDE_DELAY_MS);
+  }
+
+  async function hideToEdge() {
+    if (!snapEdge) return;
+    const win = getCurrentWindow();
+    const pos = await win.outerPosition();
+    const size = await win.outerSize();
+    const mon = await currentMonitor();
+    if (!mon) return;
+
+    const targetX =
+      snapEdge === "left"
+        ? mon.position.x - size.width + SLIVER_PX
+        : mon.position.x + mon.size.width - SLIVER_PX;
+    programmaticMove = true;
+    await win.setPosition(new PhysicalPosition(targetX, pos.y));
+    setTimeout(() => (programmaticMove = false), 120);
+    snapHidden = true;
+  }
+
+  async function revealFromEdge() {
+    if (!snapEdge || !snapHidden) return;
+    const win = getCurrentWindow();
+    const pos = await win.outerPosition();
+    const size = await win.outerSize();
+    const mon = await currentMonitor();
+    if (!mon) return;
+
+    const targetX =
+      snapEdge === "left"
+        ? mon.position.x
+        : mon.position.x + mon.size.width - size.width;
+    programmaticMove = true;
+    await win.setPosition(new PhysicalPosition(targetX, pos.y));
+    setTimeout(() => (programmaticMove = false), 120);
+    snapHidden = false;
+  }
+
+  function onWindowMouseEnter() {
+    mouseInside = true;
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = null;
+    }
+    if (snapEdge && snapHidden) {
+      void revealFromEdge();
+    }
+  }
+
+  function onWindowMouseLeave() {
+    mouseInside = false;
+    if (snapEdge && canAutoHide()) {
+      scheduleHide();
+    }
+  }
+
+  // 如果状态从"可自动隐藏"切到"不能自动隐藏"，取消定时器；反之启动
+  $effect(() => {
+    if (!canAutoHide()) {
+      if (hideTimer) {
+        clearTimeout(hideTimer);
+        hideTimer = null;
+      }
+      // 如果之前已经隐藏，这里展开，避免用户在弹框时看不到
+      if (snapEdge && snapHidden) {
+        void revealFromEdge();
+      }
+    }
+  });
+
   async function copyItem(item: HistoryItem) {
     if (item.kind === "file") {
       // 文件不复制到剪切板，点击 = 在文件管理器里定位
@@ -340,8 +486,21 @@
       })
       .then((fn) => unlistenFns.push(fn));
 
+    // 窗口位置变化：用户拖拽结束后检测是否吸附到屏幕边缘
+    getCurrentWindow()
+      .onMoved(() => {
+        if (programmaticMove) return;
+        if (moveDebounceTimer) clearTimeout(moveDebounceTimer);
+        moveDebounceTimer = window.setTimeout(() => {
+          void detectSnap();
+        }, 220);
+      })
+      .then((fn) => unlistenFns.push(fn));
+
     return () => {
       unlistenFns.forEach((fn) => fn());
+      if (moveDebounceTimer) clearTimeout(moveDebounceTimer);
+      if (hideTimer) clearTimeout(hideTimer);
     };
   });
 
@@ -420,7 +579,15 @@
   }
 </script>
 
-<div class="window">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div
+  class="window"
+  class:snap-hidden={snapHidden}
+  class:snap-left={snapEdge === "left"}
+  class:snap-right={snapEdge === "right"}
+  onmouseenter={onWindowMouseEnter}
+  onmouseleave={onWindowMouseLeave}
+>
   <!-- 顶部栏 -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
@@ -543,6 +710,7 @@
       >
       <span class="device">{form.device_name || "…"}</span>
     </div>
+    <div class="brand">Powered by Tao</div>
   {:else if view === "settings"}
     <div class="panel scrollable">
       <div class="section-title">本机</div>
@@ -689,6 +857,39 @@
     gap: 6px;
     user-select: none;
     overflow: hidden;
+    position: relative;
+  }
+  /* 吸附到左/右边缘时，贴边那侧的圆角抹掉 */
+  .window.snap-left {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+  }
+  .window.snap-right {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  /* 隐藏状态下在可见的 sliver 那侧画一条醒目的高亮，告诉用户"往这里靠"可以唤出窗口 */
+  .window.snap-hidden.snap-left::after,
+  .window.snap-hidden.snap-right::after {
+    content: "";
+    position: absolute;
+    top: 10%;
+    bottom: 10%;
+    width: 3px;
+    border-radius: 3px;
+    background: linear-gradient(
+      to bottom,
+      rgba(96, 165, 250, 0.85),
+      rgba(59, 130, 246, 0.85)
+    );
+    box-shadow: 0 0 8px rgba(96, 165, 250, 0.6);
+    pointer-events: none;
+  }
+  .window.snap-hidden.snap-left::after {
+    right: 0.5px;
+  }
+  .window.snap-hidden.snap-right::after {
+    left: 0.5px;
   }
   .header {
     display: flex;
@@ -982,6 +1183,14 @@
   .device {
     font-size: 11px;
     color: #9ca3af;
+  }
+  .brand {
+    text-align: center;
+    font-size: 9px;
+    color: rgba(255, 255, 255, 0.22);
+    padding: 2px 0 1px;
+    letter-spacing: 0.5px;
+    user-select: none;
   }
 
   /* settings/join 通用面板 */
