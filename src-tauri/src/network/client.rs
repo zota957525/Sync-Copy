@@ -2,7 +2,9 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 
-use super::protocol::{ClipboardReq, FileReq, HandshakeReq, HandshakeResp, PeerPublic};
+use super::protocol::{
+    ClipboardReq, DeleteHistoryReq, FileReq, HandshakeReq, HandshakeResp, PeerPublic,
+};
 use crate::{crypto, peer::Peer, state::AppState};
 
 fn build_client() -> anyhow::Result<reqwest::Client> {
@@ -159,6 +161,43 @@ pub async fn broadcast_text(state: Arc<AppState>, text: String) {
 /// 广播图片（PNG 字节流）
 pub async fn broadcast_image(state: Arc<AppState>, png: Vec<u8>, width: u32, height: u32) {
     broadcast_payload(state, png, "image_png", Some(width), Some(height)).await
+}
+
+/// 广播删除历史条目（按 content_hash 通知所有 peer 删除同一内容）
+pub async fn broadcast_delete(state: Arc<AppState>, content_hash: String) {
+    let (device_id, seq) = {
+        let cfg = state.config.read();
+        let seq = state.next_seq();
+        (cfg.device_id.clone(), seq)
+    };
+    let peers = state.peers.snapshot();
+    if peers.is_empty() {
+        return;
+    }
+    let body = DeleteHistoryReq {
+        origin_device_id: device_id,
+        seq,
+        content_hash,
+    };
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot build reqwest client for delete");
+            return;
+        }
+    };
+    for peer in peers {
+        let url = format!("http://{}/delete_history", peer.addr);
+        let body = body.clone();
+        let client = client.clone();
+        tauri::async_runtime::spawn(async move {
+            match client.post(&url).json(&body).send().await {
+                Ok(r) if r.status().is_success() => {}
+                Ok(r) => tracing::warn!(peer = %peer.device_name, status = %r.status(), "delete broadcast non-2xx"),
+                Err(e) => tracing::warn!(peer = %peer.device_name, error = %e, "delete broadcast failed"),
+            }
+        });
+    }
 }
 
 /// 广播文件：返回 (成功数, 总 peer 数)

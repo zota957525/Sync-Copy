@@ -12,11 +12,13 @@ use tokio::sync::oneshot;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
-use super::protocol::{ClipboardReq, FileReq, HandshakeReq, HandshakeResp, PeerPublic};
+use super::protocol::{
+    ClipboardReq, DeleteHistoryReq, FileReq, HandshakeReq, HandshakeResp, PeerPublic,
+};
 use crate::{
     clipboard::ClipboardCmd,
     crypto,
-    history::Source,
+    history::{sha256_hex, Source},
     peer::Peer,
     state::{AppState, PendingFileSave},
 };
@@ -40,6 +42,7 @@ pub async fn run(
         .route("/handshake", post(handle_handshake))
         .route("/clipboard", post(handle_clipboard))
         .route("/file", post(handle_file))
+        .route("/delete_history", post(handle_delete_history))
         // 放宽 body 上限：5MB 文件 + base64 膨胀 + JSON 开销，留到 8MB
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(ctx);
@@ -216,11 +219,12 @@ async fn handle_clipboard(
             if width == 0 || height == 0 {
                 return Err(StatusCode::BAD_REQUEST);
             }
+            let content_hash = sha256_hex(&plaintext_bytes);
             let data_url = format!("data:image/png;base64,{}", B64.encode(&plaintext_bytes));
             if ctx
                 .state
                 .history
-                .push_image(width, height, data_url, source)
+                .push_image(width, height, data_url, content_hash, source)
                 .is_some()
             {
                 let _ = ctx.app.emit("history-updated", ());
@@ -253,6 +257,29 @@ async fn handle_clipboard(
         }
     }
 
+    Ok(StatusCode::OK)
+}
+
+async fn handle_delete_history(
+    State(ctx): State<ServerCtx>,
+    Json(req): Json<DeleteHistoryReq>,
+) -> Result<StatusCode, StatusCode> {
+    let known = ctx
+        .state
+        .peers
+        .snapshot()
+        .iter()
+        .any(|p| p.device_id == req.origin_device_id);
+    if !known {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !ctx.state.seen_seq_and_update(&req.origin_device_id, req.seq) {
+        return Ok(StatusCode::OK);
+    }
+    if ctx.state.history.remove_by_hash(&req.content_hash) {
+        let _ = ctx.app.emit("history-updated", ());
+        tracing::info!(hash = %req.content_hash, "remote delete applied");
+    }
     Ok(StatusCode::OK)
 }
 
@@ -319,25 +346,56 @@ async fn handle_file(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    // 算 content hash（用于跨机器同步删除）
+    let content_hash = sha256_hex(&plaintext);
+    let source = Source::Remote {
+        device_name: req.origin_device_name.clone(),
+    };
+
     // 写到 Downloads（如果不存在用临时目录兜底）
     let target_dir = directories::UserDirs::new()
         .and_then(|u| u.download_dir().map(std::path::PathBuf::from))
         .unwrap_or_else(std::env::temp_dir);
     let dest = unique_path(&target_dir, &safe_name);
-    if let Err(e) = tokio::fs::write(&dest, &plaintext).await {
-        tracing::error!(error = %e, "write file failed");
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-    tracing::info!(dest = %dest.display(), "file saved");
-    let _ = ctx.app.emit(
-        "file-saved",
-        serde_json::json!({
-            "path": dest.to_string_lossy(),
-            "filename": safe_name,
-        }),
-    );
 
-    Ok(StatusCode::OK)
+    match tokio::fs::write(&dest, &plaintext).await {
+        Ok(()) => {
+            tracing::info!(dest = %dest.display(), "file saved");
+            let saved_path = dest.to_string_lossy().to_string();
+            let _ = ctx.state.history.push_file(
+                safe_name.clone(),
+                req.size,
+                Some(saved_path.clone()),
+                "received",
+                None,
+                Some(content_hash),
+                source,
+            );
+            let _ = ctx.app.emit("history-updated", ());
+            let _ = ctx.app.emit(
+                "file-saved",
+                serde_json::json!({
+                    "path": saved_path,
+                    "filename": safe_name,
+                }),
+            );
+            Ok(StatusCode::OK)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "write file failed");
+            let _ = ctx.state.history.push_file(
+                safe_name,
+                req.size,
+                None,
+                "failed",
+                Some(e.to_string()),
+                Some(content_hash),
+                source,
+            );
+            let _ = ctx.app.emit("history-updated", ());
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 fn sanitize_filename(name: &str) -> String {

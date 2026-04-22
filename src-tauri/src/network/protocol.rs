@@ -69,3 +69,12 @@ pub struct FileReq {
     pub nonce: String,
     pub ciphertext: String,
 }
+
+/// 同步删除某条历史（按内容 hash 跨机器识别）
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeleteHistoryReq {
+    pub origin_device_id: String,
+    pub seq: u64,
+    /// 要删除的历史条目的 content_hash
+    pub content_hash: String,
+}

@@ -95,12 +95,18 @@ fn run(app: AppHandle, state: Arc<AppState>, rx: mpsc::Receiver<ClipboardCmd>) {
                                 let h = hash_bytes(&png_bytes);
                                 if last_image_hash != Some(h) {
                                     last_image_hash = Some(h);
-                                    // 图片变了：写入历史 + 广播
+                                    let hash_hex = hex_string(&h);
                                     let data_url =
                                         format!("data:image/png;base64,{}", B64.encode(&png_bytes));
                                     if state
                                         .history
-                                        .push_image(width, height, data_url, Source::Local)
+                                        .push_image(
+                                            width,
+                                            height,
+                                            data_url,
+                                            hash_hex,
+                                            Source::Local,
+                                        )
                                         .is_some()
                                     {
                                         let _ = app.emit("history-updated", ());
@@ -163,6 +169,14 @@ fn hash_bytes(b: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b);
     h.finalize().into()
+}
+
+fn hex_string(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<u8>> {

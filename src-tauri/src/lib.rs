@@ -53,6 +53,8 @@ pub fn run() {
             commands::respond_file_save,
             commands::send_files,
             commands::quit_app,
+            commands::hide_window,
+            commands::reveal_file,
         ])
         .setup(move |app| {
             build_tray(app.handle())?;

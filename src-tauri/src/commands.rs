@@ -9,7 +9,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use crate::{
     clipboard::ClipboardCmd,
     config::Config,
-    history::{HistoryItem, HistoryPayload},
+    history::{sha256_hex, HistoryItem, HistoryPayload, Source},
     network,
     peer::Peer,
     state::{AppState, ConnectionStatus},
@@ -93,8 +93,16 @@ pub fn delete_history_item(
     app: AppHandle,
     id: String,
 ) {
-    if state.history.remove(&id) {
-        let _ = app.emit("history-updated", ());
+    let Some(removed) = state.history.remove(&id) else {
+        return;
+    };
+    let _ = app.emit("history-updated", ());
+    // 有 content_hash 才广播（文件在发送失败等情况可能没 hash）
+    if let Some(hash) = removed.content_hash {
+        let state_c: Arc<AppState> = Arc::clone(state.inner());
+        tauri::async_runtime::spawn(async move {
+            network::client::broadcast_delete(state_c, hash).await;
+        });
     }
 }
 
@@ -135,6 +143,10 @@ pub fn recopy_history_item(
                 .ok_or_else(|| "data_url 格式异常".to_string())?;
             let png = B64.decode(b64).map_err(|e| e.to_string())?;
             let _ = tx.send(ClipboardCmd::SetImageSuppress { png, width, height });
+        }
+        HistoryPayload::File { .. } => {
+            // 文件不走剪切板，点击应调 reveal_file 而不是 recopy
+            return Err("文件条目不支持复制到剪切板".into());
         }
     }
     Ok(())
@@ -371,11 +383,64 @@ pub async fn send_files(app: AppHandle, paths: Vec<String>) -> Result<String, St
                 continue;
             }
         };
+        let content_hash = sha256_hex(&bytes);
+        let size = bytes.len() as u64;
         let (ok, total) =
             network::client::broadcast_file(Arc::clone(&state), filename.clone(), bytes).await;
         reports.push(format!("{}: 已送达 {}/{} 台", filename, ok, total));
+        // 发送端也把文件写进历史（便于删除同步和查看）
+        let _ = state.history.push_file(
+            filename.clone(),
+            size,
+            Some(path.to_string_lossy().to_string()),
+            "sent",
+            None,
+            Some(content_hash),
+            Source::Local,
+        );
+        let _ = app.emit("history-updated", ());
     }
     Ok(reports.join("\n"))
+}
+
+/// 隐藏浮窗（通过托盘图标可重新显示）
+#[tauri::command]
+pub fn hide_window(app: AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+}
+
+/// 在系统文件管理器里定位文件（已保存的文件点条目时调用）
+#[tauri::command]
+pub fn reveal_file(path: String) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&path);
+    if !p.exists() {
+        return Err(format!("文件不存在: {}", path));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&p)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg("/select,")
+            .arg(&p)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = p;
+        return Err("当前平台不支持".into());
+    }
+    Ok(())
 }
 
 #[tauri::command]

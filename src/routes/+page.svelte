@@ -18,9 +18,18 @@
     id: string;
     timestamp_ms: number;
     source: Source;
+    content_hash: string | null;
   } & (
     | { kind: "text"; text: string }
     | { kind: "image"; width: number; height: number; data_url: string }
+    | {
+        kind: "file";
+        filename: string;
+        size: number;
+        saved_path: string | null;
+        file_status: "sent" | "received" | "failed";
+        error: string | null;
+      }
   );
 
   type ConfigView = {
@@ -233,13 +242,40 @@
     await refreshHistory();
   }
 
+  // 记录刚刚点击的条目 id，用于按下时变色 + 显示 "已复制" 微提示
+  let flashId = $state<string | null>(null);
+
   async function copyItem(item: HistoryItem) {
+    if (item.kind === "file") {
+      // 文件不复制到剪切板，点击 = 在文件管理器里定位
+      if (item.saved_path) {
+        try {
+          await invoke("reveal_file", { path: item.saved_path });
+        } catch (e) {
+          banner = String(e);
+        }
+      } else {
+        banner = "文件未保存（" + (item.error ?? "未知原因") + "）";
+      }
+      return;
+    }
     try {
-      // 走后端：文本和图片都能正确写回系统剪切板并抑制回传
       await invoke("recopy_history_item", { id: item.id });
+      flashId = item.id;
+      setTimeout(() => {
+        if (flashId === item.id) flashId = null;
+      }, 900);
     } catch (e) {
       console.warn("recopy failed", e);
       banner = "复制失败: " + e;
+    }
+  }
+
+  async function hideWindow() {
+    try {
+      await invoke("hide_window");
+    } catch (e) {
+      console.warn("hide_window", e);
     }
   }
 
@@ -321,22 +357,24 @@
   });
 
   // ---- derived ----
+  // peers 是「别的设备数」，小组总数要 +1（包含自己）
   const peerCount = $derived.by(() =>
     status.kind === "connected" ? status.peers : 0
   );
+  const groupTotal = $derived.by(() => peerCount + 1);
 
   const statusText = $derived.by(() => {
     switch (status.kind) {
       case "idle":
-        return `未连接 · ${peerCount} 台`;
+        return `未连接`;
       case "listening":
-        return `等待中 · ${peerCount} 台`;
+        return `小组 · ${groupTotal} 台`;
       case "connecting":
-        return `连接中 · ${peerCount} 台`;
+        return `连接中…`;
       case "connected":
-        return `已连接 · ${peerCount} 台`;
+        return `小组 · ${groupTotal} 台`;
       case "error":
-        return `出错 · ${peerCount} 台`;
+        return status.message || "出错";
     }
   });
 
@@ -410,6 +448,9 @@
           title="主动连对方机器">加入</button
         >
       {/if}
+      <button class="icon-btn" onclick={hideWindow} title="隐藏窗口（托盘点图标重新显示）"
+        >−</button
+      >
       <button class="icon-btn" onclick={openSettings} title="本机设置">⚙</button>
     {:else if view === "settings"}
       <button class="icon-btn" onclick={closeSettings} title="放弃修改并返回">×</button>
@@ -442,29 +483,51 @@
             tabindex="0"
             class="item"
             class:item-image={item.kind === "image"}
+            class:item-flash={flashId === item.id}
             onclick={() => copyItem(item)}
             onkeydown={(e) => {
               if (e.key === "Enter" || e.key === " ") copyItem(item);
             }}
-            title="点击复制到剪切板"
+            title={item.kind === "file" ? "点击在文件管理器里定位" : "点击复制到剪切板"}
           >
             {#if item.kind === "text"}
               <div class="item-text">{item.text}</div>
-            {:else}
+            {:else if item.kind === "image"}
               <div class="item-img-wrap">
                 <img class="item-img" src={item.data_url} alt="image" />
                 <span class="item-img-dim">{item.width}×{item.height}</span>
+              </div>
+            {:else}
+              <div class="item-file">
+                <span class="file-icon">📎</span>
+                <div class="file-info">
+                  <div class="file-name">{item.filename}</div>
+                  <div class="file-sub">
+                    {formatSize(item.size)}
+                    <span class="dotsep">·</span>
+                    {#if item.file_status === "received"}
+                      <span class="st-ok">已保存</span>
+                    {:else if item.file_status === "sent"}
+                      <span class="st-sent">已发送</span>
+                    {:else}
+                      <span class="st-fail">保存失败{item.error ? `：${item.error}` : ""}</span>
+                    {/if}
+                  </div>
+                </div>
               </div>
             {/if}
             <div class="item-meta">
               <span>{sourceLabel(item.source)}</span>
               <span class="dotsep">·</span>
               <span>{timeAgo(item.timestamp_ms)}</span>
+              {#if flashId === item.id}
+                <span class="copied-chip">已复制</span>
+              {/if}
             </div>
             <button
               class="del-btn"
               onclick={(e) => deleteItem(item.id, e)}
-              title="删除此条"
+              title="删除此条（同步到所有设备）"
               aria-label="删除">✕</button
             >
           </div>
@@ -768,6 +831,57 @@
   .item:hover {
     background: rgba(255, 255, 255, 0.08);
     border-color: rgba(255, 255, 255, 0.12);
+  }
+  .item:active,
+  .item.item-flash {
+    background: rgba(34, 197, 94, 0.2);
+    border-color: rgba(34, 197, 94, 0.45);
+    transform: scale(0.99);
+    transition: background 120ms, border-color 120ms, transform 120ms;
+  }
+  .item-file {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .file-icon {
+    font-size: 20px;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .file-info {
+    min-width: 0;
+    flex: 1;
+  }
+  .file-name {
+    font-size: 12px;
+    color: #e5e7eb;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .file-sub {
+    margin-top: 2px;
+    font-size: 10px;
+    color: #9ca3af;
+  }
+  .st-ok {
+    color: #86efac;
+  }
+  .st-sent {
+    color: #93c5fd;
+  }
+  .st-fail {
+    color: #fca5a5;
+  }
+  .copied-chip {
+    margin-left: auto;
+    font-size: 10px;
+    color: #86efac;
+    background: rgba(34, 197, 94, 0.18);
+    padding: 0 5px;
+    border-radius: 3px;
+    font-variant-numeric: tabular-nums;
   }
   .item-text {
     font-size: 12px;
