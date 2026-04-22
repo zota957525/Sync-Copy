@@ -1,7 +1,7 @@
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{atomic::{AtomicU64, Ordering}, Arc, mpsc},
 };
 use tokio::sync::oneshot;
@@ -25,6 +25,9 @@ impl PeerKeys {
     }
     pub fn get(&self, device_id: &str) -> Option<[u8; 32]> {
         self.keys.read().get(device_id).copied()
+    }
+    pub fn remove(&self, device_id: &str) {
+        self.keys.write().remove(device_id);
     }
     pub fn clear(&self) {
         self.keys.write().clear();
@@ -74,6 +77,14 @@ pub struct AppState {
 
     /// 每个 peer 的对称加密密钥
     pub peer_keys: PeerKeys,
+
+    /// 已经被本机（或任一小组成员）同意过的设备 id —— 收到这些设备的握手时
+    /// 不再弹审批框，直接通过。通过 /peers/trust gossip 在组内传播。
+    pub approved_device_ids: RwLock<HashSet<String>>,
+
+    /// 已经被本机（或任一小组成员）拒绝过的设备 id —— 收到这些设备的握手
+    /// 直接返回 403。通过 /peers/ban gossip 在组内传播。
+    pub banned_device_ids: RwLock<HashSet<String>>,
 }
 
 #[allow(dead_code)]
@@ -98,6 +109,8 @@ impl AppState {
             pending_approvals: Mutex::new(HashMap::new()),
             pending_file_saves: Mutex::new(HashMap::new()),
             peer_keys: PeerKeys::new(),
+            approved_device_ids: RwLock::new(HashSet::new()),
+            banned_device_ids: RwLock::new(HashSet::new()),
         })
     }
 

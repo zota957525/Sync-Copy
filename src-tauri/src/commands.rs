@@ -298,6 +298,8 @@ pub fn leave_group(
 ) -> Result<(), String> {
     state.peers.clear();
     state.peer_keys.clear();
+    state.approved_device_ids.write().clear();
+    state.banned_device_ids.write().clear();
     if let Some(tx) = state.server_shutdown.lock().take() {
         let _ = tx.send(());
     }
@@ -312,6 +314,8 @@ pub async fn quit_app(app: AppHandle) {
     let state: Arc<AppState> = Arc::clone(app.state::<Arc<AppState>>().inner());
     state.peers.clear();
     state.peer_keys.clear();
+    state.approved_device_ids.write().clear();
+    state.banned_device_ids.write().clear();
     if let Some(tx) = state.server_shutdown.lock().take() {
         let _ = tx.send(());
     }

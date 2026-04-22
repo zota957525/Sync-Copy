@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
 use super::protocol::{
-    ClipboardReq, DeleteHistoryReq, FileReq, HandshakeReq, HandshakeResp, PeerPublic,
+    ClipboardReq, DeleteHistoryReq, FileReq, HandshakeReq, HandshakeResp, PeerPublic, TrustReq,
 };
 use crate::{
     clipboard::ClipboardCmd,
@@ -43,6 +43,8 @@ pub async fn run(
         .route("/clipboard", post(handle_clipboard))
         .route("/file", post(handle_file))
         .route("/delete_history", post(handle_delete_history))
+        .route("/peers/trust", post(handle_trust))
+        .route("/peers/ban", post(handle_ban))
         // 放宽 body 上限：5MB 文件 + base64 膨胀 + JSON 开销，留到 8MB
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(ctx);
@@ -103,6 +105,17 @@ async fn handle_handshake(
         return Err(StatusCode::CONFLICT);
     }
 
+    // 黑名单直接拦截（由组内其它成员拒绝后 gossip 过来的）
+    if ctx
+        .state
+        .banned_device_ids
+        .read()
+        .contains(&req.device_id)
+    {
+        tracing::warn!(peer = %req.device_name, "handshake blocked by gossip ban-list");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     // 已知 peer：直接更新，重新协商密钥
     let known = ctx
         .state
@@ -119,6 +132,31 @@ async fn handle_handshake(
             addr: peer_addr.clone(),
         });
         tracing::info!(peer = %req.device_name, addr = %peer_addr, "re-handshake with known peer, key refreshed");
+        return Ok(Json(HandshakeResp {
+            device_id: my_id,
+            device_name: my_name,
+            peers: peer_list_excluding(&ctx.state, &req.device_id),
+            pubkey: my_pubkey_b64,
+        }));
+    }
+
+    // 白名单：此前被组内另一成员批准过，直接通过、不弹审批
+    let pre_approved = ctx
+        .state
+        .approved_device_ids
+        .read()
+        .contains(&req.device_id);
+    if pre_approved {
+        let aes_key = crypto::derive_aes_key(my_secret, &their_pub);
+        ctx.state.peer_keys.set(req.device_id.clone(), aes_key);
+        ctx.state.peers.upsert(Peer {
+            device_id: req.device_id.clone(),
+            device_name: req.device_name.clone(),
+            addr: peer_addr.clone(),
+        });
+        crate::state::update_status_connected(&ctx.state);
+        let _ = ctx.app.emit("status-updated", ());
+        tracing::info!(peer = %req.device_name, addr = %peer_addr, "peer auto-approved via gossip trust-list");
         return Ok(Json(HandshakeResp {
             device_id: my_id,
             device_name: my_name,
@@ -155,10 +193,25 @@ async fn handle_handshake(
 
     if !approved {
         tracing::info!(peer = %req.device_name, "handshake rejected by user");
+        // 记录到本地黑名单 + gossip 告诉其它 peer（后台异步，不阻塞响应）
+        ctx.state
+            .banned_device_ids
+            .write()
+            .insert(req.device_id.clone());
+        let state_c = Arc::clone(&ctx.state);
+        let subj_id = req.device_id.clone();
+        let subj_name = req.device_name.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                super::client::broadcast_ban(state_c, subj_id, subj_name),
+            )
+            .await;
+        });
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // 用户同意 → ECDH 派生共享 AES 密钥并持久化
+    // 用户同意 → ECDH 派生共享 AES 密钥并持久化 + 记到白名单
     let aes_key = crypto::derive_aes_key(my_secret, &their_pub);
     ctx.state.peer_keys.set(req.device_id.clone(), aes_key);
     ctx.state.peers.upsert(Peer {
@@ -166,9 +219,24 @@ async fn handle_handshake(
         device_name: req.device_name.clone(),
         addr: peer_addr.clone(),
     });
+    ctx.state
+        .approved_device_ids
+        .write()
+        .insert(req.device_id.clone());
     crate::state::update_status_connected(&ctx.state);
     let _ = ctx.app.emit("status-updated", ());
     tracing::info!(peer = %req.device_name, addr = %peer_addr, "peer approved, key exchanged");
+
+    // Gossip: 告诉组里其它已知 peer 信任此设备。最多等 2 秒；
+    // 尽量在 C 回收到响应前，把「信任 C」送达所有其它节点。
+    let state_c = Arc::clone(&ctx.state);
+    let subj_id = req.device_id.clone();
+    let subj_name = req.device_name.clone();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        super::client::broadcast_trust(state_c, subj_id, subj_name),
+    )
+    .await;
 
     Ok(Json(HandshakeResp {
         device_id: my_id,
@@ -280,6 +348,97 @@ async fn handle_delete_history(
         let _ = ctx.app.emit("history-updated", ());
         tracing::info!(hash = %req.content_hash, "remote delete applied");
     }
+    Ok(StatusCode::OK)
+}
+
+async fn handle_trust(
+    State(ctx): State<ServerCtx>,
+    Json(req): Json<TrustReq>,
+) -> Result<StatusCode, StatusCode> {
+    // 只接受来自已认证 peer 的信任广播
+    let known = ctx
+        .state
+        .peers
+        .snapshot()
+        .iter()
+        .any(|p| p.device_id == req.origin_device_id);
+    if !known {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !ctx.state.seen_seq_and_update(&req.origin_device_id, req.seq) {
+        return Ok(StatusCode::OK);
+    }
+    // 自己不信任自己
+    let my_id = ctx.state.config.read().device_id.clone();
+    if req.subject_device_id == my_id {
+        return Ok(StatusCode::OK);
+    }
+    ctx.state
+        .approved_device_ids
+        .write()
+        .insert(req.subject_device_id.clone());
+    // 如果之前被封禁过，信任覆盖黑名单
+    ctx.state
+        .banned_device_ids
+        .write()
+        .remove(&req.subject_device_id);
+    tracing::info!(
+        via = %req.origin_device_id,
+        subject = %req.subject_device_name,
+        "peer pre-approved via gossip"
+    );
+    Ok(StatusCode::OK)
+}
+
+async fn handle_ban(
+    State(ctx): State<ServerCtx>,
+    Json(req): Json<TrustReq>,
+) -> Result<StatusCode, StatusCode> {
+    let known = ctx
+        .state
+        .peers
+        .snapshot()
+        .iter()
+        .any(|p| p.device_id == req.origin_device_id);
+    if !known {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !ctx.state.seen_seq_and_update(&req.origin_device_id, req.seq) {
+        return Ok(StatusCode::OK);
+    }
+    let my_id = ctx.state.config.read().device_id.clone();
+    if req.subject_device_id == my_id {
+        // 自己不能被自己踢
+        return Ok(StatusCode::OK);
+    }
+    ctx.state
+        .banned_device_ids
+        .write()
+        .insert(req.subject_device_id.clone());
+    ctx.state
+        .approved_device_ids
+        .write()
+        .remove(&req.subject_device_id);
+
+    // 如果对方当前是已知 peer，直接踢出
+    let was_peer = ctx
+        .state
+        .peers
+        .snapshot()
+        .iter()
+        .any(|p| p.device_id == req.subject_device_id);
+    if was_peer {
+        ctx.state.peers.remove(&req.subject_device_id);
+        ctx.state.peer_keys.remove(&req.subject_device_id);
+        crate::state::update_status_connected(&ctx.state);
+        let _ = ctx.app.emit("status-updated", ());
+    }
+    tracing::info!(
+        via = %req.origin_device_id,
+        subject = %req.subject_device_name,
+        was_peer,
+        "peer banned via gossip"
+    );
     Ok(StatusCode::OK)
 }
 

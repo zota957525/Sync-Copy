@@ -78,3 +78,15 @@ pub struct DeleteHistoryReq {
     /// 要删除的历史条目的 content_hash
     pub content_hash: String,
 }
+
+/// 信任/封禁传播：A 同意（或拒绝）C 的加入后，把这个决定告诉小组里其它已知 peer
+/// 让它们把 C 也登记到 approved_device_ids（或 banned_device_ids），C 之后主动
+/// 联系它们时就不必重复弹审批框了。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TrustReq {
+    pub origin_device_id: String,
+    pub seq: u64,
+    /// 被信任/被拒的设备
+    pub subject_device_id: String,
+    pub subject_device_name: String,
+}

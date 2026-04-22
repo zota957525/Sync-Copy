@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Context;
 
 use super::protocol::{
-    ClipboardReq, DeleteHistoryReq, FileReq, HandshakeReq, HandshakeResp, PeerPublic,
+    ClipboardReq, DeleteHistoryReq, FileReq, HandshakeReq, HandshakeResp, PeerPublic, TrustReq,
 };
 use crate::{crypto, peer::Peer, state::AppState};
 
@@ -161,6 +161,74 @@ pub async fn broadcast_text(state: Arc<AppState>, text: String) {
 /// 广播图片（PNG 字节流）
 pub async fn broadcast_image(state: Arc<AppState>, png: Vec<u8>, width: u32, height: u32) {
     broadcast_payload(state, png, "image_png", Some(width), Some(height)).await
+}
+
+/// 广播信任/封禁决定。path 应该是 "/peers/trust" 或 "/peers/ban"。
+/// await 全部 peer 完成（或失败）后返回，便于上游用 tokio::time::timeout 控总时长
+async fn broadcast_trust_decision(
+    state: Arc<AppState>,
+    path: &'static str,
+    subject_device_id: String,
+    subject_device_name: String,
+) {
+    let (origin_id, seq) = {
+        let cfg = state.config.read();
+        (cfg.device_id.clone(), state.next_seq())
+    };
+    let peers = state.peers.snapshot();
+    if peers.is_empty() {
+        return;
+    }
+    let body = TrustReq {
+        origin_device_id: origin_id,
+        seq,
+        subject_device_id: subject_device_id.clone(),
+        subject_device_name,
+    };
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot build reqwest client for trust gossip");
+            return;
+        }
+    };
+    let mut handles = Vec::with_capacity(peers.len());
+    for peer in peers {
+        // 不把这个决定发给当事人自己
+        if peer.device_id == subject_device_id {
+            continue;
+        }
+        let url = format!("http://{}{}", peer.addr, path);
+        let body = body.clone();
+        let client = client.clone();
+        let peer_name = peer.device_name.clone();
+        handles.push(tauri::async_runtime::spawn(async move {
+            match client.post(&url).json(&body).send().await {
+                Ok(r) if r.status().is_success() => {}
+                Ok(r) => tracing::warn!(peer = %peer_name, status = %r.status(), path, "trust gossip non-2xx"),
+                Err(e) => tracing::warn!(peer = %peer_name, error = %e, path, "trust gossip failed"),
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
+pub async fn broadcast_trust(
+    state: Arc<AppState>,
+    subject_device_id: String,
+    subject_device_name: String,
+) {
+    broadcast_trust_decision(state, "/peers/trust", subject_device_id, subject_device_name).await
+}
+
+pub async fn broadcast_ban(
+    state: Arc<AppState>,
+    subject_device_id: String,
+    subject_device_name: String,
+) {
+    broadcast_trust_decision(state, "/peers/ban", subject_device_id, subject_device_name).await
 }
 
 /// 广播删除历史条目（按 content_hash 通知所有 peer 删除同一内容）
