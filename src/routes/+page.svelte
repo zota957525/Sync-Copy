@@ -567,7 +567,26 @@
     );
   }
 
+  // 挂载时防御：如果窗口已是球大小但 collapsed=false（可能 HMR 重建了组件
+  // 但 OS 窗口还是球），把它恢复成默认大小，避免正常 UI 挤在 48×48 里没法用
+  async function restoreIfStuckSmall() {
+    try {
+      const win = getCurrentWindow();
+      const sz = await win.outerSize();
+      const scale = await win.scaleFactor();
+      const lw = sz.width / scale;
+      const lh = sz.height / scale;
+      if ((lw < 150 || lh < 150) && !collapsed) {
+        console.log("[restoreIfStuckSmall] window tiny but not collapsed, restoring");
+        await win.setSize(new LogicalSize(DEFAULT_EXPANDED.w, DEFAULT_EXPANDED.h));
+      }
+    } catch (e) {
+      console.warn("restoreIfStuckSmall failed", e);
+    }
+  }
+
   onMount(() => {
+    restoreIfStuckSmall();
     refreshStatus();
     refreshHistory();
     loadConfig();
