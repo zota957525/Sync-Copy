@@ -907,7 +907,7 @@
       </span>
       <span class="device">{form.device_name || "…"}</span>
     </div>
-    <div class="brand">Powered by Tao</div>
+    <div class="brand">Made with Claude Opus 4.7 · by Tao</div>
   {:else if view === "settings"}
     <div class="panel scrollable">
       <label>
