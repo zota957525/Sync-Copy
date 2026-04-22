@@ -716,8 +716,13 @@
     ondblclick={onBallDblClick}
     title="点击展开，拖动移动"
   >
+    <img
+      class="ball-icon-img"
+      src="/app-icon.png"
+      alt="Sync Copy"
+      draggable="false"
+    />
     <div class="ball-status-dot" style="background:{statusColor}"></div>
-    <div class="ball-icon">📋</div>
     {#if pendingApprovals.length + pendingFiles.length > 0}
       <div class="ball-badge">{pendingApprovals.length + pendingFiles.length}</div>
     {/if}
@@ -986,17 +991,13 @@
     box-sizing: border-box;
   }
 
-  /* 悬浮球形态：窗口缩小成圆形图标 */
+  /* 悬浮球形态：窗口缩小成圆形应用图标 */
   .ball {
     width: 100vw;
     height: 100vh;
     border-radius: 50%;
-    background: radial-gradient(
-      circle at 30% 30%,
-      rgba(59, 130, 246, 0.85),
-      rgba(30, 64, 175, 0.95)
-    );
-    border: 2px solid rgba(255, 255, 255, 0.2);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.18);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1011,10 +1012,12 @@
     cursor: grabbing;
     transform: scale(0.95);
   }
-  .ball-icon {
-    font-size: 20px;
-    line-height: 1;
+  .ball-icon-img {
+    width: 80%;
+    height: 80%;
+    object-fit: contain;
     pointer-events: none;
+    -webkit-user-drag: none;
   }
   .ball-status-dot {
     position: absolute;
@@ -1023,7 +1026,7 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    border: 1.5px solid rgba(30, 64, 175, 0.95);
+    border: 1.5px solid rgba(28, 28, 32, 0.85);
     pointer-events: none;
   }
   .ball-badge {
