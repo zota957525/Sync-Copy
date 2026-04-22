@@ -3,7 +3,8 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Context;
 
 use super::protocol::{
-    ClipboardReq, DeleteHistoryReq, FileReq, HandshakeReq, HandshakeResp, PeerPublic, TrustReq,
+    ApprovalDecisionReq, ApprovalDismissReq, ApprovalForwardReq, ClipboardReq, DeleteHistoryReq,
+    FileReq, GroupActionReq, HandshakeReq, HandshakeResp, PeerPublic, TrustReq,
 };
 use crate::{crypto, peer::Peer, state::AppState};
 
@@ -229,6 +230,160 @@ pub async fn broadcast_ban(
     subject_device_name: String,
 ) {
     broadcast_trust_decision(state, "/peers/ban", subject_device_id, subject_device_name).await
+}
+
+/// 通知所有 peer：我要下线了，把我从 peers 表移除
+pub async fn broadcast_leave(state: Arc<AppState>) {
+    let (origin_id, seq) = {
+        let cfg = state.config.read();
+        (cfg.device_id.clone(), state.next_seq())
+    };
+    let peers = state.peers.snapshot();
+    if peers.is_empty() {
+        return;
+    }
+    let body = GroupActionReq {
+        origin_device_id: origin_id,
+        seq,
+    };
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mut handles = Vec::with_capacity(peers.len());
+    for peer in peers {
+        let url = format!("http://{}/peers/leave", peer.addr);
+        let body = body.clone();
+        let client = client.clone();
+        handles.push(tauri::async_runtime::spawn(async move {
+            let _ = client.post(&url).json(&body).send().await;
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
+/// 通知所有 peer：把全部历史清空
+pub async fn broadcast_clear_history(state: Arc<AppState>) {
+    let (origin_id, seq) = {
+        let cfg = state.config.read();
+        (cfg.device_id.clone(), state.next_seq())
+    };
+    let peers = state.peers.snapshot();
+    if peers.is_empty() {
+        return;
+    }
+    let body = GroupActionReq {
+        origin_device_id: origin_id,
+        seq,
+    };
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for peer in peers {
+        let url = format!("http://{}/history/clear", peer.addr);
+        let body = body.clone();
+        let client = client.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = client.post(&url).json(&body).send().await;
+        });
+    }
+}
+
+/// 把审批请求转发给所有其它 peer，让它们也弹框
+pub async fn broadcast_approval_forward(
+    state: Arc<AppState>,
+    request_id: String,
+    subject_device_id: String,
+    subject_device_name: String,
+) {
+    let (origin_id, seq) = {
+        let cfg = state.config.read();
+        (cfg.device_id.clone(), state.next_seq())
+    };
+    let peers = state.peers.snapshot();
+    if peers.is_empty() {
+        return;
+    }
+    let body = ApprovalForwardReq {
+        origin_device_id: origin_id,
+        seq,
+        request_id,
+        subject_device_id: subject_device_id.clone(),
+        subject_device_name,
+    };
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for peer in peers {
+        // 不要转发给 subject 自己（其实 subject 这时不在 peers 表里，防御性检查）
+        if peer.device_id == subject_device_id {
+            continue;
+        }
+        let url = format!("http://{}/peers/approval/forward", peer.addr);
+        let body = body.clone();
+        let client = client.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = client.post(&url).json(&body).send().await;
+        });
+    }
+}
+
+/// B 把决定回传给 A，单播到指定 addr
+pub async fn send_approval_decision(
+    state: Arc<AppState>,
+    origin_addr: String,
+    request_id: String,
+    accept: bool,
+) {
+    let (my_id, seq) = {
+        let cfg = state.config.read();
+        (cfg.device_id.clone(), state.next_seq())
+    };
+    let body = ApprovalDecisionReq {
+        origin_device_id: my_id,
+        seq,
+        request_id,
+        accept,
+    };
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let url = format!("http://{}/peers/approval/decide", origin_addr);
+    let _ = client.post(&url).json(&body).send().await;
+}
+
+/// 通知所有 peer：这个审批已有结果了，把对应弹框关掉
+pub async fn broadcast_approval_dismiss(state: Arc<AppState>, request_id: String) {
+    let (origin_id, seq) = {
+        let cfg = state.config.read();
+        (cfg.device_id.clone(), state.next_seq())
+    };
+    let peers = state.peers.snapshot();
+    if peers.is_empty() {
+        return;
+    }
+    let body = ApprovalDismissReq {
+        origin_device_id: origin_id,
+        seq,
+        request_id,
+    };
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for peer in peers {
+        let url = format!("http://{}/peers/approval/dismiss", peer.addr);
+        let body = body.clone();
+        let client = client.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = client.post(&url).json(&body).send().await;
+        });
+    }
 }
 
 /// 广播删除历史条目（按 content_hash 通知所有 peer 删除同一内容）

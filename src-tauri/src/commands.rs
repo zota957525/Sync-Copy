@@ -110,6 +110,11 @@ pub fn delete_history_item(
 pub fn clear_history(state: State<'_, Arc<AppState>>, app: AppHandle) {
     state.history.clear();
     let _ = app.emit("history-updated", ());
+    // 广播给所有 peer 也清空
+    let state_c: Arc<AppState> = Arc::clone(state.inner());
+    tauri::async_runtime::spawn(async move {
+        network::client::broadcast_clear_history(state_c).await;
+    });
 }
 
 /// 把某条历史条目重新写回系统剪切板（文本或图片都支持）
@@ -292,14 +297,20 @@ pub async fn join_group(app: AppHandle, target: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn leave_group(
-    state: State<'_, Arc<AppState>>,
-    app: AppHandle,
-) -> Result<(), String> {
+pub async fn leave_group(app: AppHandle) -> Result<(), String> {
+    let state: Arc<AppState> = Arc::clone(app.state::<Arc<AppState>>().inner());
+    // 先给 peer 发离线通知（best-effort，最多等 1.5 秒）
+    let state_c = Arc::clone(&state);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        network::client::broadcast_leave(state_c),
+    )
+    .await;
     state.peers.clear();
     state.peer_keys.clear();
     state.approved_device_ids.write().clear();
     state.banned_device_ids.write().clear();
+    state.forwarded_approvals.lock().clear();
     if let Some(tx) = state.server_shutdown.lock().take() {
         let _ = tx.send(());
     }
@@ -308,14 +319,22 @@ pub fn leave_group(
     Ok(())
 }
 
-/// 完全退出 app（会先下线）
+/// 完全退出 app（会先发离线通知 + 清理状态）
 #[tauri::command]
 pub async fn quit_app(app: AppHandle) {
     let state: Arc<AppState> = Arc::clone(app.state::<Arc<AppState>>().inner());
+    // 广播离线（给组内其它 peer 即时更新计数）
+    let state_c = Arc::clone(&state);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        network::client::broadcast_leave(state_c),
+    )
+    .await;
     state.peers.clear();
     state.peer_keys.clear();
     state.approved_device_ids.write().clear();
     state.banned_device_ids.write().clear();
+    state.forwarded_approvals.lock().clear();
     if let Some(tx) = state.server_shutdown.lock().take() {
         let _ = tx.send(());
     }
@@ -329,9 +348,29 @@ pub fn respond_handshake(
     request_id: String,
     accept: bool,
 ) {
-    let mut pending = state.pending_approvals.lock();
-    if let Some(tx) = pending.remove(&request_id) {
+    // 情形 A：这是本机发起的审批（握手直接进到我），tx 在本机
+    if let Some(tx) = state.pending_approvals.lock().remove(&request_id) {
         let _ = tx.send(accept);
+        return;
+    }
+    // 情形 B：这是其它 peer 转发给我的审批，我要把决定送回给发起方
+    let fwd = state.forwarded_approvals.lock().remove(&request_id);
+    if let Some(info) = fwd {
+        // 在 peers 里找 origin 的 addr
+        let origin_addr = state
+            .peers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.device_id == info.origin_device_id)
+            .map(|p| p.addr);
+        let Some(addr) = origin_addr else {
+            tracing::warn!(origin = %info.origin_device_id, "forwarded approval decision: origin peer unknown");
+            return;
+        };
+        let state_c: Arc<AppState> = Arc::clone(state.inner());
+        tauri::async_runtime::spawn(async move {
+            network::client::send_approval_decision(state_c, addr, request_id, accept).await;
+        });
     }
 }
 

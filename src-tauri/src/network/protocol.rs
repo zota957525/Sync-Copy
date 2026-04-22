@@ -90,3 +90,37 @@ pub struct TrustReq {
     pub subject_device_id: String,
     pub subject_device_name: String,
 }
+
+/// 无 payload 的小组广播（leave / clear-all-history）
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GroupActionReq {
+    pub origin_device_id: String,
+    pub seq: u64,
+}
+
+/// A 收到握手 → 请求所有 peer 也弹一个审批框
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ApprovalForwardReq {
+    pub origin_device_id: String, // A（决策收集方，decide 回传时要找他）
+    pub seq: u64,
+    pub request_id: String,
+    pub subject_device_id: String,
+    pub subject_device_name: String,
+}
+
+/// B（或其他 peer）的用户在弹框上点了决定 → 把决定回传给 A 的 pending_approvals
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ApprovalDecisionReq {
+    pub origin_device_id: String, // B（做决定的那个节点）
+    pub seq: u64,
+    pub request_id: String,
+    pub accept: bool,
+}
+
+/// A 收到决定后 → 通知所有 peer 把对应的弹框关掉
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ApprovalDismissReq {
+    pub origin_device_id: String, // A
+    pub seq: u64,
+    pub request_id: String,
+}

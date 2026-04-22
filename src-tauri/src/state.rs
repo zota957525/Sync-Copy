@@ -69,8 +69,14 @@ pub struct AppState {
     /// 接收去重：每个 peer 最后见过的最大 seq
     pub last_seen_seq: RwLock<HashMap<String, u64>>,
 
-    /// 握手审批队列：服务端收到握手后挂在这里，等前端点「同意/拒绝」再继续
+    /// 握手审批队列：服务端收到握手后挂在这里，等前端点「同意/拒绝」再继续。
+    /// 只在"接到握手的那一台"（A）上有值。
     pub pending_approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+
+    /// 从其它 peer 转发来的审批请求：其它 peer (A) 叫我也弹审批框，
+    /// 用户决定时我要把结果送回给 A 的 pending_approvals。
+    /// 只在"被转发的那些 peer"（B/D/E）上有值。
+    pub forwarded_approvals: Mutex<HashMap<String, ForwardedApprovalInfo>>,
 
     /// 文件保存审批队列
     pub pending_file_saves: Mutex<HashMap<String, PendingFileSave>>,
@@ -85,6 +91,15 @@ pub struct AppState {
     /// 已经被本机（或任一小组成员）拒绝过的设备 id —— 收到这些设备的握手
     /// 直接返回 403。通过 /peers/ban gossip 在组内传播。
     pub banned_device_ids: RwLock<HashSet<String>>,
+}
+
+/// 被转发到本机的审批信息：origin 是原始接到握手的 peer，subject 是待审批设备
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ForwardedApprovalInfo {
+    pub origin_device_id: String,
+    pub subject_device_id: String,
+    pub subject_device_name: String,
 }
 
 #[allow(dead_code)]
@@ -107,6 +122,7 @@ impl AppState {
             seq: AtomicU64::new(1),
             last_seen_seq: RwLock::new(HashMap::new()),
             pending_approvals: Mutex::new(HashMap::new()),
+            forwarded_approvals: Mutex::new(HashMap::new()),
             pending_file_saves: Mutex::new(HashMap::new()),
             peer_keys: PeerKeys::new(),
             approved_device_ids: RwLock::new(HashSet::new()),

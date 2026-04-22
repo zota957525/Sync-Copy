@@ -612,7 +612,14 @@
       unlistenFns.push(fn)
     );
     listen<PendingApproval>("handshake-pending", (e) => {
+      // 同一 request_id 已经存在就不重复追加（防转发回环）
+      if (pendingApprovals.some((p) => p.request_id === e.payload.request_id)) return;
       pendingApprovals = [...pendingApprovals, e.payload];
+    }).then((fn) => unlistenFns.push(fn));
+    listen<{ request_id: string }>("handshake-dismissed", (e) => {
+      pendingApprovals = pendingApprovals.filter(
+        (p) => p.request_id !== e.payload.request_id,
+      );
     }).then((fn) => unlistenFns.push(fn));
     listen<PendingFile>("file-pending", (e) => {
       pendingFiles = [...pendingFiles, e.payload];

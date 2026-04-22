@@ -13,14 +13,15 @@ use tokio::sync::oneshot;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
 use super::protocol::{
-    ClipboardReq, DeleteHistoryReq, FileReq, HandshakeReq, HandshakeResp, PeerPublic, TrustReq,
+    ApprovalDecisionReq, ApprovalDismissReq, ApprovalForwardReq, ClipboardReq, DeleteHistoryReq,
+    FileReq, GroupActionReq, HandshakeReq, HandshakeResp, PeerPublic, TrustReq,
 };
 use crate::{
     clipboard::ClipboardCmd,
     crypto,
     history::{sha256_hex, Source},
     peer::Peer,
-    state::{AppState, PendingFileSave},
+    state::{AppState, ForwardedApprovalInfo, PendingFileSave},
 };
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -43,8 +44,13 @@ pub async fn run(
         .route("/clipboard", post(handle_clipboard))
         .route("/file", post(handle_file))
         .route("/delete_history", post(handle_delete_history))
+        .route("/history/clear", post(handle_clear_history))
         .route("/peers/trust", post(handle_trust))
         .route("/peers/ban", post(handle_ban))
+        .route("/peers/leave", post(handle_leave))
+        .route("/peers/approval/forward", post(handle_approval_forward))
+        .route("/peers/approval/decide", post(handle_approval_decide))
+        .route("/peers/approval/dismiss", post(handle_approval_dismiss))
         // 放宽 body 上限：5MB 文件 + base64 膨胀 + JSON 开销，留到 8MB
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(ctx);
@@ -165,7 +171,8 @@ async fn handle_handshake(
         }));
     }
 
-    // 新设备：走审批流程
+    // 新设备：走审批流程。A 本机弹框 + 转发给所有已知 peer 也弹框。任一节点先决
+    // 定，结果都回流到 A 的 pending_approvals tx。
     let request_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = oneshot::channel::<bool>();
     {
@@ -180,70 +187,97 @@ async fn handle_handshake(
             "device_name": req.device_name,
         }),
     );
-    tracing::info!(peer = %req.device_name, addr = %peer_addr, "handshake pending user approval");
+    tracing::info!(peer = %req.device_name, addr = %peer_addr, "handshake pending user approval (local + broadcast)");
 
-    let approved = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
-        Ok(Ok(ok)) => ok,
-        _ => {
-            ctx.state.pending_approvals.lock().remove(&request_id);
-            tracing::warn!(peer = %req.device_name, "handshake approval timed out");
-            return Err(StatusCode::REQUEST_TIMEOUT);
-        }
-    };
-
-    if !approved {
-        tracing::info!(peer = %req.device_name, "handshake rejected by user");
-        // 记录到本地黑名单 + gossip 告诉其它 peer（后台异步，不阻塞响应）
-        ctx.state
-            .banned_device_ids
-            .write()
-            .insert(req.device_id.clone());
+    // 并发转发给其它 peer 让它们也弹框
+    {
         let state_c = Arc::clone(&ctx.state);
-        let subj_id = req.device_id.clone();
-        let subj_name = req.device_name.clone();
+        let rid_c = request_id.clone();
+        let sid = req.device_id.clone();
+        let sname = req.device_name.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(2),
-                super::client::broadcast_ban(state_c, subj_id, subj_name),
-            )
-            .await;
+            super::client::broadcast_approval_forward(state_c, rid_c, sid, sname).await;
         });
-        return Err(StatusCode::FORBIDDEN);
     }
 
-    // 用户同意 → ECDH 派生共享 AES 密钥并持久化 + 记到白名单
-    let aes_key = crypto::derive_aes_key(my_secret, &their_pub);
-    ctx.state.peer_keys.set(req.device_id.clone(), aes_key);
-    ctx.state.peers.upsert(Peer {
-        device_id: req.device_id.clone(),
-        device_name: req.device_name.clone(),
-        addr: peer_addr.clone(),
-    });
-    ctx.state
-        .approved_device_ids
-        .write()
-        .insert(req.device_id.clone());
-    crate::state::update_status_connected(&ctx.state);
-    let _ = ctx.app.emit("status-updated", ());
-    tracing::info!(peer = %req.device_name, addr = %peer_addr, "peer approved, key exchanged");
+    // 等决定（本机或其它 peer 回传都 ok）
+    let result = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
+        Ok(Ok(b)) => Some(b),
+        _ => None,
+    };
 
-    // Gossip: 告诉组里其它已知 peer 信任此设备。最多等 2 秒；
-    // 尽量在 C 回收到响应前，把「信任 C」送达所有其它节点。
-    let state_c = Arc::clone(&ctx.state);
-    let subj_id = req.device_id.clone();
-    let subj_name = req.device_name.clone();
-    let _ = tokio::time::timeout(
-        Duration::from_secs(2),
-        super::client::broadcast_trust(state_c, subj_id, subj_name),
-    )
-    .await;
+    // 无论什么结果，先关掉所有弹框（本机 + 所有 peer）
+    ctx.state.pending_approvals.lock().remove(&request_id);
+    let _ = ctx.app.emit(
+        "handshake-dismissed",
+        json!({ "request_id": request_id }),
+    );
+    {
+        let state_c = Arc::clone(&ctx.state);
+        let rid_c = request_id.clone();
+        tauri::async_runtime::spawn(async move {
+            super::client::broadcast_approval_dismiss(state_c, rid_c).await;
+        });
+    }
 
-    Ok(Json(HandshakeResp {
-        device_id: my_id,
-        device_name: my_name,
-        peers: peer_list_excluding(&ctx.state, &req.device_id),
-        pubkey: my_pubkey_b64,
-    }))
+    match result {
+        None => {
+            tracing::warn!(peer = %req.device_name, "handshake approval timed out");
+            Err(StatusCode::REQUEST_TIMEOUT)
+        }
+        Some(false) => {
+            tracing::info!(peer = %req.device_name, "handshake rejected");
+            ctx.state
+                .banned_device_ids
+                .write()
+                .insert(req.device_id.clone());
+            let state_c = Arc::clone(&ctx.state);
+            let subj_id = req.device_id.clone();
+            let subj_name = req.device_name.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    super::client::broadcast_ban(state_c, subj_id, subj_name),
+                )
+                .await;
+            });
+            Err(StatusCode::FORBIDDEN)
+        }
+        Some(true) => {
+            // 同意 → ECDH + 加入 peers + 白名单 + trust 广播
+            let aes_key = crypto::derive_aes_key(my_secret, &their_pub);
+            ctx.state.peer_keys.set(req.device_id.clone(), aes_key);
+            ctx.state.peers.upsert(Peer {
+                device_id: req.device_id.clone(),
+                device_name: req.device_name.clone(),
+                addr: peer_addr.clone(),
+            });
+            ctx.state
+                .approved_device_ids
+                .write()
+                .insert(req.device_id.clone());
+            crate::state::update_status_connected(&ctx.state);
+            let _ = ctx.app.emit("status-updated", ());
+            tracing::info!(peer = %req.device_name, addr = %peer_addr, "peer approved");
+
+            // Trust gossip
+            let state_c = Arc::clone(&ctx.state);
+            let subj_id = req.device_id.clone();
+            let subj_name = req.device_name.clone();
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                super::client::broadcast_trust(state_c, subj_id, subj_name),
+            )
+            .await;
+
+            Ok(Json(HandshakeResp {
+                device_id: my_id,
+                device_name: my_name,
+                peers: peer_list_excluding(&ctx.state, &req.device_id),
+                pubkey: my_pubkey_b64,
+            }))
+        }
+    }
 }
 
 async fn handle_clipboard(
@@ -386,6 +420,155 @@ async fn handle_trust(
         via = %req.origin_device_id,
         subject = %req.subject_device_name,
         "peer pre-approved via gossip"
+    );
+    Ok(StatusCode::OK)
+}
+
+async fn handle_leave(
+    State(ctx): State<ServerCtx>,
+    Json(req): Json<GroupActionReq>,
+) -> Result<StatusCode, StatusCode> {
+    let known = ctx
+        .state
+        .peers
+        .snapshot()
+        .iter()
+        .any(|p| p.device_id == req.origin_device_id);
+    if !known {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !ctx.state.seen_seq_and_update(&req.origin_device_id, req.seq) {
+        return Ok(StatusCode::OK);
+    }
+    ctx.state.peers.remove(&req.origin_device_id);
+    ctx.state.peer_keys.remove(&req.origin_device_id);
+    crate::state::update_status_connected(&ctx.state);
+    let _ = ctx.app.emit("status-updated", ());
+    tracing::info!(peer = %req.origin_device_id, "peer left");
+    Ok(StatusCode::OK)
+}
+
+async fn handle_clear_history(
+    State(ctx): State<ServerCtx>,
+    Json(req): Json<GroupActionReq>,
+) -> Result<StatusCode, StatusCode> {
+    let known = ctx
+        .state
+        .peers
+        .snapshot()
+        .iter()
+        .any(|p| p.device_id == req.origin_device_id);
+    if !known {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !ctx.state.seen_seq_and_update(&req.origin_device_id, req.seq) {
+        return Ok(StatusCode::OK);
+    }
+    ctx.state.history.clear();
+    let _ = ctx.app.emit("history-updated", ());
+    tracing::info!(peer = %req.origin_device_id, "remote clear-all applied");
+    Ok(StatusCode::OK)
+}
+
+async fn handle_approval_forward(
+    State(ctx): State<ServerCtx>,
+    Json(req): Json<ApprovalForwardReq>,
+) -> Result<StatusCode, StatusCode> {
+    let known = ctx
+        .state
+        .peers
+        .snapshot()
+        .iter()
+        .any(|p| p.device_id == req.origin_device_id);
+    if !known {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !ctx.state.seen_seq_and_update(&req.origin_device_id, req.seq) {
+        return Ok(StatusCode::OK);
+    }
+    // 如果 subject 已经在我黑/白名单里，不必再弹 —— 结果会自动生效
+    if ctx
+        .state
+        .banned_device_ids
+        .read()
+        .contains(&req.subject_device_id)
+        || ctx
+            .state
+            .approved_device_ids
+            .read()
+            .contains(&req.subject_device_id)
+    {
+        return Ok(StatusCode::OK);
+    }
+    ctx.state.forwarded_approvals.lock().insert(
+        req.request_id.clone(),
+        ForwardedApprovalInfo {
+            origin_device_id: req.origin_device_id.clone(),
+            subject_device_id: req.subject_device_id.clone(),
+            subject_device_name: req.subject_device_name.clone(),
+        },
+    );
+    let _ = ctx.app.emit(
+        "handshake-pending",
+        json!({
+            "request_id": req.request_id,
+            "device_id": req.subject_device_id,
+            "device_name": req.subject_device_name,
+        }),
+    );
+    tracing::info!(via = %req.origin_device_id, subject = %req.subject_device_name, "forwarded approval popup");
+    Ok(StatusCode::OK)
+}
+
+async fn handle_approval_decide(
+    State(ctx): State<ServerCtx>,
+    Json(req): Json<ApprovalDecisionReq>,
+) -> Result<StatusCode, StatusCode> {
+    let known = ctx
+        .state
+        .peers
+        .snapshot()
+        .iter()
+        .any(|p| p.device_id == req.origin_device_id);
+    if !known {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !ctx.state.seen_seq_and_update(&req.origin_device_id, req.seq) {
+        return Ok(StatusCode::OK);
+    }
+    // 找对应的本地 pending_approvals（本机是 A——握手入口）
+    if let Some(tx) = ctx.state.pending_approvals.lock().remove(&req.request_id) {
+        let _ = tx.send(req.accept);
+        tracing::info!(deciding_peer = %req.origin_device_id, request_id = %req.request_id, accept = req.accept, "remote decision applied");
+    } else {
+        tracing::warn!(request_id = %req.request_id, "decision came in but no pending approval found (already decided?)");
+    }
+    Ok(StatusCode::OK)
+}
+
+async fn handle_approval_dismiss(
+    State(ctx): State<ServerCtx>,
+    Json(req): Json<ApprovalDismissReq>,
+) -> Result<StatusCode, StatusCode> {
+    let known = ctx
+        .state
+        .peers
+        .snapshot()
+        .iter()
+        .any(|p| p.device_id == req.origin_device_id);
+    if !known {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !ctx.state.seen_seq_and_update(&req.origin_device_id, req.seq) {
+        return Ok(StatusCode::OK);
+    }
+    ctx.state
+        .forwarded_approvals
+        .lock()
+        .remove(&req.request_id);
+    let _ = ctx.app.emit(
+        "handshake-dismissed",
+        json!({ "request_id": req.request_id }),
     );
     Ok(StatusCode::OK)
 }
