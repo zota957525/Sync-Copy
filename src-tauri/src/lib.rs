@@ -62,12 +62,16 @@ pub fn run() {
             let tx = clipboard::spawn(app.handle().clone(), Arc::clone(&app_state));
             *app_state.clipboard_tx.lock() = Some(tx);
 
-            // 已配置密码 → 自动上线，省掉用户手动点「上线」
+            // 自动上线
             let state_cl = Arc::clone(&app_state);
             let app_cl = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 commands::auto_listen_on_startup(state_cl, app_cl).await;
             });
+
+            // 后台 peer 健康检查：每 10s ping 一次，连续 2 次失败就踢
+            network::health::spawn(Arc::clone(&app_state), app.handle().clone());
+
             Ok(())
         })
         .run(tauri::generate_context!())

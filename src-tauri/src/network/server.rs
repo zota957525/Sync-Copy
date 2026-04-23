@@ -51,6 +51,7 @@ pub async fn run(
         .route("/peers/approval/forward", post(handle_approval_forward))
         .route("/peers/approval/decide", post(handle_approval_decide))
         .route("/peers/approval/dismiss", post(handle_approval_dismiss))
+        .route("/ping", axum::routing::get(handle_ping))
         // 放宽 body 上限：5MB 文件 + base64 膨胀 + JSON 开销，留到 8MB
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(ctx);
@@ -544,6 +545,10 @@ async fn handle_approval_decide(
         tracing::warn!(request_id = %req.request_id, "decision came in but no pending approval found (already decided?)");
     }
     Ok(StatusCode::OK)
+}
+
+async fn handle_ping() -> &'static str {
+    "pong"
 }
 
 async fn handle_approval_dismiss(

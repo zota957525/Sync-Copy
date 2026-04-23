@@ -272,6 +272,7 @@ pub async fn broadcast_clear_history(state: Arc<AppState>) {
     };
     let peers = state.peers.snapshot();
     if peers.is_empty() {
+        tracing::info!("broadcast_clear_history: no peers");
         return;
     }
     let body = GroupActionReq {
@@ -280,14 +281,24 @@ pub async fn broadcast_clear_history(state: Arc<AppState>) {
     };
     let client = match build_client() {
         Ok(c) => c,
-        Err(_) => return,
+        Err(e) => {
+            tracing::error!(error = %e, "broadcast_clear_history: build client failed");
+            return;
+        }
     };
     for peer in peers {
         let url = format!("http://{}/history/clear", peer.addr);
         let body = body.clone();
         let client = client.clone();
+        let peer_name = peer.device_name.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = client.post(&url).json(&body).send().await;
+            match client.post(&url).json(&body).send().await {
+                Ok(r) if r.status().is_success() => {
+                    tracing::info!(peer = %peer_name, "clear-history broadcast ok");
+                }
+                Ok(r) => tracing::warn!(peer = %peer_name, status = %r.status(), "clear-history non-2xx"),
+                Err(e) => tracing::warn!(peer = %peer_name, error = %e, "clear-history failed"),
+            }
         });
     }
 }

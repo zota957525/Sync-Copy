@@ -108,12 +108,14 @@ pub fn delete_history_item(
 
 #[tauri::command]
 pub fn clear_history(state: State<'_, Arc<AppState>>, app: AppHandle) {
+    let peer_count = state.peers.count();
+    tracing::info!(peer_count, "clear_history invoked, will broadcast to peers");
     state.history.clear();
     let _ = app.emit("history-updated", ());
-    // 广播给所有 peer 也清空
     let state_c: Arc<AppState> = Arc::clone(state.inner());
     tauri::async_runtime::spawn(async move {
         network::client::broadcast_clear_history(state_c).await;
+        tracing::info!("broadcast_clear_history finished");
     });
 }
 

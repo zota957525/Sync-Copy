@@ -266,149 +266,6 @@
   // 记录刚刚点击的条目 id，用于按下时变色 + 显示 "已复制" 微提示
   let flashId = $state<string | null>(null);
 
-  // ---- 边缘吸附状态 ----
-  type SnapEdge = "left" | "right" | null;
-  let snapEdge = $state<SnapEdge>(null);
-  let snapHidden = $state(false); // 是否已滑入屏幕边缘隐藏
-  let mouseInside = $state(false);
-  let moveDebounceTimer: number | null = null;
-  let hideTimer: number | null = null;
-  let programmaticMove = false; // 我们自己调 setPosition 时别重入
-  const SNAP_THRESHOLD = 20; // 距离边缘多少像素内算吸附
-  const HIDE_DELAY_MS = 1500; // 吸附后多久无鼠标悬停就隐藏
-  const SLIVER_PX = 4; // 隐藏后露出的像素
-
-  /** 是否允许自动隐藏（设置/加入/审批界面时禁止） */
-  function canAutoHide(): boolean {
-    return (
-      view === "main" &&
-      pendingApprovals.length === 0 &&
-      pendingFiles.length === 0 &&
-      !sendingFiles
-    );
-  }
-
-  async function detectSnap() {
-    // 悬浮球形态下不吸附，用户自由放置
-    if (collapsed) return;
-    const win = getCurrentWindow();
-    const pos = await win.outerPosition();
-    const size = await win.outerSize();
-    const mon = await currentMonitor();
-    if (!mon) return;
-    const mx = mon.position.x;
-    const mw = mon.size.width;
-
-    const distLeft = pos.x - mx;
-    const distRight = mx + mw - (pos.x + size.width);
-
-    if (distLeft >= 0 && distLeft <= SNAP_THRESHOLD) {
-      await snapTo("left", mon, size);
-    } else if (distRight >= 0 && distRight <= SNAP_THRESHOLD) {
-      await snapTo("right", mon, size);
-    } else {
-      // 不在吸附范围 → 解除吸附
-      snapEdge = null;
-      snapHidden = false;
-      if (hideTimer) {
-        clearTimeout(hideTimer);
-        hideTimer = null;
-      }
-    }
-  }
-
-  async function snapTo(edge: "left" | "right", mon: any, size: { width: number; height: number }) {
-    const win = getCurrentWindow();
-    const pos = await win.outerPosition();
-    const targetX =
-      edge === "left"
-        ? mon.position.x
-        : mon.position.x + mon.size.width - size.width;
-    programmaticMove = true;
-    await win.setPosition(new PhysicalPosition(targetX, pos.y));
-    setTimeout(() => (programmaticMove = false), 120);
-    snapEdge = edge;
-    snapHidden = false;
-    // 鼠标还在窗口内时不隐藏，等鼠标离开再倒计时
-    if (!mouseInside) scheduleHide();
-  }
-
-  function scheduleHide() {
-    if (hideTimer) clearTimeout(hideTimer);
-    hideTimer = window.setTimeout(() => {
-      if (snapEdge && canAutoHide()) {
-        void hideToEdge();
-      }
-    }, HIDE_DELAY_MS);
-  }
-
-  async function hideToEdge() {
-    if (!snapEdge) return;
-    const win = getCurrentWindow();
-    const pos = await win.outerPosition();
-    const size = await win.outerSize();
-    const mon = await currentMonitor();
-    if (!mon) return;
-
-    const targetX =
-      snapEdge === "left"
-        ? mon.position.x - size.width + SLIVER_PX
-        : mon.position.x + mon.size.width - SLIVER_PX;
-    programmaticMove = true;
-    await win.setPosition(new PhysicalPosition(targetX, pos.y));
-    setTimeout(() => (programmaticMove = false), 120);
-    snapHidden = true;
-  }
-
-  async function revealFromEdge() {
-    if (!snapEdge || !snapHidden) return;
-    const win = getCurrentWindow();
-    const pos = await win.outerPosition();
-    const size = await win.outerSize();
-    const mon = await currentMonitor();
-    if (!mon) return;
-
-    const targetX =
-      snapEdge === "left"
-        ? mon.position.x
-        : mon.position.x + mon.size.width - size.width;
-    programmaticMove = true;
-    await win.setPosition(new PhysicalPosition(targetX, pos.y));
-    setTimeout(() => (programmaticMove = false), 120);
-    snapHidden = false;
-  }
-
-  function onWindowMouseEnter() {
-    mouseInside = true;
-    if (hideTimer) {
-      clearTimeout(hideTimer);
-      hideTimer = null;
-    }
-    if (snapEdge && snapHidden) {
-      void revealFromEdge();
-    }
-  }
-
-  function onWindowMouseLeave() {
-    mouseInside = false;
-    if (snapEdge && canAutoHide()) {
-      scheduleHide();
-    }
-  }
-
-  // 如果状态从"可自动隐藏"切到"不能自动隐藏"，取消定时器；反之启动
-  $effect(() => {
-    if (!canAutoHide()) {
-      if (hideTimer) {
-        clearTimeout(hideTimer);
-        hideTimer = null;
-      }
-      // 如果之前已经隐藏，这里展开，避免用户在弹框时看不到
-      if (snapEdge && snapHidden) {
-        void revealFromEdge();
-      }
-    }
-  });
 
   async function copyItem(item: HistoryItem) {
     if (item.kind === "file") {
@@ -446,16 +303,6 @@
   let lastExpandedSize = { w: DEFAULT_EXPANDED.w, h: DEFAULT_EXPANDED.h };
 
   async function collapseToBall() {
-    console.log("[collapseToBall] enter");
-    if (snapEdge && snapHidden) {
-      await revealFromEdge();
-    }
-    snapEdge = null;
-    snapHidden = false;
-    if (hideTimer) {
-      clearTimeout(hideTimer);
-      hideTimer = null;
-    }
     const win = getCurrentWindow();
     // outerSize 返回物理像素；要转为逻辑像素记下来
     const sz = await win.outerSize();
@@ -464,25 +311,17 @@
       w: Math.round(sz.width / scale),
       h: Math.round(sz.height / scale),
     };
-    console.log("[collapseToBall] physical=", sz, "scale=", scale, "logical saved=", lastExpandedSize);
-
-    programmaticMove = true;
     collapsed = true;
     // 用 LogicalSize：config 的 minWidth 也是逻辑像素，保持一致
     await win.setSize(new LogicalSize(BALL_SIZE, BALL_SIZE));
-    console.log("[collapseToBall] setSize ok, now=", await win.outerSize());
-    setTimeout(() => (programmaticMove = false), 200);
   }
 
   async function expandFromBall() {
-    console.log("[expandFromBall] enter, lastExpandedSize=", lastExpandedSize);
     const win = getCurrentWindow();
     const w = lastExpandedSize.w || DEFAULT_EXPANDED.w;
     const h = lastExpandedSize.h || DEFAULT_EXPANDED.h;
-    programmaticMove = true;
     collapsed = false;
     await win.setSize(new LogicalSize(w, h));
-    console.log("[expandFromBall] setSize ok, now=", await win.outerSize());
 
     // 展开后如果超出屏幕，挪一下让它完全可见
     const pos = await win.outerPosition();
@@ -501,7 +340,6 @@
         await win.setPosition(new PhysicalPosition(nx, ny));
       }
     }
-    setTimeout(() => (programmaticMove = false), 200);
   }
 
   // 悬浮球上的鼠标：短按抬起 = 点击展开；移动超过 8px = 拖动窗口
@@ -631,16 +469,6 @@
       }, 2500);
     }).then((fn) => unlistenFns.push(fn));
 
-    // 托盘重新打开窗口时，清掉吸附状态（后端已 recenter）
-    listen("window-shown", () => {
-      snapEdge = null;
-      snapHidden = false;
-      if (hideTimer) {
-        clearTimeout(hideTimer);
-        hideTimer = null;
-      }
-    }).then((fn) => unlistenFns.push(fn));
-
     // 拖文件到窗口 → 发送
     getCurrentWebview()
       .onDragDropEvent((event) => {
@@ -661,21 +489,8 @@
     }, 3000);
     unlistenFns.push(() => clearInterval(statusPoll));
 
-    // 窗口位置变化：用户拖拽结束后检测是否吸附到屏幕边缘
-    getCurrentWindow()
-      .onMoved(() => {
-        if (programmaticMove) return;
-        if (moveDebounceTimer) clearTimeout(moveDebounceTimer);
-        moveDebounceTimer = window.setTimeout(() => {
-          void detectSnap();
-        }, 220);
-      })
-      .then((fn) => unlistenFns.push(fn));
-
     return () => {
       unlistenFns.forEach((fn) => fn());
-      if (moveDebounceTimer) clearTimeout(moveDebounceTimer);
-      if (hideTimer) clearTimeout(hideTimer);
     };
   });
 
@@ -773,15 +588,7 @@
     {/if}
   </div>
 {:else}
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div
-  class="window"
-  class:snap-hidden={snapHidden}
-  class:snap-left={snapEdge === "left"}
-  class:snap-right={snapEdge === "right"}
-  onmouseenter={onWindowMouseEnter}
-  onmouseleave={onWindowMouseLeave}
->
+<div class="window">
   <!-- 顶部栏 -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
@@ -1057,18 +864,18 @@
   }
   .ball-count {
     position: absolute;
-    bottom: -2px;
-    right: -2px;
-    min-width: 16px;
-    height: 16px;
-    padding: 0 4px;
+    bottom: 3px;
+    right: 3px;
+    min-width: 15px;
+    height: 15px;
+    padding: 0 3px;
     border-radius: 8px;
     color: white;
-    font-size: 10px;
-    line-height: 16px;
+    font-size: 9px;
+    line-height: 15px;
     font-weight: 600;
     text-align: center;
-    border: 2px solid #ffffff;
+    border: 1.5px solid #ffffff;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
     pointer-events: none;
     font-variant-numeric: tabular-nums;
@@ -1110,37 +917,6 @@
     position: relative;
   }
   /* 吸附到左/右边缘时，贴边那侧的圆角抹掉 */
-  .window.snap-left {
-    border-top-left-radius: 0;
-    border-bottom-left-radius: 0;
-  }
-  .window.snap-right {
-    border-top-right-radius: 0;
-    border-bottom-right-radius: 0;
-  }
-  /* 隐藏状态下在可见的 sliver 那侧画一条醒目的高亮，告诉用户"往这里靠"可以唤出窗口 */
-  .window.snap-hidden.snap-left::after,
-  .window.snap-hidden.snap-right::after {
-    content: "";
-    position: absolute;
-    top: 10%;
-    bottom: 10%;
-    width: 3px;
-    border-radius: 3px;
-    background: linear-gradient(
-      to bottom,
-      rgba(96, 165, 250, 0.85),
-      rgba(59, 130, 246, 0.85)
-    );
-    box-shadow: 0 0 8px rgba(96, 165, 250, 0.6);
-    pointer-events: none;
-  }
-  .window.snap-hidden.snap-left::after {
-    right: 0.5px;
-  }
-  .window.snap-hidden.snap-right::after {
-    left: 0.5px;
-  }
   .header {
     display: flex;
     align-items: center;
