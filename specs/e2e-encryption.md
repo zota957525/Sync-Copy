@@ -107,3 +107,61 @@ Sync Copy 的差异化定位之一是"**内容不出局域网 + 端到端加密*
 ## 8. Review 段（占位）
 
 > code-reviewer / tech-architect / security-reviewer 后续填写。本 feature 必须经 security-reviewer 显式 ACK 才能 ADR_ACCEPTED（CLAUDE.md 第 9 节）。
+
+---
+
+## 8. Code Review (by code-reviewer · 2026-05-09 · PR-1 commit b3382cb)
+
+**结论**：APPROVED
+
+### 8.1 Spec / ADR 一致性（5 聚焦点逐条）
+
+1. MUST-1 AAD 字面量字节级一致 ✅：`build_aad` 拼装顺序 = `AAD_MAGIC(b"sync-copy-v2") || kind.as_bytes() || origin_device_id.as_bytes() || seq.to_be_bytes()` 与 ADR-008 第 7.2 节 MUST-1 字面级一致；9 个 AadKind 字面量（text / image_png / file / trust / ban / leave / delete_history / clear_history / approval）与 ADR-011 第 3.3 节字面量表 1:1 匹配；`seq.to_be_bytes()` 是 BE；单测 `aad_layout_byte_exact` 用手算 expected Vec 字节级断言（见 mod.rs:225-242）。
+2. HKDF v2 单点定义 ✅：`grep "sync-copy-v2"` 命中 3（mod.rs AAD_MAGIC + x25519.rs HKDF_SALT + x25519.rs HKDF_INFO），符合 ADR-011 实施提示 #2；`derive_aes_key` 引用 `HKDF_SALT` / `HKDF_INFO` 常量而非硬编码（x25519.rs:72-74）。
+3. MUST-2 zeroize 边界 ✅：Cargo.toml `zeroize = "1.8", features = ["zeroize_derive"]`，Lock 锁定 1.8.2；`derive_aes_key` 返裸 `[u8; 32]` 与 ADR-011 第 3.5 节"trait 实现内部不引入额外 zeroize"边界一致（caller 在 ADR-009 第 3.1 节 PeerState.aes_key 处用 `Zeroizing::new` 包装；trait 与 zeroize 解耦便于 future 切实现）；AesGcmSealer 是 unit struct（无 key 字段）符合第 3.2 节"无状态"约束。
+4. nonce 唯一性 + 无入参 ✅：`Sealer::encrypt` 签名仅收 `(key, plaintext, aad)`，无 nonce 入参（caller 不可注入，密码学不变式）；encrypt 内部 `Aes256Gcm::generate_nonce(&mut OsRng)` 12B；单测 `nonce_uniqueness_under_repeated_encrypt` 真跑 100 次 encrypt + HashSet 断言 `len()==100`（aes_gcm.rs:308-328）。
+5. MUST-5 panic message 字面量 ✅：所有 `.expect()` / `.unwrap()` message 全字面量；无 `format!()` 运行时插值（grep 验证 18 处 expect/unwrap，每处都是 `"……"` 字面量字符串）。
+
+### 8.2 必修条目落地
+
+- MUST-1 AAD 绑值 ✅：`build_aad` 字节级匹配；3 条 aad_byte_flip_* + cross_origin + cross_seq 单测形成 5 维防线
+- MUST-2 zeroize ✅：crate 引入 + caller 边界（PeerState）契约清晰；trait 不双重清零（避免提前清零返空字节反模式）
+- MUST-5 panic message 字面量 ✅：18 处 expect/unwrap 全字面量
+
+### 8.3 发现的问题（按严重度排序）
+
+#### [低 / nit] hkdf_deterministic 测试绕开 derive_aes_key 直接调 HKDF crate
+- 文件：`src-tauri/src/crypto/x25519.rs:117-136`
+- 现象：测试以"重建两个 hkdf::Hkdf::new + expand"等价模拟，未真正调 `X25519KeyExchange::derive_aes_key`
+- 风险：若 future 重构改 derive_aes_key 内部 HKDF 调用顺序（如忘传 INFO），此测试无法抓出；implementer 已加注释说明 `EphemeralSecret` 消费语义限制
+- 建议修法：保留现状（caller 注释合理）；`cross_peer_keys_differ` 间接覆盖 derive_aes_key 入口；future 可补"用 mock Secret 注入相同字节验证 derive 输出确定" 但非阻塞
+
+#### [低 / nit] tampered_ciphertext_decrypt_fails 的 assert! 消息含运行时插值
+- 文件：`src-tauri/src/crypto/aes_gcm.rs:167-169`
+- 现象：`assert!(matches!(...), "..., 实际: {:?}", result.err())` 用了 `{:?}`
+- 风险：MUST-5 严格读字面是 panic / unwrap / expect 的 message；assert! 的失败消息是 test diagnostic，不在 prod 路径，不属 MUST-5 约束。**不构成违规**，仅记录避免 reviewer 误判
+- 建议修法：无须修；如要严格统一可改为字面量 `"实际不是 DecryptFailed"`
+
+#### [低 / nit] roundtrip 仅覆盖 text，未直接覆盖 image_png / file
+- 文件：`src-tauri/src/crypto/aes_gcm.rs:122-141`
+- 现象：仅 1 条 round-trip（Text）；ImagePng / File kind 通过 `aad_kind_bytes_all_distinct` + `cross_origin/seq` 间接覆盖 enum 拼装，但 round-trip 路径未跑这两个 kind
+- 风险：极低（encrypt/decrypt 与 kind 无关，只是 aad 字节不同）；不影响 PR-1 验收
+- 建议修法：无须修；PR-3+ handler 落地时各 kind 端到端 round-trip 自然覆盖
+
+### 8.4 风险点（可能的隐藏 bug）
+
+- **HKDF v3 future bump 不一致风险**：当 v3 升级时若只改 HKDF_SALT 忘改 AAD_MAGIC（或反之），加密路径仍跑通但语义错位 → 难调试。已有 ADR-011 第 3.4 节"两常量 bump 一致"不变式 + 第 4.3 节副作用 #2 警告 + 实施提示 #2 grep 检查项三处锚定，缓解充分
+- **caller 漏调 build_aad 直传 `&[]`**：trait 签名 `aad: &[u8]` 不阻挡空字节串；ADR-011 sec 第 7.2 节第 5 条已识别 + 缓解（PR 阶段 grep `sealer.encrypt(.*&\[\]` = 0 命中）。本 PR-1 不含 handler 调用点，缓解检查留 PR-3+ handler 落地时执行
+- **`.into()` 类型推导隐式依赖**：aes_gcm.rs:40 / :81 用 `key.into()` 把 `&[u8; 32]` 推到 `&Key<Aes256Gcm>`；clippy 已通过；未来若 aes-gcm crate 改 Key 类型签名需复测
+
+### 8.5 给 implementer 的明确 todo 清单
+
+无修补项。本 PR 通过；可推进 PR-2 (PeerRegistry, ADR-009)。
+
+### 8.6 测试覆盖评估
+
+- ADR-011 第 3.6 节最小 6 条 + 建议 3 条单测**全部覆盖** + 1 条 build_aad 字节锁定 + 3 条额外（empty_plaintext / pubkey b64 invalid / wrong_length） = 18 条
+- e2e-encryption AC #6 ≥ 5 条单测 ✅（覆盖 round-trip / wrong_key / decrypt 失败 / HKDF 确定 / 跨 peer 独立）
+- 公钥 base64 长度 == 44 ✅ (`pubkey_b64_roundtrip`)
+- ADR-008 MUST-1 单测要求"改 aad 任一字节后 decrypt 失败" ✅（覆盖 magic / kind / seq 3 段）
+- 未覆盖（合理）：handler 端到端 / cross-platform / v0 不互通——属 P2-2+ qa-tester e2e 阶段
