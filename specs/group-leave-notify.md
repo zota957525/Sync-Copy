@@ -121,3 +121,63 @@ priority: P2
 ## 8. Review 段（占位）
 
 > code-reviewer / tech-architect / security-reviewer 后续填写。本 feature 涉及网络协议与状态收敛路径，必须经 security-reviewer ACK（CLAUDE.md 第 9 节）。
+
+---
+
+## 8. Code Review (by code-reviewer · 2026-05-09 · PR-3 Lifecycle + ClientPool + AppState)
+
+> 范围：commit 25fe411（基础设施三件套最后一件，落 ADR-010 v1.2 + ADR-009 第 3.5 节 client_pool + ADR-008 MUST-5）。本 spec 第 8 节是 5 份共享 spec（peer-heartbeat / group-leave-notify / diagnostic-logging / tray-integration / settings-panel）中最直接关联的承载点（关闭 7 步含 leave 1500ms timeout 由 PR-3 占位实现）。
+
+**结论**：CHANGES_REQUESTED（2 条 [低/nit] 文本/单测级补丁；非阻塞主路径，主窗口可静默派 backend-impl 落）
+
+### 8.1 ADR / spec 一致性（5 聚焦点）
+
+1. **MUST-5 panic hook 注册位置**：✅ APPROVED。`lib.rs::run` 第 34 行（Builder::default 第 49 行 + AppState::new 第 47 行触发的 Lifecycle::new 之前）；`prev(info)` 链保留 ✅；hook 不调 `app.emit` / `tauri::dialog`，用 osascript / powershell / eprintln 三 cfg 隔离 ✅；payload 仅取 `&'static str` / `String` 字面 ✅；dialog 文案不含 payload ✅；`prev(info)` 注释明文 "默认 backtrace 含函数符号 + 行号，release 模式不含栈变量值" 落 P1 补丁 ✅。
+2. **client_pool 接口契约**：✅ APPROVED。`get(id)` miss 返 None 不 lazy add（单测 `get_does_not_lazy_add` 显式断言 + 池 size 仍 0 ✅）；`remove` 是 `pub(crate)` + `#[allow(dead_code)]` PR-3 临时标注 ✅；`replace` 用 `Client::builder().no_proxy().build()` 落 lessons-learned 第 4.1 节 ✅；replace 写锁内 HashMap 替换让旧 Client 随原值 drop ✅。
+3. **Phase 状态机 + shutdown 幂等**：⚠ APPROVED-with-nit。Phase 4 态 + 转移注释明文 ✅；shutdown 入口检查 `Shutting | Dead` 返 Duration::ZERO（单测 `shutdown_idempotent_reentry` + `shutdown_idempotent_when_already_shutting` 双覆盖 ✅）；step 6 在 step 4 join 之后 ✅；log_guard 字段顺序最后 ✅。**遗漏**：ADR-010 第 6 节单测 #9 期望"非法转移（Dead → Running）panic"，当前 `phase_transitions_valid` 仅验证合法路径可写，没有 enforcement（任何代码可 `*phase.write() = X`）。属占位阶段可接受 — 见 8.5 todo P-low-1。
+4. **deadline 命中 tracing::warn**：✅ APPROVED。step 3 leave / step 4 health / step 5 server 三步 timeout 均有 `tracing::warn!(target: "lifecycle", step, deadline_ms, actual_ms, ...)` 落盘 ✅；P0 tray TODO 注释在 lib.rs `quit_app` 命令上方明文（行 202）✅；P0 tray bypass tracing::warn 强制观测线 PR-3 未触达（tray 集成 PR-4 落地 — 符合 PR-3 范围）。
+5. **依赖兼容性 cross-check**：✅ APPROVED。tokio-util 0.7 + tracing-appender 0.2 + thiserror 1 三依赖全在 ADR-010 第 5 节实施提示 #2 列出；tokio 1 / tracing 0.1 同生态版本无冲突；`tokio-util = { version = "0.7", features = ["rt"] }` 启用 CancellationToken ✅。
+
+附加查项：cargo clippy `-D warnings` 0 warning ✅；cargo test --lib 43/43 pass ✅（PR-1 18 + PR-2 14 + PR-3 11）；cargo fmt --check pass ✅；空 worker 仅 `select! { cancel | sleep(5s) }` 不引业务（无 reqwest / arboard）✅；4 退出路径仅 quit_app 命令注册（CloseRequested / tray menu PR-4）✅；无 `app.exit(0)` / `process::exit` 绕过 Lifecycle 的代码（仅启动失败 + panic hook 内 abort，符合 ADR-010 第 3.4 节）✅。
+
+### 8.2 发现的问题
+
+#### [低/nit] `show_native_fatal_dialog` 内 `_message` 变量未使用 + osascript / powershell 命令字符串拼接潜在注入面
+
+- 文件：`src-tauri/src/lib.rs:144-147`（dead code）+ `:155-157`（osascript format!）+ `:172-176`（powershell format!）
+- 现象：`_message` 计算后从未读；mac/Win 分支各自独立 `format!` 把 `location` 直接插入 shell 命令字符串
+- 风险：`location` 来源 `info.location()`（编译期 `file!()` + `line!()`，攻击者无法构造），但若未来源码引入特殊字符路径（如含 `"` / `'` / `\`）会让 shell 命令体破裂；`_message` 是 dead code 引轻微误导
+- 建议修法：删 `_message` 行；mac/Win 分支用 `Command::arg()` 多次传参（osascript 用 `-e` 单参数较难；可改 escape `"` `\` 后再插入）；或加 `// SECURITY: location is compile-time file!:line!, attacker-uncontrollable` 注释明示已审
+
+#### [低/nit] ADR-010 第 6 节单测 #9 "非法转移（Dead → Running）panic" 未实现 + lifecycle.rs 521 行小超 ADR 第 5 节"≤ 350 行硬约束"
+
+- 文件：`src-tauri/src/app/lifecycle.rs`（整体 521 行 / `phase_transitions_valid` 测试 504-520）
+- 现象：(a) ADR-010 第 6 节单测 #9 期望非法转移 panic，但 phase 字段是 `RwLock<Phase>` 直写无 enforcement；(b) lifecycle.rs 521 行比 ADR-010 第 5 节"≤ 350 行硬约束"超 49%（但 ADR 第 9 节自查写"≤ 500 行硬约束已达"两处文本自相矛盾）
+- 风险：(a) 未来 implementer 误写 `*phase.write() = Phase::Running` 在 Dead 之后，无 enforcement；属低危（仅内部代码，无外部接口）；(b) 行数硬约束 ADR 文本自相矛盾，本 PR 选了较宽松的 500 解读
+- 建议修法：(a) 加 `Lifecycle::set_phase(new)` 内方法做转移合法性 assert（仅 cfg(debug_assertions) 即可，release 不 panic 仅 warn）；或单测加"在 Dead 上写 Running 后 panic"用 `#[should_panic]` 但需先实现 enforcement；(b) 不必修代码，可在后续 ADR-010 supersede 时统一 350/500 文本；当前作 nit 记录
+
+### 8.3 风险点（隐藏 bug 候选）
+
+- **PR-4 落地 axum server 时**：`server_shutdown_tx` 的 oneshot::Sender 必须在 step 5 spawn axum 之前由 lifecycle 持有 — 当前 `start()` 占位未涉及；PR-4 实施时检查
+- **PR-5 clipboard std::thread 落地时**：mpsc `ClipboardCmd::Shutdown` 的 send 必须在 step 2，join 在 step 4，且 join 100ms 超时后 detach（非 abort，因 std::thread 没 abort API）—当前 lifecycle struct 字段未预留 `clipboard_cmd_tx` / `clipboard_thread`，PR-5 实施时补
+- **panic 在 start step 1 之前发生**：tracing 未 init → tracing::error! 是 no-op，仅 eprintln + dialog；ADR-010 第 4.2 节已声明可接受，PR-3 验证此边界（dialog 不依赖 tracing 可正常弹）
+- **panic hook 内 eprintln msg 字面**：ADR-008 第 6.1 节明确允许 stderr 写 payload 字面（攻击者拿不到 stderr，仅 dev tail 可见）；release build stderr 用户看不到（ADR 已声明）
+
+### 8.4 测试覆盖评估
+
+PR-3 范围下 11 条单测合理（lifecycle 6 + client_pool 5）。**未覆盖但属 PR-4/5 范畴**（不算欠债）：
+- `start_step5_bind_fail_unwinds_step4_and_step1`（mock TCP bind 失败 — PR-4 落 axum 后写）
+- `shutdown_step3_leave_timeout` mock 真实 reqwest 永远 timeout（PR-4 落 leave broadcast 后写）
+- `shutdown_step4_clipboard_join_timeout` mock std::thread（PR-5 落 clipboard 后写）
+- `panic_hook_*` 4 条单测（panic hook 注册测试需 fork process 或 sentinel mock，独立测试模块；ADR-010 第 6 节亦为推荐非强制）
+
+### 8.5 给 implementer 的明确 todo 清单
+
+> 主窗口策略：以下 2 条均 [低/nit]，不阻塞 PR-4 启动。建议合到 PR-4 第一个 commit 顺手清理；不必单独 patch commit。
+
+- [ ] **P-low-1**：删 `lib.rs:144-147` 的 `_message` dead code；mac/Win 分支 `format!` 上方加注释 `// SECURITY: location is compile-time file!:line!, attacker-uncontrollable`（明示 shell 拼接已审）
+- [ ] **P-low-2**：（可选 — 不修代码亦可）lifecycle.rs `phase_transitions_valid` 单测顶端加注释说明 "ADR-010 第 6 节单测 #9 期望非法转移 panic 留 PR-4 enforcement；当前 PR-3 仅验证合法转移可写"；或在 `Lifecycle::set_phase` 加 `debug_assert!` 转移合法性
+
+### 8.6 owner 边界自查
+
+未写代码 ✅；未改 ADR / spec 第 1-7 节 ✅；未改 PLAN.md（v2-9 主窗口职责）✅；未调任何 agent ✅；review 段写到合适 spec（group-leave-notify 是关闭 7 步含 leave 1500ms timeout 最直接关联）✅；本段 ≤ 80 行预算控制 ✅。
