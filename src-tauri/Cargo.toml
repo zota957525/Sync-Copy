@@ -36,5 +36,7 @@ hkdf = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+# zeroize：PeerState.aes_key 类型 Zeroizing<[u8;32]>（ADR-008 MUST-2 / ADR-009 第 3.1 节）
+zeroize = { version = "1.8", default-features = false, features = ["zeroize_derive"] }
 # PNG 编解码（剪切板图片同步）
 image = { version = "0.25", default-features = false, features = ["png"] }
