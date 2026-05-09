@@ -2,7 +2,7 @@
 
 > 这份文件是「主窗口」（即你正在阅读它的这个 Claude 会话）的工作契约。
 > 任何与此契约冲突的指令请反过来引用本文件提醒用户。
-> 修改本文件本身需要走 ADR 流程（见 §6）。
+> 修改本文件本身需要走 ADR 流程（见 第 6 节）。
 
 ---
 
@@ -194,19 +194,19 @@ superseded_by: [ADR-MMM]   # 可选
    → 产出 specs/<slug>.md，状态 SPEC_DRAFTED
    ↓
 3. 调 ux-designer（如涉及 UI）
-   → 产出 specs/<slug>.md 的 §UX 段，或独立 specs/ux/<slug>.md
+   → 产出 specs/<slug>.md 的 UX 段，或独立 specs/ux/<slug>.md
    ↓
 4. 调 tech-architect
    → 产出 decisions/ADR-NNN-<slug>.md，状态 ADR_DRAFTED
    ↓
 5. 调 security-reviewer（如涉及 crypto/auth/网络协议）
-   → 在 ADR 末尾追加 §安全审阅，或独立 ADR
+   → 在 ADR 末尾追加 安全审阅，或独立 ADR
    ↓
 6. 调 backend-implementer 和/或 frontend-implementer
    → 修改对应源码，状态 IMPL_IN_PROGRESS → IMPL_DONE
    ↓
 7. 调 code-reviewer
-   → 不改代码，写 review 报告到 specs/<slug>.md 的 §Review 段
+   → 不改代码，写 review 报告到 specs/<slug>.md 的 Review 段
    → 状态 REVIEW_PASSED 或 BLOCKED_BY_REVIEW
    ↓
 8. 调 qa-tester
@@ -272,6 +272,16 @@ SUPERSEDED            被另一个 task 替代
 
 ---
 
+## 11.5 文档书写规约
+
+- **禁止使用 § 符号**（U+00A7，Section Sign）作为编号或序列标记
+- 章节引用统一用「第 N 节」「第 N.M 节」（如：见 第 4 节、参见 第 7.5 节）
+- 列表 / bullet 用标准 `-` 或 `1. 2. 3.` 数字编号
+- agent / 主窗口 / 用户在写任何 spec / ADR / PLAN.md / 报告时都遵守此规约
+- 该规约由用户 2026-05-06 直接拍板（轻量约定，免 ADR）
+
+---
+
 ## 12. 模式开关（lite / full）
 
 - 当前模式：见 `.claude/pipeline-mode` 文件
@@ -287,3 +297,57 @@ SUPERSEDED            被另一个 task 替代
 
 - 每一次新增 agent / 删除 agent / 更改 SDLC 流程 → 写一个 ADR + 更新本文件
 - 每一次 CLAUDE.md 修改必须有对应 ADR 论证
+
+---
+
+## 14. HANDOFF v5 规则镜像
+
+> 由 ADR-002（2026-05-08）落盘。`HANDOFF.md` v5 包含 v4-1~v4-8 + v5-1~v5-12 共 20 条规则。
+> v2-1 要求：subagent 不读全局 `~/.claude/CLAUDE.md`，必须把硬规则镜像到项目级。下表即镜像。
+
+### 14.1 工作流纪律（v5 新增）
+
+| 规则 | 一句话 | 主窗口动作 |
+|---|---|---|
+| v5-1 错位升级信号 | 用户 / 主窗口 / 错位 agent 在做某专家应做的事 = 流程缺口的硬信号 | 立即触发 lite→full 切换或新角色引入；不让流水线带着错位硬跑 |
+| v5-2 流水线自动跑 | 默认连续推进所有 SDLC 阶段，仅 3 类硬关卡停下 | ① 关键产品方向决策（spec K-Q 拍板）② 早期架构性决策（design 阶段决策卡片）③ 不可逆操作（合 PR / 上线 / 删数据 / 公开发布）；其他全自动；连续 BLOCKED 2 次上报用户 |
+| v5-3 严格 SDLC 不轻流程 | 任何功能必须 spec → ADR（如有架构）→ design（如有 UI）→ 实现 → review → test-matrix → release-notes，**一个不能少** | lite 仅是默认更少 agent 常驻；需要某 SDLC 步骤的产出时**临时召唤**对应专家，不能省 |
+
+### 14.2 用户交互纪律（v5 新增）
+
+| 规则 | 一句话 | 主窗口动作 |
+|---|---|---|
+| v5-11 决策卡片格式 | 任何 stop-and-ask 必须含问题 + 选项 + 推荐 + 取舍 + must-fix | 禁止开放式"接下来怎么办？""你说选哪个？" |
+| v5-12 § 符号禁令 | 与 第 11.5 节 一致 | 已镜像 |
+
+### 14.3 工程规范（v5 新增 — 实现阶段必读）
+
+| 规则 | 适用场景 | 主要动作 |
+|---|---|---|
+| v5-4 第三方依赖兼容性 cross-check | 引入 / 升级任何第三方库前 | 主动查 trove classifier / engines / minimum-supported-version；锁版本范围 |
+| v5-5 长生存周期任务 lifecycle owner | 调度器 / 后台 worker / 长连接等 | 明确挂在哪个 event loop / 谁拉起 / 谁负责关；禁止挂在临时 loop |
+| v5-6 外部接口 try-coerce | from_external / from_sdk / from_api 反序列化 | Pydantic field_validator / Rust serde `#[serde(default)]` + 显式 coerce；不假设第三方返回类型与文档一致 |
+| v5-7 SDK 操作 idempotent | open / close / acquire / release 类 SDK 操作 | 三层 fallback：复用已存在资源 → 正常 open → 残留状态恢复（cleanup → 重试 1 次） |
+| v5-8 物理资源并发管控 | 设备 / 容器 / 第三方账号 / 限额 API / 浏览器实例 | per-resource lock 或 全局串行；scheduler concurrency 默认 1，等观测稳定再升 |
+| v5-9 agent / registry 完整性 cross-check | 每次 architecture 改动 / 新增功能域 | registry tool inventory check：agent 描述里的"职责"必须能映射到 tools 字段里的具体工具 |
+| v5-10 三向决议日常审计 | 状态流转门禁（如 READY_FOR_DESIGN → READY_FOR_IMPL） | SDLC 预审 cross-check ADR + spec K-Q + architecture 三处一致 |
+
+### 14.4 长期记忆机制（v4-1~v4-8）
+
+| 规则 | 落地资产 |
+|---|---|
+| v4-1 Living lessons-learned 文档 | `docs/handoff-lessons-learned.md`（已建，10 段结构） |
+| v4-2 决议 obsolete 清单显式维护 | 同上 第 3 段（每条记原决议 → 反转触发 → 新决议 → ❌ 禁止做的事） |
+| v4-3 会话压缩 / 重启复审 ritual | 同上 第 6 段（4 步硬性流程；会话第一动作必跑） |
+| v4-4 引用纪律 | 同上 第 7 段（commit / 总结 / audit 必精确到 ADR-NNN / spec [N.M] / commit-SHA） |
+| v4-5 主窗口管家职责 | 同上 第 5 段（6 条 + v5 派生 3 条） |
+| v4-6 决议反转触发四步文档同步 | (a) Living doc obsolete 清单加条 (b) 老 ADR status → SUPERSEDED + superseded_by (c) spec K-Q 同步 (d) forbidden actions 列表 |
+| v4-7 fatal error 三件套 | (a) 写文件日志（不依赖 stderr）(b) 弹 GUI/CLI 用户可见对话 (c) 不允许静默 exit |
+| v4-8 跨边界自动操作禁令 | 同上 第 8 段（不 auto-install / 不修系统代理 / 不动证书 / 不要求关 Clash / 不动注册表） |
+
+### 14.5 引用本节
+
+- 任何 agent 的 prompt 都隐含本节为硬规则。具体落地：每个 agent 文件下次被修订时显式加段"读 `CLAUDE.md` 第 14 节"。
+- `safety-bar.sh` 是 v4-8 在 dev 操作层的具象化；产品功能设计层也要遵守同样原则。
+
+---

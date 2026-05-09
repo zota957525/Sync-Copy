@@ -14,7 +14,7 @@
 | 模型 | （由用户启动 Claude Code 时决定） |
 | 职责 | 接需求、读状态、调 agent、写 PLAN.md、转述结果 |
 | 禁忌 | 不直接改业务源码、不直接写 spec/test、不调用嵌套 agent |
-| 详细契约 | 见 CLAUDE.md §4 |
+| 详细契约 | 见 CLAUDE.md 第 4 节 |
 
 ---
 
@@ -41,7 +41,7 @@
 | 模型 | sonnet |
 | 触发 | UI 改动、新增视图、交互流程设计 |
 | 输入 | spec、用户场景描述、当前 UI 截图（如有） |
-| 输出 | `specs/<slug>.md` 中的 §UX 段，或 `specs/ux/<slug>.md`（含 wireframe 文字描述、状态图、交互边界） |
+| 输出 | `specs/<slug>.md` 中的 UX 段，或 `specs/ux/<slug>.md`（含 wireframe 文字描述、状态图、交互边界） |
 | 严格禁止 | 写 Svelte 实现代码、改 CSS |
 
 ### 3. 架构师 / Tech Architect
@@ -89,7 +89,7 @@
 | 模型 | opus |
 | 触发 | implementer 完成后、merge 前 |
 | 输入 | git diff、spec、ADR、相关测试 |
-| 输出 | `specs/<slug>.md` 末尾的 §Review 段（结论 + 问题清单 + 阻塞点） |
+| 输出 | `specs/<slug>.md` 末尾的 Review 段（结论 + 问题清单 + 阻塞点） |
 | 严格禁止 | 直接改代码（只能写 review 报告，不通过则打回 implementer） |
 
 ### 7. 测试工程师 / QA Tester
@@ -113,7 +113,7 @@
 | 模型 | opus |
 | 触发 | 涉及 crypto / 协议 / 认证 / 密钥管理 / 权限 / capabilities 的任何改动 |
 | 输入 | spec、ADR、相关源码、协议 DTO |
-| 输出 | ADR 末尾的 §安全审阅 段，或独立 `decisions/ADR-NNN-security-<slug>.md` |
+| 输出 | ADR 末尾的 安全审阅 段，或独立 `decisions/ADR-NNN-security-<slug>.md` |
 | 严格禁止 | 改代码（只签字或打回） |
 
 ### 9. 文档工程师 / Docs Writer

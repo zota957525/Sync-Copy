@@ -54,8 +54,8 @@ Sync Copy 的 v0 prototype（commit `f4be188` 及之前）已经能跑：剪切�
 具体执行路径：
 1. **保留 v0**：`git branch legacy-prototype`（指向当前 main HEAD `f4be188`）。任何时候可以 `git show legacy-prototype:<path>` 参考。
 2. **main 清空业务代码**：移除 `src-tauri/src/*.rs`（保留 `main.rs` 入口外壳）、`src/routes/+page.svelte`、`src/routes/+layout.ts`。**保留** `Cargo.toml`、`package.json`、`tauri.conf.json`、`capabilities/`、`.github/workflows/`、`static/` 资源、`项目架构.md` 与 `使用说明.md`（标 banner 注明 v0 历史，待 v2 完工后由 docs-writer 重写）。
-3. **新流程**：所有 feature 从 PM 写 spec 开始，按 CLAUDE.md §7 的 9 步 SDLC 链路推进。
-4. **主窗口边界**：见 CLAUDE.md §4。主窗口不直接修改业务源码、不直接写 spec/ADR（除"用户实时拍板的决议"外）、不让 agent 之间互相调用。
+3. **新流程**：所有 feature 从 PM 写 spec 开始，按 CLAUDE.md 第 7 节 的 9 步 SDLC 链路推进。
+4. **主窗口边界**：见 CLAUDE.md 第 4 节。主窗口不直接修改业务源码、不直接写 spec/ADR（除"用户实时拍板的决议"外）、不让 agent 之间互相调用。
 5. **决策落盘**：每个非平凡技术决定 = 一份 ADR；每个 feature = 一份 spec；任务进度 = PLAN.md 状态字段。**任何"我记得我们说过 X"的论据无效；找文件出处。**
 
 ## 4. 后果（Consequences）
