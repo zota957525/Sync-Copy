@@ -260,16 +260,25 @@ mod tests {
         );
     }
 
-    /// 验证 Allowed 决策可以多次连续调用（RateLimiter 无状态错误）。
+    /// 验证 Allowed 决策在连续多次调用（未达阈值）下保持稳定。
+    ///
+    /// reviewer 补丁（specs/peer-heartbeat.md 第 8.5 节 [低 nit]）：
+    /// 原测试名 `allowed_decision_is_stable` 暗示"多次连续调用稳定"，
+    /// 但原实现只调 1 次；现补充 3 次调用，让测试体与名字语义匹配。
+    /// MAX_PER_PAIR_IN_WINDOW = 3，连续 3 次同 (ip, device) 应全部 Allowed；
+    /// 第 4 次才触发 TooManyRequests（由 per_pair_and_global_count 测试覆盖）。
     #[test]
     fn allowed_decision_is_stable() {
         let rl = RateLimiter::new();
         let ip: IpAddr = "172.16.0.1".parse().expect("test ip parse");
 
-        // 第 1 次：Allowed
-        assert_eq!(
-            rl.check_handshake(ip, "stable-device"),
-            RateLimitDecision::Allowed
-        );
+        // 连续 3 次（= MAX_PER_PAIR_IN_WINDOW，阈值边界，全部应 Allowed）
+        for call_idx in 0..3 {
+            assert_eq!(
+                rl.check_handshake(ip, "stable-device"),
+                RateLimitDecision::Allowed,
+                "call {call_idx}: Allowed decision must be stable when below threshold"
+            );
+        }
     }
 }

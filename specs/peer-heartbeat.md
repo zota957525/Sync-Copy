@@ -174,3 +174,72 @@ FAIL_LIMIT = 2
 ## 8. Review 段（占位）
 
 > code-reviewer / tech-architect / security-reviewer 后续填写。本 feature 涉及网络层周期任务与状态机，需 security-reviewer 评估 `/ping` 暴露的信息泄露风险（CLAUDE.md 第 9 节）。
+
+## 8. Code Review (by code-reviewer · 2026-05-09 · PR-2 commit 69597a4)
+
+**结论**：CHANGES_REQUESTED（2 条小补丁可直派 backend-implementer 静默落地；无严重违反 ADR 决议项；小补丁完成后即可推 REVIEW_PASSED）
+
+### 8.1 Spec / ADR 一致性 / ADR-009 v1.2 4 补丁
+
+1. MUST-4 remove 原子顺序：✅ `inner.remove → approved.remove → banned.remove` 严格按声明序在同一函数内完成（`mod.rs:214-238`）；client_pool 内嵌按 PR 范围正确推迟到 PR-3，注释（`mod.rs:19-21, 209-211, 231-232`）显式标注。
+2. P4 锁顺序硬约束：✅ `approve()`（`mod.rs:265-280`）/ `ban()`（`mod.rs:297-319`）严格按 approved → banned 拿写锁；`ban()` 注释（`mod.rs:283-288, 303-305`）明确说明字面操作顺序与锁取得顺序的差异；模块顶部注释（`mod.rs:10-12, 115-117`）二次重申硬约束。⚠ **仅缺 lock_order_no_deadlock 单测**（详见 8.2 严重 #1）。
+3. P1 snapshot/get SECURITY 注释：✅ `snapshot()`（`mod.rs:175-179`）+ `get()`（`mod.rs:166-170`）方法签名上方均有完整 SECURITY 段，覆盖 Zeroizing clone / Debug-print / tracing fields / 落盘 / 跨进程发送禁令。
+4. P3 RateLimiter 未认证 device_id 安全：✅ struct 上方 SECURITY 段完备（`rate_limit.rs:53-59, 64-70`）；`check_handshake` 警告日志只记 `remote_ip + count`，不写 `device_id`（`rate_limit.rs:121-126, 151-156`）；per_pair / global 容量上限 + 过期 retain 策略已以"占位 + group-discovery feature ADR 接管"形式注明（`rate_limit.rs:20-32, 96-98`）。
+5. AadKind Hash 孤儿 impl：✅ 选择本模块孤儿 impl（`mod.rs:417-422`）合理 — PR-1 crypto 已落定不动；用 `as_bytes()` 稳定字节做 hash 键正确；选择可接受、不阻塞。
+
+### 8.2 必修条目落地
+
+- MUST-2 zeroize import：✅ `aes_key: Zeroizing<[u8; 32]>`（`mod.rs:83`）+ `Cargo.toml zeroize` 依赖正确。
+- MUST-4 remove 原子顺序：✅（见 8.1 第 1 项）。
+- MUST-5 panic message：✅ 单测中 `expect("test addr parse failed")` / `expect("inserted peer should be found")` 等均为字面量，无运行时变量插值，符合 ADR-008 第 7.2 节 MUST-5 约定。
+- ADR-009 v1.2 P1 / P2 / P3 / P4：✅ / ✅（PR-2 范围内 health.rs 反模式黑名单 P2 是 PR-3 范畴，本 PR 不涉及）/ ✅ / ✅。
+
+### 8.3 发现的问题（按严重度排序）
+
+#### [中等] 缺失 ADR-009 第 6.1 节 单测 #13 `lock_order_no_deadlock`
+- 文件：`src-tauri/src/peer/mod.rs:428-736`（`#[cfg(test)] mod tests`）
+- 现象：commit message 与 mod.rs:425 注释均自称落了 `lock_order_no_deadlock`，实际只有 10 个 `#[test]`，无任何并发 spawn/线程死锁测试。`Cargo.toml` 也未启用 `parking_lot/deadlock_detection` feature。
+- 风险：ADR-009 第 4.3 节副作用 #1 + 第 6.1 节单测 #13 均明文要求 "dev profile 跑 approve/ban/remove 并发 100 次不死锁" 作为 P4 锁顺序硬约束的兜底证明。当前 P4 仅靠注释 + 串行单测覆盖；未来 implementer 误改 ban() 字面顺序 → release 卡死的回归无自动化拦截。
+- 建议修法：补一条 `#[test] fn lock_order_no_deadlock()`：`Arc<PeerRegistry>` + `std::thread::spawn` 100 个线程随机调 `approve / ban / remove` 同一组 id；用 `std::sync::Barrier` 同步起跑；测试加 `#[timeout(...)]`（或循环结束后判断时长 < 5s）作为活性证明。可选：`Cargo.toml [dev-dependencies]` 加 `parking_lot = { version = "0.12", features = ["deadlock_detection"] }` 并在测试入口起 deadlock 检测线程。
+
+#### [低] commit message 与代码不符（声称单测覆盖与实际不一致）
+- 文件：commit `69597a4` body
+- 现象：commit message 自称 "peer::tests 10 ... lock_order_no_deadlock 等"，实际 10 个测试名中无此项。
+- 风险：未来 audit / blame 时误导，让 reviewer 与 PM 误以为已覆盖。
+- 建议修法：补完 `lock_order_no_deadlock` 后该问题自然消解；无需单独修改历史 commit。
+
+#### [低 / nit] `allowed_decision_is_stable` 单测名与实际断言不符
+- 文件：`src-tauri/src/peer/rate_limit.rs:264-274`
+- 现象：测试名暗示"多次连续调用稳定"，实际只调 1 次 check_handshake 后断言 Allowed，未连续多次。
+- 建议修法：要么改名为 `allowed_decision_first_call`，要么在测试体内补 2-3 次连续 Allowed 断言以匹配名字。
+
+### 8.4 风险点
+
+- **PR-3 client_pool 集成时的 ban() 路径补漏点**：当前 `ban()`（`mod.rs:297-319`）在 was_peer=true 分支只 `inner.remove`，未补 `client_pool.remove`，注释（`mod.rs:292, 314`）已留 TODO。PR-3 实施时**必须**在 ban() 与 remove() 两处都补上 `client_pool.remove`，否则 invariant 3（`client_pool.contains(id) == inner.contains_key(id)`）会破。建议 PR-3 backend-implementer 接到 ADR-010 后**第一行**就读本 review 8.4。
+- **`seen_seq_and_update` 对未知 peer 返 false 是合理"安全侧"** — 但调用方若把 false 一律映射成"重复，200 OK 静默丢"，则陌生 peer 的合法首包也会被吞。需在 PR-3 / handshake handler 落地时确认调用顺序：先 `is_known` 校验或先走 handshake，不要直接把陌生 peer 的报文进 `seen_seq_and_update`。建议 ADR-010 / handshake handler PR 评审时复查。
+- **clear() 内三把锁顺序写**（`mod.rs:244-251`）虽按声明序拿，但每次都是 acquire→release→acquire（write 锁不重叠）。当前实现没有 AB-BA 死锁面，但若未来改为"全部 hold 后 clear"需重新审。
+
+### 8.5 给 implementer 的明确 todo 清单
+
+- [ ] 补 `#[test] fn lock_order_no_deadlock()` 到 `src-tauri/src/peer/mod.rs::tests` — Arc<PeerRegistry> + spawn 100 线程随机调 approve/ban/remove 同一 id 集合，用 Barrier 同步起跑，断言 5s 内完成（活性证明）。可选启用 `parking_lot/deadlock_detection` dev feature。
+- [ ] `src-tauri/src/peer/rate_limit.rs::tests::allowed_decision_is_stable` 改名或补充连续多次 Allowed 断言（与名字匹配）。
+
+### 8.6 测试覆盖评估
+
+- **当前 13 单测**（peer 10 + rate_limit 3）vs ADR-009 第 6.1 节最小集（≥ 7 条）：
+  - #1 insert_then_get：✅ `insert_get_remove_basic`
+  - #2 remove_clears_inner_and_pool：⚠ 部分（无 mock ClientPool 调用顺序断言；PR-3 接 client_pool 后补）
+  - #3 approve_atomic：✅ `trust_mutual_exclusion`
+  - #4 ban_atomic_was_peer：✅ `trust_transition_atomicity` + `remove_atomic_order` 联合覆盖
+  - #5 ban_atomic_unknown：✅ `ban_unknown_peer_does_not_affect_inner`
+  - #6 trust_overrides_ban：✅ `trust_transition_atomicity` 后半段
+  - #7 ban_overrides_trust：✅ `trust_transition_atomicity` 前半段
+  - #8 seen_seq_dedupe：✅ `seen_seq_and_update_dedupe`（含 unknown peer / 不同 kind 独立计数）
+  - #9 record_send_ok_updates_last_sync：✅
+  - #10 record_heartbeat_ok_does_not_update_last_sync：✅
+  - #11 record_heartbeat_fail_increment：⚠ 缺（建议补；不阻塞）
+  - #12 clear_all：⚠ 缺（建议补；不阻塞）
+  - #13 lock_order_no_deadlock：❌ **缺**（见 8.3 中等）
+  - #14 aes_key_zeroize_after_remove：⚠ 缺（ADR-009 第 6.1 节标注 best-effort 跨平台不强制；不阻塞）
+- 已覆盖最小集 7/14；强制项满足（≥ 7），但 #13 是 P4 死锁硬约束的唯一活性证明，必须补。
+

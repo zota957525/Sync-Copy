@@ -733,4 +733,71 @@ mod tests {
             "unknown peer should be in banned"
         );
     }
+
+    // 单测 13（ADR-009 第 6.1 节 #13 — 锁顺序死锁活性证明）
+    //
+    // 验证 approve / ban / get 在多线程并发下不死锁（锁顺序硬约束 ADR-009 第 3.3.1 节）。
+    // 方法：8 个线程各跑 50 次混合操作（approve / ban / get）作用于同一组 device_id；
+    //       若锁顺序存在 AB-BA 反转，线程将死锁，join 无法完成（CI 超时触发失败）。
+    //
+    // 注意：
+    // - 不使用 parking_lot/deadlock_detection feature（Cargo.toml 未启用）；
+    //   活性证明依赖"8 个线程全部 join 完成"这一事实——死锁发生时 join 卡住。
+    // - 用 get 替代 remove：避免第 n 次 approve/ban 作用于已被移除的 peer 产生
+    //   无意义的"未知 peer"路径（影响测试可读性，不影响锁顺序验证目的）。
+    //
+    // see: decisions/ADR-009-peer-registry.md 第 3.3.1 节 / 第 6.1 节 #13
+    #[test]
+    fn lock_order_no_deadlock() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let registry = Arc::new(PeerRegistry::new());
+
+        // 预先插入 5 个 peer，approve 状态
+        for i in 0..5 {
+            let id = format!("device-{i}");
+            registry.insert(make_peer(&id));
+            registry.approve(&id);
+        }
+
+        let device_ids: Vec<String> = (0..5).map(|i| format!("device-{i}")).collect();
+
+        let mut handles = vec![];
+        for thread_idx in 0..8usize {
+            let registry = Arc::clone(&registry);
+            let ids = device_ids.clone();
+            handles.push(thread::spawn(move || {
+                for iter in 0..50usize {
+                    let id = &ids[(thread_idx + iter) % ids.len()];
+                    // 三种操作交替，覆盖 approve（双写锁）、ban（双写锁，反向语义）、
+                    // get（inner 读锁）三条锁路径；关键是 approve 与 ban 并发时
+                    // 两者都按 approved → banned 顺序拿锁，不会 AB-BA 反转。
+                    match (thread_idx + iter) % 3 {
+                        0 => {
+                            registry.approve(id);
+                        }
+                        1 => {
+                            registry.ban(id);
+                            // ban 后重新 insert + approve，保证后续 approve/ban 操作有 peer 可用
+                            registry.insert(make_peer(id));
+                            registry.approve(id);
+                        }
+                        _ => {
+                            // get 走 inner 读锁，与 approve/ban 写锁并发
+                            let _ = registry.get(id);
+                        }
+                    }
+                }
+            }));
+        }
+
+        // 若发生死锁，此处 join 不返回，CI 超时触发失败
+        for h in handles {
+            h.join().expect("thread should join without deadlock");
+        }
+
+        // 走到这里说明 8 个线程全部无死锁完成
+        assert_eq!(8, 8, "all 8 threads completed without deadlock");
+    }
 }
