@@ -2,17 +2,20 @@
 //! see decisions/ADR-010-lifecycle.md (第 3.2 节 step 3 顺序)
 //! see decisions/ADR-009-peer-registry.md (第 3.5 节 / 第 5 节 #5 构造顺序)
 //! see decisions/ADR-003-project-architecture-skeleton.md (第 3.5 节 AppState struct)
-//! see specs/clipboard-text-sync.md (PR-5 clipboard_apply_tx 占位)
+//! see specs/clipboard-text-sync.md (PR-5b 修 ADR-008 MUST-4 / 自连校验 / device_id 占位)
 //!
 //! 构造顺序（ADR-009 第 5 节 #5 + ADR-010 第 3.2 节 step 3）：
-//!   Arc<ClientPool>::new()
-//!   → Arc<PeerRegistry>::new()  [PR-4 落地时传入 client_pool]
+//!   my_device_id = uuid::Uuid::new_v4().to_string()
+//!   → Arc<ClientPool>::new()
+//!   → Arc<PeerRegistry>::new(client_pool)  [PR-5b 落地：传入 client_pool]
 //!   → Arc<RateLimiter>::new()
 //!   → Arc<Lifecycle>::new()
 //!
-//! PR-3 注意：PeerRegistry::new() 当前不接受 client_pool 参数（PR-2 已落接口）。
-//! PR-4 Lifecycle 落地时在 PeerRegistry::remove / ban 内补充 client_pool.remove 原子顺序。
-//! PR-5 新增：clipboard_apply_tx 占位（PR-6 真接 arboard 线程时填入真实 Sender）。
+//! PR-5b 新增：
+//!   - my_device_id 字段（启动期生成 UUID v4；handshake.rs 自连校验 + HandshakeResp 真值用）
+//!   - PeerRegistry::new(client_pool) 传入 client_pool（修 ADR-008 MUST-4 契约违反）
+//!
+//! PR-5 保留：clipboard_apply_tx 占位（PR-6 真接 arboard 线程时填入真实 Sender）。
 
 use std::sync::Arc;
 
@@ -54,6 +57,18 @@ pub struct ApplyClipboardEvt {
 /// 字段命名遵循 ADR-010 第 3.1 节 + ADR-009 第 3.6 节。
 #[derive(Clone)]
 pub struct AppState {
+    /// 本机 device_id（启动期 UUID v4 生成，整个生命周期不变）。
+    ///
+    /// 用途（PR-5b 修 ADR-008 MUST-3 / 严重 #2 #3）：
+    /// - handshake handler 自连校验：req.device_id == my_device_id → 403
+    /// - HandshakeResp.device_id 填真值（替换占位 "placeholder-my-device-id"）
+    /// - broadcast_leave / broadcast_clipboard my_device_id 参数来源
+    ///
+    /// SECURITY（ADR-008 第 4.1 节）：
+    /// device_id 是 UUID 形式（非敏感），可进 tracing fields。
+    /// 但禁止在 403 响应 body 中返回（让攻击者枚举本机 device_id —
+    /// ADR-008 第 4.1 节 409 → 403 不可区分决议）。
+    pub my_device_id: String,
     /// 统一 peer 状态库（ADR-009 第 3.2 节）
     pub peers: Arc<PeerRegistry>,
     /// Handshake DoS 限流器（ADR-009 第 3.6 节）
@@ -78,22 +93,28 @@ impl AppState {
     ///
     /// 由 `lib.rs::run` 调用，在 tauri::Builder::default() 前完成。
     pub fn new() -> Self {
-        // ADR-009 第 5 节 #5 构造顺序：
+        // ADR-009 第 5 节 #5 构造顺序（PR-5b 修正：client_pool 先于 peers）：
+        //   0. my_device_id = uuid::Uuid::new_v4().to_string()（ADR-008 严重 #2/#3 修复）
         //   1. ClientPool（无依赖）
-        //   2. PeerRegistry（PR-4 落地时传入 client_pool；当前独立）
+        //   2. PeerRegistry::new(client_pool)（传入 client_pool — ADR-008 MUST-4 契约）
         //   3. RateLimiter（无依赖）
         //   4. Lifecycle（持有 health_cancel / task handles）
+        let my_device_id = uuid::Uuid::new_v4().to_string();
         let client_pool = Arc::new(ClientPool::new());
-        let peers = Arc::new(PeerRegistry::new());
+        // ADR-009 第 3.2 节：PeerRegistry::new 接受 Arc<ClientPool>
+        // 保证 remove/ban 内部原子调 client_pool.remove（ADR-008 MUST-4）
+        let peers = Arc::new(PeerRegistry::new(Arc::clone(&client_pool)));
         let rate_limiter = Arc::new(RateLimiter::new());
         let lifecycle = Lifecycle::new();
 
         tracing::debug!(
             target: "app::state",
-            "AppState::new() constructed (client_pool + peers + rate_limiter + lifecycle)"
+            my_device_id = %my_device_id,
+            "AppState::new() constructed (my_device_id + client_pool + peers + rate_limiter + lifecycle)"
         );
 
         Self {
+            my_device_id,
             peers,
             rate_limiter,
             client_pool,

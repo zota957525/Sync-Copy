@@ -286,12 +286,11 @@ impl Lifecycle {
 
             // PR-5：broadcast_leave 真正落地（group-leave-notify）。
             // seq = 0 用于 leave（单次广播，不需要 monotonic 计数；接收方 seen_seq 仍记录）。
-            // my_device_id 当前无 AppState 字段（TODO PR-6 加 my_device_id）；
-            // 用 "shutdown" 占位不影响 leave handler 的 is_known 校验（对端已有 origin_device_id）。
-            // PR-6 落地时替换为 state.my_device_id.as_str()。
+            // PR-5b 修：my_device_id 已在 AppState 落地，使用真实值（去除占位 "shutdown-placeholder"）。
+            // 对端 leave handler is_known 校验用 origin_device_id，与本机 my_device_id 对应。
             let leave_result = tokio::time::timeout(
                 Duration::from_millis(LEAVE_DEADLINE_MS),
-                crate::network::client::broadcast_leave(state, "shutdown-placeholder", 0),
+                crate::network::client::broadcast_leave(state, &state.my_device_id, 0),
             )
             .await;
 

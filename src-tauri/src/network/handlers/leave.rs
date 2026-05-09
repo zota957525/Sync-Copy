@@ -118,7 +118,7 @@ mod tests {
     #[test]
     fn leave_atomic_remove_inner_and_pool() {
         let pool = Arc::new(ClientPool::new());
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let peer_id = "leave-test-peer";
 
         // 先 insert + approve
@@ -171,7 +171,7 @@ mod tests {
     /// leave_rejects_unknown：未知 peer 的 leave → is_known false → 403 路径
     #[test]
     fn leave_rejects_unknown_peer_logic() {
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         assert!(
             !registry.is_known("ghost-peer"),
             "is_known must return false for unknown peer"

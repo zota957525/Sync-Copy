@@ -338,7 +338,7 @@ mod tests {
     /// handle_ban 调 ban → banned && !approved（互斥不变式，ADR-009 第 3.3 节）
     #[test]
     fn trust_ban_mutual_exclusion_via_registry() {
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let origin_id = "origin-peer";
         let subject_id = "subject-peer";
 
@@ -369,7 +369,7 @@ mod tests {
         );
 
         // trust 覆盖 ban（approve 后 ban 集合清空）
-        let registry2 = PeerRegistry::new();
+        let registry2 = PeerRegistry::new_for_test();
         registry2.insert(make_peer("sub2"));
         registry2.ban("sub2");
         registry2.approve("sub2");
@@ -386,7 +386,7 @@ mod tests {
     /// announce_inserts_unknown_peer：新 peer 宣告后应在 registry 中（Pending 状态）
     #[test]
     fn announce_inserts_unknown_peer_into_registry() {
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let peer_id = "announce-new-peer";
 
         // 模拟 handle_peers_announce 核心逻辑

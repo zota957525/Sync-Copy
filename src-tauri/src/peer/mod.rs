@@ -1,11 +1,14 @@
 //! PeerRegistry — 统一 peer 状态库
 //! see specs/peer-heartbeat.md, decisions/ADR-009-peer-registry.md
 //! see decisions/ADR-008-security-review-of-adr003.md (MUST-2 zeroize, MUST-4 remove 原子顺序)
+//! see specs/clipboard-text-sync.md (PR-5b 修 ADR-008 MUST-4 契约违反)
 //!
 //! 设计决策摘要（ADR-009 第 3 节）：
 //! - 锁粒度选 A：单 RwLock<HashMap<String, PeerState>> + 两个独立 RwLock<HashSet<String>>
 //! - trust 互斥集中在 PeerRegistry::approve / .ban（选项 B）
 //! - PolicyState（DoS 限流）独立 RateLimiter（选项 B，见 peer/rate_limit.rs）
+//! - client_pool 内嵌 Arc<ClientPool>：PeerRegistry::remove / ban 内部调 client_pool.remove
+//!   保证 ADR-008 MUST-4 + ADR-009 第 3.5 节 invariant 3 闭环。
 //!
 //! 锁顺序硬约束（防 AB-BA 死锁，ADR-009 第 3.3.1 节）：
 //!   inner > approved > banned（按字段声明序一致）
@@ -14,11 +17,8 @@
 //! SECURITY 约束（ADR-009 第 3.2 节 invariants）：
 //! (1) approved ∩ banned = ∅
 //! (2) inner[id].trust_state == Approved ⟺ approved.contains(id)
-//! (3) 任何返 PeerState 的方法返 clone；调用方禁止落盘 / 写 tracing fields
-//!
-//! client_pool 注意：本 PR（PR-2）仅实现 PeerRegistry 纯逻辑层；
-//! client_pool 集成留 PR-3 Lifecycle。remove() 当前不调 client_pool.remove()；
-//! PR-3 合并后将在同一函数内按 inner.remove → client_pool.remove 原子顺序扩充。
+//! (3) client_pool.contains(id) == inner.contains_key(id)（MUST-4 原子保证）
+//! (4) 任何返 PeerState 的方法返 clone；调用方禁止落盘 / 写 tracing fields
 
 pub mod rate_limit;
 pub mod sanitize;
@@ -26,9 +26,11 @@ pub mod sanitize;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 use zeroize::Zeroizing;
 
+use crate::app::client_pool::ClientPool;
 use crate::crypto::AadKind;
 
 // ---------------------------------------------------------------------------
@@ -112,6 +114,7 @@ pub struct PeerState {
 ///   `inner`    — 主 HashMap，含完整 PeerState（含 aes_key）
 ///   `approved` — 短路 HashSet；查询 approved 状态免拿 inner 读锁
 ///   `banned`   — 短路 HashSet；查询 banned 状态免拿 inner 读锁
+///   `client_pool` — 内嵌 Arc：保证 remove/ban 内部原子调 client_pool.remove
 ///
 /// 锁顺序硬约束（ADR-009 第 3.3.1 节 P4 补丁）：
 /// 任何同时持有 approved + banned 锁的路径必须按 approved 先于 banned 顺序拿。
@@ -127,17 +130,31 @@ pub struct PeerRegistry {
     approved: RwLock<HashSet<String>>,
     /// banned 短路缓存（锁顺序第 3）。
     banned: RwLock<HashSet<String>>,
+    /// per-peer reqwest::Client 连接池（ADR-009 第 3.5 节 / ADR-008 MUST-4）。
+    /// 内嵌 Arc 保证 remove/ban 内部调 client_pool.remove 原子。
+    /// client_pool.remove 仅由 PeerRegistry::remove 内部调用（pub(crate) 可见性）。
+    client_pool: Arc<ClientPool>,
 }
 
 impl PeerRegistry {
     /// 构造空 PeerRegistry。
-    /// 由 lifecycle.start 调用（ADR-009 第 5.5 节）。
-    pub fn new() -> Self {
+    ///
+    /// 签名（ADR-009 第 3.2 节 / PR-5b 修 ADR-008 MUST-4 契约违反）：
+    ///   `new(client_pool: Arc<ClientPool>)`
+    /// 由 AppState::new() 调用，构造顺序必须先建 ClientPool 再传入（ADR-009 第 5 节 #5）。
+    pub fn new(client_pool: Arc<ClientPool>) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
             approved: RwLock::new(HashSet::new()),
             banned: RwLock::new(HashSet::new()),
+            client_pool,
         }
+    }
+
+    /// 测试专用构造：内部新建独立 ClientPool，避免测试代码重复构造。
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self::new(Arc::new(ClientPool::new()))
     }
 
     // -----------------------------------------------------------------------
@@ -202,14 +219,14 @@ impl PeerRegistry {
 
     /// 移除 peer（唯一允许 remove 的入口）。
     ///
-    /// 原子顺序（ADR-008 MUST-4 / ADR-009 第 3.5 节）：
-    ///   1. inner.remove(id)   — PeerState drop → Zeroizing 自动清零 aes_key
+    /// 原子顺序（ADR-008 MUST-4 / ADR-009 第 3.5 节调用顺序契约表第 2 行）：
+    ///   1. inner.remove(id)     — PeerState drop → Zeroizing 自动清零 aes_key
     ///   2. approved.remove(id)
     ///   3. banned.remove(id)
+    ///   4. client_pool.remove(id) — 最后清连接池（invariant 3 闭环）
     ///
-    /// PR-2 范围：本方法仅处理 inner / approved / banned 三集合。
-    /// PR-3 Lifecycle 落地后将在此方法尾部补充 client_pool.remove(id)，
-    /// 完成 ADR-009 第 3.5 节调用顺序契约第三行（inner → client_pool 原子）。
+    /// 保证 invariant 3：`client_pool.contains(id) == inner.contains_key(id)`
+    /// 任何 handler 禁止绕过此方法直接调 client_pool.remove（ADR-009 第 5 节 #5 反模式）。
     ///
     /// caller 须在本方法返回后 emit status-updated（PeerRegistry 不持 Tauri AppHandle）。
     pub fn remove(&self, id: &str) -> Option<PeerState> {
@@ -229,11 +246,12 @@ impl PeerRegistry {
             self.banned.write().remove(id);
         }
 
-        // PR-3 Lifecycle 落地后在此处补充：
-        // self.client_pool.remove(id);  // 必须在 inner.remove 之后
+        // MUST-4 步骤 4：从 client_pool 移除（ADR-009 第 3.5 节 / ADR-008 MUST-4 原子顺序）
+        // 注意：仅在 inner.remove 之后调用，保证锁释放后再操作 client_pool（不持 inner 锁过此调用）
+        self.client_pool.remove(id);
 
         if removed.is_some() {
-            tracing::info!(id = %id, "peer removed from registry");
+            tracing::info!(id = %id, "peer removed from registry (inner + pool cleared)");
         }
         removed
     }
@@ -308,12 +326,14 @@ impl PeerRegistry {
             b.insert(id.into());
         }
 
-        // 若 was_peer：从 inner 移除（MUST-4 原子顺序步骤 1）
+        // 若 was_peer：从 inner 移除（MUST-4 原子顺序 + ADR-009 第 3.3 节状态机表）
         let removed = self.inner.write().remove(id);
         if removed.is_some() {
-            // aes_key 已随 PeerState drop 被 Zeroizing 清零
-            // PR-3 落地后在此处补充 client_pool.remove(id)
-            tracing::info!(id = %id, "peer banned and removed from inner (was_peer=true)");
+            // aes_key 已随 PeerState drop 被 Zeroizing 清零。
+            // 同时清 client_pool（ADR-008 MUST-4 / ADR-009 第 3.5 节 invariant 3）。
+            // 顺序：inner.remove（已完成）→ client_pool.remove（现在执行）
+            self.client_pool.remove(id);
+            tracing::info!(id = %id, "peer banned and removed from inner + pool (was_peer=true)");
         } else {
             tracing::info!(id = %id, "peer banned (was_peer=false; not in inner)");
         }
@@ -403,7 +423,7 @@ impl PeerRegistry {
 
 impl Default for PeerRegistry {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(ClientPool::new()))
     }
 }
 
@@ -423,7 +443,7 @@ impl std::hash::Hash for AadKind {
 }
 
 // ---------------------------------------------------------------------------
-// 单元测试（ADR-009 第 6.1 节单测清单 — 本 PR 必落 7 条最小集）
+// 单元测试（ADR-009 第 6.1 节单测清单 — PR-5b 修 MUST-4 + 补新单测）
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -454,7 +474,7 @@ mod tests {
     /// insert → get 返同字段 → remove 返 Some → get 返 None
     #[test]
     fn insert_get_remove_basic() {
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let state = make_peer("peer-001");
 
         registry.insert(state.clone());
@@ -485,7 +505,7 @@ mod tests {
     /// approve → is_approved ✓ + is_banned ✗；ban → is_approved ✗ + is_banned ✓
     #[test]
     fn trust_mutual_exclusion() {
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let state = make_peer("peer-002");
         registry.insert(state);
 
@@ -516,7 +536,7 @@ mod tests {
     /// approve → ban 过渡时 approved 集合不再有，banned 集合有（原子）
     #[test]
     fn trust_transition_atomicity() {
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let state = make_peer("peer-003");
         registry.insert(state);
 
@@ -539,7 +559,7 @@ mod tests {
         );
 
         // 反向：ban → approve（ban 覆盖 trust 的逆向）
-        let registry2 = PeerRegistry::new();
+        let registry2 = PeerRegistry::new_for_test();
         let state2 = make_peer("peer-003b");
         registry2.insert(state2);
         registry2.ban("peer-003b");
@@ -558,7 +578,7 @@ mod tests {
     /// insert + approve → remove → inner / approved / banned 三集合同时不含 id
     #[test]
     fn remove_atomic_order() {
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let state = make_peer("peer-004");
         registry.insert(state);
         registry.approve("peer-004");
@@ -600,7 +620,7 @@ mod tests {
     /// 同 (id, kind) 第二次 seq <= 第一次 → false；seq > 第一次 → true
     #[test]
     fn seen_seq_and_update_dedupe() {
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let state = make_peer("peer-005");
         registry.insert(state);
 
@@ -633,7 +653,7 @@ mod tests {
     /// snapshot 返 Vec<PeerState>，每个含独立 Zeroizing<aes_key>（不与 inner 共享内存）
     #[test]
     fn snapshot_zerocopy_clone() {
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
 
         // 插入 2 个不同 aes_key 的 peer
         let mut peer_a = make_peer("peer-006a");
@@ -680,7 +700,7 @@ mod tests {
     // 额外：验证 record_heartbeat_ok 不更新 last_successful_sync_at（ADR-008 5.2 节）
     #[test]
     fn record_heartbeat_ok_does_not_update_last_sync() {
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let state = make_peer("peer-007");
         registry.insert(state);
 
@@ -700,7 +720,7 @@ mod tests {
     // 额外：验证 record_send_ok 更新 last_successful_sync_at（ADR-008 5.2 节）
     #[test]
     fn record_send_ok_updates_last_sync() {
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let state = make_peer("peer-008");
         registry.insert(state);
 
@@ -716,7 +736,7 @@ mod tests {
     // 额外：ban 一个不在 inner 的 peer（was_peer=false）不影响 inner
     #[test]
     fn ban_unknown_peer_does_not_affect_inner() {
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let state = make_peer("peer-existing");
         registry.insert(state);
 
@@ -753,7 +773,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let registry = Arc::new(PeerRegistry::new());
+        let registry = Arc::new(PeerRegistry::new_for_test());
 
         // 预先插入 5 个 peer，approve 状态
         for i in 0..5 {
@@ -800,5 +820,104 @@ mod tests {
 
         // 走到这里说明 8 个线程全部无死锁完成
         assert_eq!(8, 8, "all 8 threads completed without deadlock");
+    }
+
+    // 新单测（PR-5b #3）— ADR-008 MUST-4 + ADR-009 第 3.5 节 invariant 3
+    //
+    // 验证：insert peer + client_pool.replace（模拟握手路径写入 pool）
+    //       → registry.remove(id)
+    //       → 断言 client_pool.get(id) == None（invariant 3 闭环）
+    //
+    // see: specs/clipboard-text-sync.md 第 8.2 节 [严重 #1] / PR-5b 修复
+    // see: decisions/ADR-009-peer-registry.md 第 3.5 节 / 第 6.1 节 #2
+    #[test]
+    fn remove_clears_client_pool_atomic() {
+        use crate::app::client_pool::ClientPool;
+
+        // 构造共享 client_pool，与 registry 共享 Arc（模拟 AppState 构造路径）
+        let pool = Arc::new(ClientPool::new());
+        let registry = PeerRegistry::new(Arc::clone(&pool));
+
+        let id = "peer-pool-test";
+
+        // 模拟握手成功路径：先写 pool（client_pool.insert），再写 registry（registry.insert）
+        // ADR-009 第 3.5 节调用顺序契约表第 1 行
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client build should not fail");
+        pool.insert(id, client);
+        registry.insert(make_peer(id));
+        registry.approve(id);
+
+        // 前置断言：两者都含 id
+        assert!(
+            registry.is_known(id),
+            "before remove: registry must contain peer"
+        );
+        assert!(
+            pool.get(id).is_some(),
+            "before remove: client_pool must contain client"
+        );
+
+        // 调 registry.remove（唯一合法入口，ADR-009 第 5 节 #5）
+        let removed = registry.remove(id);
+        assert!(removed.is_some(), "remove must return Some PeerState");
+
+        // invariant 3 验证：registry 和 pool 同时不含 id
+        assert!(
+            !registry.is_known(id),
+            "after remove: registry must NOT contain peer"
+        );
+        assert!(
+            pool.get(id).is_none(),
+            "after remove: client_pool must NOT contain client (invariant 3 MUST-4)"
+        );
+    }
+
+    // 新单测（PR-5b #4）— ban was_peer=true 也清 client_pool（ADR-009 第 3.3 节状态机）
+    //
+    // 验证：insert peer + client 写 pool → registry.ban(id)（was_peer=true）
+    //       → 断言 client_pool.get(id) == None
+    //
+    // see: decisions/ADR-009-peer-registry.md 第 3.3 节事件表行 "/peers/ban 收到，subject 在 inner"
+    #[test]
+    fn ban_clears_client_pool_when_was_peer() {
+        use crate::app::client_pool::ClientPool;
+
+        let pool = Arc::new(ClientPool::new());
+        let registry = PeerRegistry::new(Arc::clone(&pool));
+
+        let id = "peer-ban-pool-test";
+
+        // 写入 pool + registry
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client build should not fail");
+        pool.insert(id, client);
+        registry.insert(make_peer(id));
+        registry.approve(id);
+
+        // 前置断言
+        assert!(registry.is_known(id));
+        assert!(pool.get(id).is_some());
+
+        // ban（was_peer=true 路径）
+        registry.ban(id);
+
+        // invariant 3 + ban 语义：inner 不含 + pool 不含 + banned 集合含
+        assert!(
+            !registry.is_known(id),
+            "after ban (was_peer): inner must NOT contain peer"
+        );
+        assert!(
+            pool.get(id).is_none(),
+            "after ban (was_peer): client_pool must NOT contain client (invariant 3 MUST-4)"
+        );
+        assert!(
+            registry.is_banned(id),
+            "after ban: banned set must contain peer"
+        );
     }
 }

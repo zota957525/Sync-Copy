@@ -90,7 +90,7 @@ mod tests {
     /// （ADR-008 5.2 节 + ADR-009 第 6.1 节 单测 #10）
     #[test]
     fn heartbeat_updates_last_heartbeat_not_last_sync() {
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let peer_id = "heartbeat-test-peer";
         registry.insert(make_peer(peer_id));
 

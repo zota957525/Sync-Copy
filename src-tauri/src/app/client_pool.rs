@@ -88,9 +88,8 @@ impl ClientPool {
     /// `PeerRegistry::remove` 内按顺序：1. inner.remove → 2. client_pool.remove。
     /// 任何 handler 不得绕过 PeerRegistry 直接调此方法。
     ///
-    /// PR-3 注：PeerRegistry 尚未集成 client_pool（PR-4 落地）；
-    /// `#[allow(dead_code)]` 仅作为 PR-3 的临时标注，PR-4 后移除。
-    #[allow(dead_code)]
+    /// PR-5b 注：PeerRegistry 已集成 client_pool（PR-5b 修 ADR-008 MUST-4 契约违反）；
+    /// `#[allow(dead_code)]` 标注已移除——此方法由 PeerRegistry::remove / ban 内部调用。
     pub(crate) fn remove(&self, id: &str) -> Option<reqwest::Client> {
         tracing::debug!(target: "app::client_pool", id = %id, "remove client");
         self.inner.write().remove(id)

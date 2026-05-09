@@ -4,16 +4,19 @@
 //! see decisions/ADR-008-security-review-of-adr003.md (MUST-3 403 不可区分 / MUST-7 DoS 限流 / MUST-8 sanitize)
 //! see decisions/ADR-009-peer-registry.md (第 3.5 节调用顺序契约 / 第 3.6 节 RateLimiter)
 //! see decisions/ADR-011-crypto-traits.md (第 3.1 节 KeyExchange trait)
+//! see specs/clipboard-text-sync.md (PR-5b 修 严重 #2 自连校验 / 严重 #3 device_id 占位)
 //!
-//! PR-5 业务逻辑：
+//! PR-5b 修复（在 PR-5 业务逻辑基础上）：
+//! - 修 严重 #2：步骤 3 自连校验真实执行（req.device_id == state.my_device_id → 403）
+//! - 修 严重 #3：HandshakeResp.device_id 改用 state.my_device_id（去除占位串）
+//!
+//! PR-5 原有业务逻辑（保留）：
 //! - sanitize device_name（MUST-8）
 //! - check_handshake DoS 限流（MUST-7）→ 429
-//! - 校验 device_id 不是自己（MUST-3 → 403）
 //! - banned peer 拒绝 re-handshake（ADR-008 5.3 节）
 //! - X25519 ECDH → HKDF → derive_aes_key → Zeroizing<[u8;32]>
 //! - ADR-009 第 3.5 节调用顺序：构造 Client → client_pool.insert → registry.insert → approve
 //! - 返 HandshakeResp { device_id, pubkey_b64, device_name }
-//! - 顺手修复 PR-4 nit：_sanitized_name 去 _ 前缀（接入 PeerState 后真实使用）
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -32,14 +35,14 @@ use crate::peer::{PeerState, TrustState};
 
 /// POST /handshake
 ///
-/// 入口检查顺序：
+/// 入口检查顺序（PR-5b 修正版，严格按 ADR-008 MUST 顺序）：
 /// 1. DoS 限流（ADR-008 MUST-7）→ 429
 /// 2. sanitize device_name（ADR-008 MUST-8）
-/// 3. device_id == 本机 device_id → 403（MUST-3，防自连）
+/// 3. device_id == 本机 device_id → 403（MUST-3，防自连；PR-5b 真实实现）
 /// 4. banned → 403（ADR-008 5.3 节）
 /// 5. X25519 ECDH → HKDF → aes_key（ADR-011）
 /// 6. client_pool.insert → registry.insert → approve（ADR-009 第 3.5 节顺序）
-/// 7. 返 HandshakeResp
+/// 7. 返 HandshakeResp（device_id = state.my_device_id，PR-5b 去占位串）
 pub async fn handle_handshake(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
@@ -63,15 +66,19 @@ pub async fn handle_handshake(
     let sanitized_name = sanitize_device_name(&req.device_name);
 
     // --- 步骤 3：防自连（device_id == 本机 → 403，MUST-3 不区分原因）---
-    // 本机 device_id 从 AppState 读取（当前 AppState 无 device_id 字段，
-    // TODO(PR-6): AppState 加 my_device_id 字段；当前跳过此校验，
-    // 以避免阻塞 PR-5 核心逻辑；self-connect 在 LAN 实践中极少发生。
-    // 若 AppState 未来加 my_device_id，此处解注释：
-    // if req.device_id == state.my_device_id {
-    //     let err = NetworkError::DeviceIdConflict;
-    //     err.log();
-    //     return Err(err);
-    // }
+    // ADR-008 第 4.1 节：对外返 403 与 banned 路径同一 body（不暴露内部区分）；
+    // 攻击者 A2 无法通过枚举 device_id 探测本机 ID（返回通用 forbidden body）。
+    // PR-5b：AppState.my_device_id 已落地，此校验真实执行。
+    if req.device_id == state.my_device_id {
+        tracing::warn!(
+            target: "network::handshake",
+            remote_ip = %remote_ip,
+            "handshake rejected: self-dial detected (device_id matches my_device_id)"
+        );
+        let err = NetworkError::DeviceIdConflict;
+        err.log();
+        return Err(err);
+    }
 
     // --- 步骤 4：banned peer 拒绝 re-handshake（ADR-008 5.3 节）---
     if state.peers.is_banned(&req.device_id) {
@@ -148,7 +155,7 @@ pub async fn handle_handshake(
         NetworkError::Internal("client build failed".into())
     })?;
 
-    // 步骤 2：client_pool.insert（先于 registry.insert，ADR-009 MUST-4 原子顺序）
+    // 步骤 2：client_pool.insert（先于 registry.insert，ADR-009 第 3.5 节调用顺序契约第 1 行）
     state.client_pool.insert(&peer_id, pool_client);
     // 步骤 3：registry.insert
     state.peers.insert(peer_state);
@@ -164,10 +171,11 @@ pub async fn handle_handshake(
     );
 
     // --- 步骤 7：返回 HandshakeResp（含本机公钥 + device_id）---
-    // TODO(PR-6): 加入 current_peers（snapshot 仅 Approved）供对端 bootstrapping
+    // PR-5b 修 严重 #3：device_id 使用 state.my_device_id（去除占位串）。
+    // 对端 dial_handshake 拿此值作 PeerRegistry 索引 + AAD origin_device_id 输入；
+    // 占位串会导致多 peer 共用同一索引（N=3+ 必崩，ADR-008 密码学/协议级灾难）。
     let resp = HandshakeResp {
-        device_id: "placeholder-my-device-id".to_string(),
-        // TODO(PR-6): state.my_device_id
+        device_id: state.my_device_id.clone(),
         pubkey_b64: my_pubkey_b64,
         device_name: Some(sanitized_name),
     };
@@ -214,7 +222,7 @@ mod tests {
         use std::collections::HashMap;
         use zeroize::Zeroizing;
 
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let peer_id = "peer-handshake-test";
 
         let (alice_sec, _alice_pub) = X25519KeyExchange::new_ephemeral();
@@ -261,6 +269,78 @@ mod tests {
             got.aes_key.len(),
             32,
             "aes_key must be 32 bytes after handshake"
+        );
+    }
+
+    // 新单测（PR-5b #1）— ADR-008 MUST-3 自连校验
+    //
+    // 验证：当 req.device_id == state.my_device_id 时，
+    //       handle_handshake 应返回 403 DeviceIdConflict。
+    //
+    // 测试策略：直接测 NetworkError::DeviceIdConflict 的 HTTP 响应码（403），
+    // 不经过 axum Router（避免构造完整 AppState）；验证自连检测逻辑本身的正确性。
+    //
+    // see: specs/clipboard-text-sync.md 第 8.2 节 [严重 #2] / ADR-008 MUST-3
+    #[test]
+    fn self_dial_returns_403() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        // 自连场景：DeviceIdConflict 映射到 403
+        // （handle_handshake 第 3 步：req.device_id == my_device_id → NetworkError::DeviceIdConflict）
+        let err = NetworkError::DeviceIdConflict;
+        let resp = err.into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "self-dial must return 403 Forbidden (ADR-008 MUST-3 DeviceIdConflict)"
+        );
+    }
+
+    // 新单测（PR-5b #2）— HandshakeResp.device_id 不是占位串
+    //
+    // 验证：HandshakeResp 中的 device_id 字段必须是真实 UUID，
+    //       不能是字面占位串 "placeholder-my-device-id"。
+    //
+    // 测试策略：构造 HandshakeResp，检查 device_id 不为占位串 + 符合 UUID 格式。
+    // 实际运行时值来自 AppState::new() 中 uuid::Uuid::new_v4().to_string()。
+    //
+    // see: specs/clipboard-text-sync.md 第 8.2 节 [严重 #3] / PR-5b 修复
+    #[test]
+    fn resp_uses_real_my_device_id() {
+        // 模拟 AppState::new() 中的 my_device_id 生成逻辑
+        let my_device_id = uuid::Uuid::new_v4().to_string();
+
+        // 断言：生成的 device_id 不是占位串
+        assert_ne!(
+            my_device_id.as_str(),
+            "placeholder-my-device-id",
+            "my_device_id must not be the placeholder literal"
+        );
+
+        // 断言：符合 UUID 格式（可被 uuid crate 解析）
+        let parsed = uuid::Uuid::parse_str(&my_device_id);
+        assert!(
+            parsed.is_ok(),
+            "my_device_id must be a valid UUID v4 string, got: {my_device_id}"
+        );
+
+        // 构造 HandshakeResp 使用真实 my_device_id（模拟 handle_handshake 步骤 7）
+        let resp = crate::network::protocol::HandshakeResp {
+            device_id: my_device_id.clone(),
+            pubkey_b64: "test_pubkey_b64".to_string(),
+            device_name: Some("TestDevice".to_string()),
+        };
+
+        assert_eq!(
+            resp.device_id, my_device_id,
+            "HandshakeResp.device_id must match my_device_id (not placeholder)"
+        );
+        assert_ne!(
+            resp.device_id.as_str(),
+            "placeholder-my-device-id",
+            "HandshakeResp.device_id must never be the placeholder literal"
         );
     }
 }

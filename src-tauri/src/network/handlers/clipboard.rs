@@ -199,7 +199,7 @@ mod tests {
     fn clipboard_rejects_unknown_peer_logic() {
         // 验证 PeerRegistry.is_known 对未注册 peer 返 false
         use crate::peer::PeerRegistry;
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         assert!(
             !registry.is_known("unknown-peer"),
             "is_known must return false for unregistered peer"
@@ -214,7 +214,7 @@ mod tests {
         use std::net::SocketAddr;
         use zeroize::Zeroizing;
 
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let peer_id = "banned-peer-001";
 
         // 先 insert，再 ban
@@ -254,7 +254,7 @@ mod tests {
         use std::net::SocketAddr;
         use zeroize::Zeroizing;
 
-        let registry = PeerRegistry::new();
+        let registry = PeerRegistry::new_for_test();
         let peer_id = "seq-test-peer";
 
         let peer = PeerState {
