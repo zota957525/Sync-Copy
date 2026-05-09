@@ -40,3 +40,9 @@ rand = "0.8"
 zeroize = { version = "1.8", default-features = false, features = ["zeroize_derive"] }
 # PNG 编解码（剪切板图片同步）
 image = { version = "0.25", default-features = false, features = ["png"] }
+# ADR-010 第 5 节实施提示 #2：tokio-util 提供 CancellationToken（health worker / lifecycle 取消机制）
+tokio-util = { version = "0.7", features = ["rt"] }
+# ADR-010 实施提示 #2：tracing-appender 提供 rolling file appender + non_blocking guard
+tracing-appender = "0.2"
+# ADR-010 实施提示 #2：thiserror 用于 StartupError enum（ADR-003 第 3.6 节已用）
+thiserror = "1"
