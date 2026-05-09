@@ -197,3 +197,31 @@ priority: P0
 - [ ] 修 §8.2 [低 #1]：client.rs:99 `_ => "text"` → `_ => unreachable!("broadcast_clipboard only supports Text/ImagePng")`
 - [ ] 修 §8.2 [低 #2]：dial_handshake banned 校验前移到 derive_aes_key 之前
 
+
+### 8.7 Code Review v2 — PR-5b 全修验证 (2026-05-10 · commit ef2979a)
+
+**结论**：APPROVED — 3 严重违反全闭环；不引入新严重违反。残留 2 条原低/nit + 1 测试遗留死代码（leave.rs 第 167-168 注释撒谎）建议挂 PR-6 顺手清理。
+
+#### 8.7.1 三严重违反全闭环验证
+
+- **#1 MUST-4 + ADR-009 第 3.5 节**：✅ 真闭环。`PeerRegistry` 加 `client_pool: Arc<ClientPool>` 字段（peer/mod.rs:136）；`new(client_pool: Arc<ClientPool>)` 签名按 ADR-009 第 3.2 节字面落地（peer/mod.rs:145）；`remove` 步骤 4 调 `self.client_pool.remove(id)` 在三 set 写锁全部释放后（peer/mod.rs:251，符合 ADR-009 第 3.3.1 节锁顺序）；`ban` 在 was_peer=true 分支同步调（peer/mod.rs:335）。新单测 `remove_clears_client_pool_atomic` (peer/mod.rs:833) + `ban_clears_client_pool_when_was_peer` (peer/mod.rs:884) 真断言 `pool.get(id).is_none()`，invariant 3 闭环。
+- **#2 handshake 自连**：✅ 真闭环。handshake.rs:72-81 在限流 + sanitize 之后、banned 之前真做 `req.device_id == state.my_device_id` 校验，错误类型 `NetworkError::DeviceIdConflict` → 403 + 通用 body "forbidden"（network/error.rs:93/188，ADR-008 MUST-3）。新单测 `self_dial_returns_403` (handshake.rs:285) 断言 `StatusCode::FORBIDDEN`。
+- **#3 my_device_id**：✅ 真闭环。`AppState.my_device_id: String` (state.rs:71) 在 `AppState::new()` 首行 `uuid::Uuid::new_v4().to_string()` (state.rs:102)；`uuid = { version = "1", features = ["v4", "serde"] }` 在 Cargo.toml:23；`git grep "placeholder-my-device-id" src-tauri/` 仅 4 命中（state.rs:64 注释 / handshake.rs:304/318/342 测试断言对比字面量），生产路径 0 命中；`shutdown-placeholder` 仅 lifecycle.rs:289 注释保留，活代码用 `&state.my_device_id` (lifecycle.rs:293)。client.rs::dial_handshake 通过 `my_device_id: &str` 入参由 caller 传 `state.my_device_id` 注入。新单测 `resp_uses_real_my_device_id` (handshake.rs:311) 断言 UUID v4 格式 + 不等占位串。
+
+#### 8.7.2 不引入新违反验证
+
+- **PeerRegistry::new 调用点全更新**：生产路径仅 state.rs:106 一处 `PeerRegistry::new(Arc::clone(&client_pool))`；其余 11 个 test mod 调用点全部改用 `new_for_test()` helper（peer/mod.rs:155 `#[cfg(test)]` 限定 ✓）。无散落的旧签名调用。
+- **new_for_test gating**：`#[cfg(test)]` 真限定（peer/mod.rs:155），生产路径**不可能**构造"无 client_pool 共享"的 PeerRegistry。
+- **0 新 TODO**：原 "PR-3 落地后补" 注释已删（leave.rs 注释更新；peer/mod.rs 中 remove/ban 注释指向 ADR-009 第 3.5 节）。残留 TODO 全为 PR-6/PR-7 已知占位（emit / arboard / tray）— 非新增。
+- **cargo 三件套**：`cargo test --lib` 87/87 pass；`cargo clippy --all-targets -- -D warnings` 0 warning；`cargo fmt --check` 0 diff（已复跑确认）。
+- **v2-9 越界**：⚠ commit ef2979a `--stat` 含 `PLAN.md | 2 +-` — backend-implementer 改了 PLAN.md（边界违规，应主窗口改）。但属流程性问题，本 PR-5b 内容正确。
+
+#### 8.7.3 新发现问题（≤ 3 条小补丁）
+
+- **[低 #3 新]** `Default for PeerRegistry` (peer/mod.rs:424-428) **无 #[cfg(test)]** 限定，构造一个孤立 ClientPool（与 AppState.client_pool 不共享）→ 若未来代码无意 `PeerRegistry::default()` 则破坏 invariant 3。当前生产路径 0 调用（grep 验证），但属脚枪。建议给 Default impl 加 `#[cfg(test)]` 或删除（与 new_for_test 重复）。
+- **[低 #4 新]** leave.rs:167-168 测试注释撒谎："PeerRegistry 不持有 client_pool" — PR-5b 已让 PeerRegistry 持有 client_pool。该注释 + `leave_atomic_remove_inner_and_pool` 测试（leave.rs:119）虽用 `new_for_test()` 与孤立 pool，但语义已被 peer/mod.rs 的 `remove_clears_client_pool_atomic` 完整覆盖；建议删 leave.rs 测试或改为对 registry.client_pool 的间接断言。
+- **[未修，原低 #1/#2 残留]** client.rs:98 `_ => "text"` 仍在；client.rs:368 banned 校验在 derive_aes_key 之后 — PR-5b 范围限 3 严重 + 1 中，这两条留 PR-6 顺手清理符合预期。
+
+#### 8.7.4 结论
+
+APPROVED → 推 `REVIEW_PASSED`。3 严重违反全代码层 + 单测层闭环；4 新单测真验证关键不变式；cargo 三件套全 green。新发现仅 2 条 [低]（Default 脚枪 + leave 测试遗留）+ 2 条原 [低/nit] 未修（PR-5b 范围外）— 均挂 PR-6 顺手清理，不阻塞 backend MVP 里程碑。
