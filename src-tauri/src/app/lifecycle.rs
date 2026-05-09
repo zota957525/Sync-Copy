@@ -284,27 +284,36 @@ impl Lifecycle {
             let step3_start = Instant::now();
             const LEAVE_DEADLINE_MS: u64 = 1500;
 
-            // PR-3 占位：leave 广播逻辑留 PR-4（group-leave-notify feature）。
-            // PR-4 落地时：对 state.peers.snapshot() 中 trust == Approved 的 peer
-            //   各 spawn POST /peers/leave，外层 join_all 包 timeout(1500ms)。
+            // PR-5：broadcast_leave 真正落地（group-leave-notify）。
+            // seq = 0 用于 leave（单次广播，不需要 monotonic 计数；接收方 seen_seq 仍记录）。
+            // my_device_id 当前无 AppState 字段（TODO PR-6 加 my_device_id）；
+            // 用 "shutdown" 占位不影响 leave handler 的 is_known 校验（对端已有 origin_device_id）。
+            // PR-6 落地时替换为 state.my_device_id.as_str()。
             let leave_result = tokio::time::timeout(
                 Duration::from_millis(LEAVE_DEADLINE_MS),
-                async {
-                    // 占位：立即完成（PR-4 替换为真正 leave broadcast）
-                    tracing::debug!(target: "lifecycle", step = 3, "leave broadcast (PR-4 placeholder)");
-                },
+                crate::network::client::broadcast_leave(state, "shutdown-placeholder", 0),
             )
             .await;
 
             let actual_ms = step3_start.elapsed().as_millis() as u64;
-            if leave_result.is_err() {
-                tracing::warn!(
-                    target: "lifecycle",
-                    step = 3,
-                    deadline_ms = LEAVE_DEADLINE_MS,
-                    actual_ms = actual_ms,
-                    "shutdown step 3: leave broadcast timed out"
-                );
+            match leave_result {
+                Ok(()) => {
+                    tracing::debug!(
+                        target: "lifecycle",
+                        step = 3,
+                        actual_ms,
+                        "leave broadcast complete (PR-5)"
+                    );
+                }
+                Err(_timeout) => {
+                    tracing::warn!(
+                        target: "lifecycle",
+                        step = 3,
+                        deadline_ms = LEAVE_DEADLINE_MS,
+                        actual_ms,
+                        "shutdown step 3: leave broadcast timed out"
+                    );
+                }
             }
         }
 

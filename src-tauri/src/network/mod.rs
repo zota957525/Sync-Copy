@@ -9,6 +9,7 @@
 //! - 监听端口默认 5858（specs/_assumptions.md A9）
 //! - shutdown 信号：oneshot::Receiver（lifecycle step 5）
 
+pub mod client;
 pub mod error;
 pub mod handlers;
 pub mod protocol;

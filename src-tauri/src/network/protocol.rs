@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// 握手请求（POST /handshake）。
 ///
 /// handler 在接收后首先调 sanitize_device_name(device_name)（ADR-008 MUST-8）。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct HandshakeReq {
     /// 发起方 device_id（UUID）
     pub device_id: String,
@@ -30,12 +30,15 @@ pub struct HandshakeReq {
 }
 
 /// 握手响应。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HandshakeResp {
     /// 本机 device_id
     pub device_id: String,
     /// 本机 X25519 公钥（base64）
     pub pubkey_b64: String,
+    /// 本机设备名称（已 sanitize；可选字段供 dial_handshake 解析）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -45,7 +48,7 @@ pub struct HandshakeResp {
 /// 剪切板推送请求（POST /clipboard）。
 ///
 /// ADR-003 第 3.2 节：text / image_png 两种 kind；snapshot 复用此 DTO。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ClipboardReq {
     pub origin_device_id: String,
     pub seq: u64,
@@ -96,8 +99,23 @@ pub struct HeartbeatReq {
 // /leave POST
 // ---------------------------------------------------------------------------
 
-/// 离线广播（POST /peers/leave）。
+/// peer 宣告自身（POST /peers/announce）。
+///
+/// 新 peer 加入 LAN 后广播自身存在，触发其他设备审批弹框。
 #[derive(Debug, Deserialize)]
+pub struct AnnounceReq {
+    /// 发起方 device_id（UUID）
+    pub device_id: String,
+    /// 发起方展示名称（需 sanitize，ADR-008 MUST-8）
+    pub device_name: String,
+    /// 发起方 X25519 公钥（base64）
+    pub pubkey_b64: String,
+    /// 发起方监听端口
+    pub listen_port: u16,
+}
+
+/// 离线广播（POST /peers/leave）。
+#[derive(Debug, Deserialize, Serialize)]
 pub struct LeaveReq {
     pub origin_device_id: String,
     pub seq: u64,
