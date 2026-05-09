@@ -9,6 +9,10 @@
 // crypto module（ADR-011 crypto traits / ADR-008 MUST-1 AAD 绑值 / MUST-2 zeroize）
 pub mod crypto;
 
+// peer module（ADR-009 PeerRegistry / TrustState / RateLimiter）
+// PR-2：纯逻辑层（struct + 状态机 + 7 单测）；client_pool 集成留 PR-3 Lifecycle。
+pub mod peer;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
