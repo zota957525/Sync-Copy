@@ -11,8 +11,10 @@
 //! - shutdown()：7 步占位（含每步 timeout）+ 幂等重入
 //! - phase() getter
 //!
-//! 不在本 PR 实现（留 PR-4/5）：
-//! - HTTP server / axum bind（step 5 占位）
+//! PR-4 新增：
+//! - step 5 真正 axum bind（tokio::net::TcpListener + axum::serve + graceful shutdown）
+//!
+//! 不在本 PR 实现（留 PR-5+）：
 //! - 剪切板线程 arboard（step 4 占位）
 //! - 心跳 / 健康自检业务逻辑（step 6 空 worker 占位）
 //! - leave 广播实际逻辑（step 3 占位）
@@ -183,11 +185,29 @@ impl Lifecycle {
         //   PR-5 范畴；当前占位 None。
         tracing::debug!(target: "lifecycle", step = 4, "clipboard thread spawn (PR-5 placeholder)");
 
-        // --- Step 5：network::server::start — axum bind 配置端口起 listen ---
+        // --- Step 5：network::server::start — 真正 axum bind + graceful shutdown ---
         // ADR-010 第 3.2 节 step 5：
         //   TCP bind 失败 → 返 PortBind → unwind step 4 + step 1
-        //   PR-4 范畴；当前占位。
-        tracing::debug!(target: "lifecycle", step = 5, "HTTP server bind (PR-4 placeholder)");
+        //   PR-4：用 tokio::net::TcpListener::bind + axum::serve + with_graceful_shutdown 真起 server。
+        {
+            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+            // 把 shutdown_tx 存入 lifecycle，shutdown step 5 时发信号
+            *self.server_shutdown_tx.write() = Some(shutdown_tx);
+
+            let state_arc = Arc::new(state.clone());
+            let server_handle = tauri::async_runtime::spawn(async move {
+                if let Err(e) = crate::network::start_server(state_arc, shutdown_rx).await {
+                    tracing::error!(
+                        target: "lifecycle",
+                        step = 5,
+                        error = %e,
+                        "HTTP server error during run"
+                    );
+                }
+            });
+            *self.server_task.write() = Some(server_handle);
+        }
+        tracing::info!(target: "lifecycle", step = 5, port = crate::network::DEFAULT_PORT, "HTTP server started");
 
         // --- Step 6：health worker spawn（空 worker + cancel token 占位）---
         // ADR-010 第 3.2 节 step 6：
@@ -501,6 +521,9 @@ mod tests {
     }
 
     // 额外测试：Phase 转移合法路径验证
+    // ADR-010 第 6 节单测 #9（非法转移 panic enforcement）留 PR-5+：
+    // Dead → Running 等非法转移当前无 panic guard（shutdown 和 start 已有重入保护）；
+    // 当 Phase 状态机需要显式 panic guard 时在 PR-5+ 补充。
     #[test]
     fn phase_transitions_valid() {
         let lc = Lifecycle::new();

@@ -21,6 +21,7 @@
 //! PR-3 合并后将在同一函数内按 inner.remove → client_pool.remove 原子顺序扩充。
 
 pub mod rate_limit;
+pub mod sanitize;
 
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};

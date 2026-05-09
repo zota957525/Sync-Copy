@@ -21,6 +21,10 @@ pub mod peer;
 // PR-3：基础设施三件套最后一件（启动 7 步 + 关闭 7 步 + Phase 状态机 + panic hook）
 pub mod app;
 
+// network module（ADR-003 第 3.2 节 12 端点 + ADR-008 MUST-3/6/7/8）
+// PR-4：axum router skeleton + handlers + error 层 + lifecycle step 5 真正 bind
+pub mod network;
+
 // ---------------------------------------------------------------------------
 // Tauri 入口（ADR-010 第 3.5 节：panic hook 在最早入口注册）
 // ---------------------------------------------------------------------------
@@ -140,11 +144,10 @@ fn install_panic_hook() {
 /// mac/Win cfg 隔离（ADR-010 第 3.5 节 + ADR-008 第 7.2 节 7.3 节 P1 补丁）。
 /// 文案不含 panic payload（ADR-008 第 6.1 节）。
 fn show_native_fatal_dialog(location: &str) {
-    // 文案：只显示位置，不显示 panic message（防截图泄露）
-    let _message = format!(
-        "Sync Copy 遇到致命错误，已写入日志（{}），请导出日志后联系开发者。",
-        location
-    );
+    // SECURITY (ADR-008 第 6.1 节 + ADR-010 第 3.5 节):
+    // 文案不含 panic message 字面（防特定 payload 让用户截图发敏感数据）。
+    // location 是编译期 file!:line! 值，攻击者无法控制其内容。
+    // SECURITY: location is compile-time file!:line!, attacker-uncontrollable.
 
     #[cfg(target_os = "macos")]
     {
