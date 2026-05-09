@@ -103,3 +103,54 @@ Sync Copy 是无中心服务器、无 mDNS / UDP 自动发现的纯 LAN 工具�
 ## 8. Review 段（占位）
 
 > code-reviewer / tech-architect 后续填写。
+
+## 8. Code Review (by code-reviewer · 2026-05-09)
+
+> 范围：commit 937fdda（PR-4 HTTP server skeleton + 4 必修 + sanitize + lifecycle step 5 真落 + PR-3 2 nit 清理）。
+> 被审文件：network/{mod,error,protocol}.rs + network/handlers/{handshake,clipboard,file,heartbeat,leave,peers,history}.rs + peer/sanitize.rs + app/lifecycle.rs + lib.rs。
+
+**结论**：APPROVED（全部 5 聚焦点合规；仅 4 条 nit/低危需要后续 PR 关注，不阻塞 PR-5）
+
+### 8.1 5 聚焦点意见
+
+1. **MUST-3 状态码 409→403 通用 body** — PASS
+   network/error.rs:90-96 把 DeviceIdConflict / Banned / NotInPeers / UserRejected 统一映射 (FORBIDDEN, "forbidden")；422（DecryptFailed / SizeMismatch）与 429（RateLimited）也分别走统一 body；500（Internal）body 不暴露 reason；4 条 tokio test（device_id_conflict_returns_403_forbidden / banned_returns_same_403_as_conflict / not_in_peers_returns_403_forbidden / decrypt_failed_and_size_mismatch_same_422_body）覆盖全部不可枚举路径。所有 403 路径返同一 body，无攻击者可推断分支。
+
+2. **MUST-6 /file seq dedupe + size 双校验 + DefaultBodyLimit** — PASS
+   handlers/file.rs 入口顺序是：is_known（MUST-3 鉴权前置）→ sanitize_filename → seen_seq_and_update（命中 OK 200 静默丢）→ 声明 size > MAX_FILE_SIZE(5MB) 413 → base64 decode → ct_len > MAX_CIPHERTEXT_BYTES(7MB) 413 → 占位 503。base64 decode 失败 400（ADR 决议 decrypt 之前的失败 ≠ 422，正确）。network/mod.rs:101 `Router::new()...layer(DefaultBodyLimit::max(7 MB))` 真应用。两道闸的常量关系（MAX_CIPHERTEXT > MAX_FILE）有单测兜底。
+
+3. **MUST-7 handshake DoS 限流 + P3 device_id 不进 tracing fields** — PASS
+   handlers/handshake.rs:39-51 在 sanitize / 任何业务前调 `state.rate_limiter.check_handshake(remote_ip, &req.device_id)`，TooManyRequests → NetworkError::RateLimited (429)。device_id 严格不进 tracing fields：handshake handler 的 tracing::debug 仅含 remote_ip + 静态消息（行 57-63 注释明示原因）；rate_limit.rs 限流命中点（行 121-126 / 151-156）只记 remote_ip + count。阈值 3/10/60s 在 rate_limit.rs:25-32 编码并经单测 per_pair_and_global_count 覆盖（4 次同对 / 11 次全局 → TooManyRequests）。
+
+4. **MUST-8 sanitize 模块 + 单测** — PASS
+   peer/sanitize.rs 三函数全部真实现：sanitize_device_name（≤ 64 codepoints + Bidi/控制字符过滤 + 空兜底 "<unnamed>"）；sanitize_filename（path basename 去穿越 + Win 保留前缀 CON/PRN/AUX/NUL/COM0-9/LPT0-9 加 _ 前缀 + Bidi/控制/Win 禁用字符过滤 + 末尾 . 与空格去除 + 200 字节限 + 空兜底 "file"）；sanitize_log_field（截短 100 字节 + Bidi/控制过滤 + 超长加 "..."）。16 单测（覆盖 3 函数 × 正常 ASCII / Unicode / RTL / 长串 / path 穿越 / Win 保留 / 末尾 . / 空 / 截断），超 ADR-008 第 10 节 ≥ 12 条最低线。所有外部字符串首动作 sanitize 在 handshake / approval/forward / file 已落实。
+
+5. **lifecycle step 5 真落 axum bind + graceful shutdown + 端口冲突** — PASS
+   start step 5（lifecycle.rs:188-210）真起 oneshot::channel + spawn(crate::network::start_server) + server_task 入仓；network/mod.rs:120-162 内 `TcpListener::bind(0.0.0.0:5858)` + `axum::serve(...).into_make_service_with_connect_info::<SocketAddr>().with_graceful_shutdown(shutdown_rx.await)` 真闭环。bind 失败 → StartupError::PortBind；spawn 包装后 lifecycle 主流程不会立即捕获 PortBind（见 8.2 信息项）。shutdown step 5（lifecycle.rs:351-390）真用 oneshot send + 500ms timeout join server_task。
+
+### 8.2 必修补丁数：0（APPROVED）
+
+无 BLOCKED 项；全部 4 必修（MUST-3/6/7/8）+ lifecycle step 5 + sanitize 模块 + PR-3 nit 全部落地。
+
+仅记 4 条信息项 / 低 nit（不阻塞 PR-5，由对应 feature ADR / PR-5+ 接管）：
+
+- [信息] step 5 PortBind 错误的 unwind 时序：`lifecycle.start` step 5 把 `start_server` 包入 `tauri::async_runtime::spawn` 后立即返回 Ok 并直进 step 6/7（Phase → Running），bind 失败发生在 spawn 内部 `tracing::error!` 但 lifecycle 不返 PortBind、AppHandle 也不 abort。ADR-010 第 3.2 节 step 5 表写明"TCP bind 失败 → 返 PortBind → unwind step 4 + step 1"，本 PR 这里事实上未 unwind（占位策略可接受，但与 ADR 字面有出入）。**留 PR-5+ 把 bind 阶段改为同步 await（在 spawn 之前先 bind，bind ok 再 spawn serve）**。该修法在 axum 0.8 是标准模式（bind 与 serve 可分离），改动量 ≤ 10 行。
+- [低 nit] PR-3 残留注释 `ADR-010 第 6 节单测 #9` 仍在 lifecycle.rs:524 — 已转化为带说明的 PR-5+ TODO（非 dead code），可以保留；如严格"清零"则删除注释。
+- [低 nit] handshake.rs:54 `let _sanitized_name = sanitize_device_name(&req.device_name)` 用 `_` 前缀避 clippy unused，PR-5+ 接 PeerState 时改回 `let sanitized_name`。
+- [低 nit] handlers/peers.rs:40 `handle_peers_announce` 暂未做来源鉴权 + sanitize（nullary handler，连 Json body 都没接）；PR-5+ 引入 announce DTO 时补 is_known + seq dedupe + sanitize 三件套。
+
+### 8.3 过度工程自查
+
+无。本 PR 1664 行严格按 ADR-003 第 3.2 节 12 端点 / ADR-008 MUST-3/6/7/8 / ADR-009 第 3.6 节 / ADR-010 第 3.2 节 step 5 的 1:1 落地，所有占位返 503 路径均带"PR-5+"注释，未引入未规约的中间层 / 抽象 / 新依赖。RateLimiter 的算法粒度（per_pair pop_back 撤销）已注明"精确撤销由 group-discovery feature ADR 细化"，符合 ADR-009 第 3.6 节 "稳定接口 + 阈值留 feature ADR" 承诺。
+
+### 8.4 owner 边界自查
+
+无越权。本 review 仅在 specs/group-discovery.md 第 8 节追加 80 行；未触 src-tauri/** / src/** / 任何 ADR 第 1-7 节 / 任何 spec 第 1-7 节 / PLAN.md。
+
+### 8.5 PLAN.md 建议
+
+PR-4（v2-9）：IMPL_DONE → REVIEW_PASSED。下游可启 PR-5 决策点。
+
+### 8.6 建议主窗口下一步
+
+APPROVED → 不需要回报用户。建议主窗口直接推进 PR-5 决策点（handler happy path / crypto 接入 / qa 集成）；可选派 backend-impl 静默落 8.2 第 1 条（PortBind 真 unwind 时序补丁）作为 PR-5 第一个子任务。
