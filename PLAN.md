@@ -31,7 +31,7 @@
 | ID | Task | 状态 | 负责人 | 备注 |
 |---|---|---|---|---|
 | P0-1 | 把当前 main 分支打成 `legacy-prototype` 分支保留 | `IMPL_DONE` | main + 用户 | `git branch -a` 确认 `legacy-prototype` 已存在（指向 v0 最后 commit `f4be188`），2026-05-08 复审时归档 |
-| P0-2 | 清空 `src-tauri/src/` 和 `src/routes/` 业务源码 | `BACKLOG` | backend-implementer + frontend-implementer | 保留 main.rs 入口 + +layout.ts + 配置文件 |
+| P0-2 | 清空 `src-tauri/src/` 和 `src/routes/` 业务源码 | `IMPL_DONE` | backend-implementer | 2026-05-09 完成：删 8 个 .rs（clipboard/commands/config/crypto/history/peer/state）+ network/ 整目录（client/health/mod/protocol/server）+ 改 main.rs 为最小 Tauri 入口 + 改 lib.rs 清空业务调用 + +page.svelte 替换为最小外壳。`cargo check` + `cargo clippy -D warnings` 全 pass 0 warning。0% 自由发挥；0 越界。`legacy-prototype` 分支 `f4be188` 留底完整 |
 | P0-3 | 保留 `项目架构.md`、`使用说明.md` 在仓库供新版**反向参考**，但不再是真理来源 | `BACKLOG` | docs-writer | 在两份文件顶部加 banner：「v0 历史文档，新版以 specs/ 为准」 |
 | P0-4 | 写 ADR-001 锁定本次重写决策、SDLC 流程、主窗口边界 | `ADR_ACCEPTED` | main（用户拍板） | 已在 `decisions/ADR-001-rewrite-with-strict-sdlc.md` 落盘（2026-05-06） |
 | P0-5 | 项目升级到 HANDOFF v5 规范（增量补丁迁移） | `IMPL_DONE` | main（用户拍板 A）| 落盘 5 件：`decisions/ADR-002-adopt-handoff-v5.md` / `specs/_assumptions.md`（PENDING_USER_REVIEW）/ `docs/handoff-lessons-learned.md`（10 段骨架）/ `CLAUDE.md` 新增 第 14 节 / `safety-bar.sh` 加 4 条新 pattern（17/17 测试通过，2026-05-08） |
