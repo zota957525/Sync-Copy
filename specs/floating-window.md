@@ -288,3 +288,50 @@ Sync Copy 的产品定位是"轻度伴随"工具——用户在前台干活，�
 ## 8. Review 段（占位）
 
 > code-reviewer / tech-architect 后续填写。
+
+## 9. Code Review — PR-FE-1 / 2026-05-13 commit 5597afe
+
+**结论**：CHANGES_REQUESTED（1 个低-中等必修 + 1 个 backend 配套必须在 PR-FE-2 前补；其余 nit）
+
+### 9.1 4 聚焦点验证
+
+- invoke / listen 命令名严格 mapping：✅ 部分。12/12 invoke 命令名完全对齐 `src-tauri/src/lib.rs` 第 61-73 行注册；DTO 字段（StatusInfo / PeerInfo / ConfigInfo / HistoryItem / PeerPendingPayload）严格镜像 `commands.rs` Serialize struct（含 `last_successful_sync_at: Option<String>` / `peer_hint: Option<String>` 的 null 映射）。3 个 listen 事件中 `status-updated` / `history-updated` 在 `commands.rs` 第 304/402/426/463/486 行有真 emit；**`peer-pending` 事件全 backend 0 emit**（grep 仅命中 `handshake.rs:406` 作为占位 device_id 字面值的字符串，与事件 emit 无关）— `+page.svelte:24` 订阅永远静默 → 见 第 9.2 节 [中等] 1。
+- Svelte 5 runes 用法：✅。`$state` / `$derived` / `$props` 用法正确；`.svelte.ts` 模块 export 单 `$state({...})` 对象规避 `state_invalid_export` 是社区惯例；无闭包外 reactive 失效；`copyTimer` 用普通 `let` 不滥用 rune（符合 spec 第 6.7 节"不要持有额外 $state"）。
+- 视觉语言字典 + spec 遵循：✅。逐项 diff 第 6.5 节字典对照 `tokens.ts` — 颜色 6 项（#22c55e / #9ca3af / #3b82f6 / #ef4444 / #f3f4f6 / 22% white）全对齐；尺寸 320×420 / 圆角 10px / 边框 0.08 / 背景 0.88 全对齐；字号 13/12/11/9 全对齐；间距 4/6/8/10/14 全对齐；字体栈逐字符相等；Win fallback 0.94 已落。`FloatingWindow.svelte` 三段布局（statusbar 36 + history-area flex + footer 24 + brand 16）对应第 6.3 节 wireframe；`data-tauri-drag-region` 用法正确，capability 已含。
+- IPC 封装 + 错误处理：✅ 基本到位。`IpcError` class + `toIpcErrorCode` switch 映射 5 个通用 body（forbidden / not_found / invalid_input / internal_error / rate_limited）符合 ADR-008 MUST-3；每个 wrapper 含 try/catch + `wrapError`；事件 helper 全返 `UnlistenFn` 并在 `+page.svelte` `onDestroy` 用 `?.()` 防御 null。fatal user-visible 兜底（ErrorBoundary）按 spec 留 PR-FE-2，本批 OK。
+
+### 9.2 必修补丁
+
+#### [中等] 1. `peer-pending` 事件无 backend emit 配套
+- 文件：`src/lib/ipc.ts:193` + `src-tauri/src/network/handlers/handshake.rs`（缺侧）
+- 现象：前端 `onPeerPending` 订阅 `"peer-pending"` 事件，但后端无任何 `app_handle.emit("peer-pending", ...)` 调用。handshake handler 第 405 行注释"待审批"但只 insert PeerRegistry，不 emit。
+- 风险：PR-FE-2 group-approval 弹框无法被触发。本批 `+page.svelte:25` `console.log` 永远不会执行 → 静默错觉"订阅生效"。
+- 建议：开一个独立 backend PR（PR-7 或 PR-FE-1.5）在 handshake handler 收到 Pending peer 后调 `app_handle.emit("peer-pending", PeerPendingPayload{...})`。本前端 PR 已为 emit 配齐 DTO + 订阅 helper，等 backend 接入即贯通。
+- 不阻塞本 PR-FE-1 合入（前端职责已尽），但**必须在 PR-FE-2 开工前补齐**，否则 PR-FE-2 验收会失败。
+
+#### [低] 2. `FloatingWindow.svelte:121` 用未定义 CSS 变量 `var(--color-success)`
+- 文件：`src/lib/components/FloatingWindow.svelte:23, 121`
+- 现象：第 23 行 import `COLOR_TEXT_SUCCESS`，第 121 行却用 `var(--color-success)` —— 该 CSS 变量在 `app.html` / `tokens.ts` / 当前组件 `<style>` 中**均未定义**。
+- 风险：用户点 IP:PORT 后"已复制"反馈不会变绿（fallback 到继承色 `#f3f4f6` 主文字）。导入的 `COLOR_TEXT_SUCCESS` 成死代码 → `svelte-check` 仍 0 warning 因为模板属性是字符串拼接。
+- 建议：把 `var(--color-success)` 改成 `{COLOR_TEXT_SUCCESS}` 与上下文风格一致；一行修补。
+
+### 9.3 [低] nit 列表
+
+- (a) `app.html` 全局 `user-select: none` 应注意：未来若历史条目要允许文本选取需局部 re-enable（PR-FE-3 注意；spec 第 6.4 节"工具型，鼠标主"已为此奠基，本批不阻塞）。
+- (b) `recopyHistoryItem` 对 image / file 类型会收到 `invalid_input` 错误（backend `commands.rs:541/545` 决定）—前端无对应类型守卫，PR-FE-3 list 渲染时记得不要对 image / file 条目挂"单击复制"。
+- (c) `+page.svelte` async `onMount` 在 await 期间组件被销毁理论上会让 unlisten 永远不赋值；浮窗主入口组件不卸载，可忽略，但 PR-FE-2 引入子 view 切换时同 pattern 复制需谨慎。
+- (d) `statusbar` 父 div 也加了 `data-tauri-drag-region`，且 `statusbar-left` 重复加 — 后者多余（父已包含），不影响功能。
+
+### 9.4 测试覆盖评估
+
+- backend `commands.rs` 单测 12 条已覆盖 DTO 序列化、boundary 错误映射、sanitize 等核心路径；前端本批无单测（合理 — 全是 thin wrapper + style），E2E / 手测留 qa-tester 跑 Tauri dev 验证 第 4 节 6 条 AC。
+- 空白覆盖：本 PR 不含 AC #1-#6 的自动化验证（视觉性、需真窗口）—— 由 qa-tester 在 PR-FE-2 后跑手测 checklist。
+
+### 9.5 owner 边界 + 过度工程自查
+
+- owner 边界：`git show 5597afe --name-only` 仅 `src/` 域，0 文件溢出到 `src-tauri/` / `PLAN.md` / `specs/` / `decisions/`。✅
+- 过度工程：本 review 段 ~62 行（略超预算 60，但 第 9.2 节两个问题需要详细 risk 描述；可接受）。无重复引用，无对子 PR 越权设计建议。
+
+### 9.6 结论
+
+本 PR 是高质量的前端脚手架第一砖：12 invoke wrapper、视觉字典严格对齐、Svelte 5 runes 规范、错误层规范。**1 个 [低] 必修（var(--color-success)）建议小补丁直接落，1 个 [中等] backend emit 配套需要在 PR-FE-2 前由 backend-implementer 补齐。** APPROVED 在 [低] 修完后即可推进 PR-FE-2；[中等] 由主窗口在 PLAN.md 跟进单独 backend PR。

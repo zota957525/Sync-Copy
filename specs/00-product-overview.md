@@ -152,3 +152,52 @@ revised: 2026-05-08 — ADR-003 项目层骨架 covers 第 5.4 节 待挑战项�
 ## 8. Review 段（占位）
 
 > code-reviewer 与 tech-architect 在后续阶段填写。
+
+---
+
+## Code Review — PR-FE-0 Tauri Commands 层 / 2026-05-13 commit 837fd55
+
+**结论**：CHANGES_REQUESTED
+
+PR-FE-0 整体设计干净（11 命令 + DTO 边界明确 + AppHandle 真零 lifecycle 改动 + 140 单测全过 + clippy/fmt 0 warning），但有 **2 条必修** 触及 ADR-008 安全必修条款 + spec AC 缺口，必须在 PR-FE-1 接入前修。
+
+### 5 聚焦点验证
+- 命令参数 sanitize：❌（MUST-8 未在 set_config 调用 `sanitize_device_name`，仅做 trim+len 截断）
+- 错误边界：❌（set_config / join_group / approve_peer 等命令 Err(String) 拼接 anyhow::Error::Display，泄露文件路径 / 内部错误链，违反 ADR-008 第 4.1 节"通用 body"原则）
+- history/config store 设计：✅（VecDeque + RwLock + MAX_HISTORY=50 / ProjectDirs config.json / async tokio::fs::write 符合 spec settings-panel 第 3 节 + history-list 第 3 节）
+- AppHandle 注入 + emit 时序：⚠️（注入 OK，emit 时序整体 OK — peers/history 操作均在 PeerRegistry/HistoryStore 写完之后再 emit；但 **peer-pending 事件 emit 接入未落地** — `PeerPendingPayload` struct 定义存在但 handshake handler 不发，spec group-approval AC #1 "A 与 B 同时弹审批框"链路在 PR-FE-0 边界外但需明确挂在 PR-FE-1 否则 group-approval 整条不通）
+- recopy_history_item 占位：⚠️（text 路径 OK；image/file 返 Err — 前端会让用户困惑点击无反应，应在 PR-FE-1 前对齐 clipboard_apply_tx 扩展为枚举或先在前端禁用图片单击）
+
+### 必修补丁（CHANGES_REQUESTED）
+
+#### [严重] MUST-8 sanitize_device_name 未在 set_config 调用 — commands.rs:324-336
+- 现象：spec settings-panel 第 4 节 AC "device_name > 64 字符时 input 截断或 banner 提示" 后端只做 `chars().take(64)`；ADR-008 MUST-8 必修"字符集白名单 + Bidi/控制字符黑名单"未应用
+- 风险：恶意 device_name 含 U+202E RTL override 写盘 → 下次 broadcast 给对端 → 对端 UI 渲染时即使 handshake 端 sanitize 也无法救（本机 device_name 是本机自定的）
+- 修法：`commands.rs::set_config` 在截断前调 `crate::peer::sanitize::sanitize_device_name(&trimmed)`；该函数已在 peer/sanitize.rs 实现且包含 Bidi+控制字符+64 codepoints 三件套
+
+#### [严重] 错误 body 泄露内部 anyhow 链 — commands.rs:257 / 280 / 350 / 487
+- 现象：`format!("入组目标格式不对，应该是 ip:port：{e}")` / `format!("连接 {normalized} 失败：{e}")` / `format!("配置保存失败：{e}")` / `format!("历史条目不存在：{id}")` 全部把 anyhow::Error::Display 拼到 Err(String) 返前端；其中 `Config::save` 失败的 Err 含完整 ProjectDirs path（"~/Library/Application Support/com.synccopy.app/config.json"）
+- 风险：违反 ADR-008 第 4.1 节"403 通用 body""422 统一 body 串"原则；前端拿到的字符串泄露内部路径 / device_id 字面值 / network::client 错误链
+- 修法：boundary 处统一返用户友好通用串（"配置保存失败" / "入组目标格式不对" / "历史条目不存在"），具体错误细节用 `tracing::warn!(error = %e, ...)` 写入日志即可；ADR-003 第 3.6 节 CommandError 设计正是为了避免这种"e.to_string() 直接出 boundary"
+
+### 新发现问题（[低] nit 可挂下批扫尾）
+
+- [低] `set_config` listen_port=0 拒绝（commands.rs:340）— `port: u16` 类型已保证 0..=65535，但 v2 P1 spec 第 3 节明确 "端口字段 P1 不开放修改"，UI 不会传 port，后端是否该直接 ignore listen_port 字段而非接受？建议改文档或加 `tracing::warn!("set_config port=... ignored at P1")`
+- [低] `now_ms()` 公开导出但 commands.rs 内未使用（pub fn 给谁用？）— 若给 PR-FE-1 后续 handler 用应有调用点 doc 注释；否则改为 pub(crate)
+- [低] `recopy_history_item` image 分支 `let _ = data_b64;` 显式丢弃但下行就直接 Err — 该写法触发 `unused_variables` 但 clippy 没报；可省略 let 绑定（HistoryPayload::Image { .. } 即可）
+- [低] `format_last_sync` 用 `Instant::elapsed()` 不可序列化 — peer.last_successful_sync_at 在 snapshot 拷贝后才转 String，时序正确，但若 snapshot 与 commands 调用间隔较长 elapsed 会偏大；可接受（用户感知秒级误差无意义）
+
+### 测试覆盖评估
+
+- 现有 8 单测：覆盖 normalize_addr / approve_peer unknown / set_config 截断 / entry_to_item / relative_time / DTO 构造
+- 未覆盖（建议 PR-FE-1 前补）：
+  - set_config 含 Bidi 字符 → 出来必须不含 U+202E（修必修 1 后追加）
+  - 错误 body 不含 anyhow 内部细节（修必修 2 后追加：set_config 写盘失败的 Err 不含 path）
+  - HistoryStore 并发 push（多线程同时 push 同 hash → 不应 panic + 计数 = 1）
+- spec history-list AC #11 "50 条全部为图片（每张 5 MB）时浮窗滚动流畅" — 属前端验收，PR-FE-1 落地后由 qa-tester 跑
+
+### 结论
+
+CHANGES_REQUESTED。2 条必修是 ADR-008 必修条款 + spec AC 安全防线，必须修；其余 [低] nit 挂 PR-FE-1 扫尾。按 lessons-learned 新策略：派 backend-impl 静默落两条补丁 → 静默通过（不需要走完整流程二次评审）。
+
+**过度工程自查**：本 review 段约 0% 可省略 — 2 条必修是 spec/ADR 硬约束触发，[低] 4 条已折叠到 nit。8.5 todo 共 2 条主修 + 4 条 nit，控制在 8 条建议上限内。
