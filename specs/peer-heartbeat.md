@@ -243,3 +243,37 @@ FAIL_LIMIT = 2
   - #14 aes_key_zeroize_after_remove：⚠ 缺（ADR-009 第 6.1 节标注 best-effort 跨平台不强制；不阻塞）
 - 已覆盖最小集 7/14；强制项满足（≥ 7），但 #13 是 P4 死锁硬约束的唯一活性证明，必须补。
 
+
+### 8.1 Code Review v1 — PR-6b heartbeat worker + 隐形掉线 (2026-05-10 · commit a8a3a08)
+
+**结论**：APPROVED（0 严重违反 / 0 中等问题 / 5 低 nit；6 条 ADR 必修全代码层闭环）
+
+#### 8.1.1 6 ADR 必修条目真闭环验证
+
+- **Shutting 禁 replace**（ADR-010 第 3.6 节）：✅ `force_rebuild_connection` step 1（heartbeat_worker.rs:356-363）+ `heartbeat_loop` 每 tick 顶端短路（line 149-155）双重防御；单测 `worker_skips_force_rebuild_during_shutting`（line 575-591）mock Phase::Shutting + 断言 `client_pool.is_empty()` 真过
+- **banned 校验**（ADR-008 第 5.3 节）：✅ step 2 `is_known(id) && !is_banned(id)`（line 367-376）；单测 `worker_skips_force_rebuild_for_banned_peer`（line 596-612）真 ban + 断言 pool 空
+- **last_successful_sync_at 仅 broadcast 写**（ADR-008 卡 7 must-fix #1，最关键）：✅ `grep last_successful_sync_at heartbeat_worker.rs` 仅出现读路径（detect_hidden_dead 用作 hidden-dead 判定）；`update_heartbeat_success → record_heartbeat_ok` 仅写 `last_heartbeat_at`（peer/mod.rs:350-355）；唯一写点 `record_send_ok`（peer/mod.rs:373-378）由 `network/client.rs:144` broadcast 200 OK 调；单测 `heartbeat_success_does_not_update_last_successful_sync_at`（line 671-703）真断言前后 None 不变
+- **zeroize auto-zero**（ADR-008 MUST-2）：✅ `update_aes_key` 签名 `Zeroizing<[u8; 32]>`（peer/mod.rs:439-444），`state.aes_key = key` 触发旧 Zeroizing Drop（crate 契约保证字节归零）；类型层闭环（nit：单测仅断言新值写入，未直接验证旧字节归零，依赖 crate 契约）
+- **窗口期重检**（ADR-009 第 4.3 节副作用 #3）：✅ step 4 replace 后再次 `is_known + !is_banned` 校验（heartbeat_worker.rs:389-399）；窗口失败兜底调 `client_pool.remove_for_rebuild`（client_pool.rs:127-130）真新增；nit：无单测，仅靠静态评审
+- **隐形掉线语义**（spec 第 1.1 节）：✅ 30s sync_stale AND 15s hb_stale 双条件（line 309-331）；`unwrap_or(false)` for sync / `unwrap_or(true)` for hb 边界处理合理（从未同步不触发，从未心跳视为过期）；单测 8/9 真模拟时间戳验证两侧分支
+
+#### 8.1.2 不引入新违反验证
+
+- HeartbeatWorker::shutdown 500ms deadline：✅ `tokio::time::timeout(deadline, handle)` 三分支日志（line 95-118）模式与 PR-6a' clipboard 100ms 一致
+- 并发：✅ `for task in ping_tasks { let _ = task.await; }`（line 220-222）串行 await，N=8 一轮 ≤ 2s × 8 但 spawn 并发执行所以挂钟仅 ~2s；不与 v5-8 冲突（reqwest::Client 自带连接池，per-peer 隔离）
+- 子 task leak：⚠ `tokio::spawn` 子 task 在 worker shutdown 时不主动 abort；若 cancel 后 sleep 唤醒已绕过则不进入 spawn 分支（line 192-196 提前 check `cancel.is_cancelled()`），实际泄露风险 ≤ 单次 ping 2s timeout 自然结束 — 可接受
+- network/client.rs::ping：✅ 用 client_pool（已 `.no_proxy()`）；timeout / request error / non-2xx 三分支全覆盖（line 463-506）
+- snapshot 一致性：✅ `state.peers.snapshot()` 后立即释锁，per-peer state clone 含独立 aes_key 副本，worker 间不共享可变状态
+
+#### 8.1.3 新发现问题（5 条，全部低 nit / 非阻塞）
+
+1. **[低 nit]** `cargo test --lib` 首跑 `watcher_shutdown_under_100ms` 失败（108ms vs 100ms 软上限），重跑 5 次稳过。**非 PR-6b 范围**（PR-6a' clipboard），但 commit 声明 "108/108 全过" 与本机首跑 107/108 不符。建议主窗口下个补丁让 implementer 把该测试软上限放宽至 150ms 或 mark `#[ignore]`
+2. **[低 nit]** `update_aes_key_replaces_key`（heartbeat_worker.rs:707-727）仅断言新值写入，未直接验证旧字节归零；Zeroizing crate Drop 契约可信，但测试名暗示 MUST-2 落地未充分自证
+3. **[低 nit]** 窗口期重检逻辑（heartbeat_worker.rs:389-399）无单测覆盖；只能靠 review 验证。建议后续补 mock `replace` 后立刻 `ban` 的并发场景
+4. **[低 nit]** `force_rebuild` 重连路径 dial_handshake 用硬编码 `"SyncCopy"` 作 device_name 占位（line 411），依赖对端返回值覆盖；逻辑闭环但耦合性高
+5. **[极低]** commit message 里测试名 `worker_pings_all_approved_peers_every_5s` 与代码实际名 `worker_only_pings_approved_peers`（heartbeat_worker.rs:475）不符；命名 drift 不影响功能
+
+#### 8.1.4 结论
+
+PR-6b 是 backend MVP 真业务接入第二批的高质量补强，**6 条 ADR 必修条目全部代码层闭环**（含 ADR-008 卡 7 must-fix #1 这条 v0 隐形掉线 bug 的核心防御）。新代码 ~951 行，0 TODO / 0 clippy warning / 9 新单测全过。5 条 nit 全部"建议改进"级别，无任何 ADR 契约级违反。**建议主窗口直接推进 qa-tester 集成测试 + 跨平台 CI**（按新策略：5 个 nit 累积一轮再派 backend-impl 静默修，或直接搁置到 PR-7 集成时一并扫尾）。
+
