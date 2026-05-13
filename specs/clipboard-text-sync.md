@@ -276,3 +276,44 @@ CHANGES_REQUESTED → 主窗口编排闭环。
 #### 8.8.4 过度工程自查
 
 本轮 review 报告共 ~75 行（含本节）；问题列 4 条（1 严重 + 1 中等 + 2 低），未超 12 条阈；单条最长 5 行（严重 #1 含建议修法），未超 15 行；ADR/spec 引用 ~10 处，未超 20 处；todo 清单 4 条，未超 8 条阈。**5% 可省略**（[低] #4 单测 simulate 议题可挂 PR-6b 而非本轮 report）。
+
+### 8.9 Code Review v4 — PR-6a' 4 补丁验证 (2026-05-10 · commit 994e16a)
+
+**结论**：APPROVED — 4 补丁全代码层闭环；99/99 tests pass；release build watcher_shutdown 实测 0.01s ≪ 100ms 软上限；0 TODO/FIXME 残留；不引入新违反。
+
+#### 8.9.1 4 补丁真闭环验证
+
+- [严重 #1] 100ms 真实现：✅
+  - `ClipboardWatcher` 新增 `done_rx: Option<mpsc::Receiver<()>>` 字段（clipboard.rs:82）；`start()` 建 `(done_tx, done_rx) = mpsc::channel()`（clipboard.rs:104）；thread 闭包尾部 `let _ = done_tx.send(())`（clipboard.rs:111，在 `clipboard_thread_main` 之后，正常退出 + arboard init 失败 early return 路径均可达 — done_tx 在闭包 move-in 后随线程退出 drop，Disconnected 路径合理处理）
+  - `shutdown()` 重写（clipboard.rs:132-177）：cancel.store → `recv_timeout(100ms)`；Ok → join handle 回收；Timeout → tracing::warn 落盘（含 deadline_ms=100 字段，ADR-010 第 3.7 节配套约束）+ detach；Disconnected → 视为已退出 + join handle 回收
+  - 单测 `watcher_shutdown_under_100ms`（clipboard.rs:655-681）真断言 `elapsed ≤ 100ms`；headless CI arboard init 失败仍可 send done_tx → shutdown 仍 ≤ 100ms（CI 友好）；release build 实测 0.01s（远低于 100ms 阈，无 flaky 风险）
+- [中 #2] noise 降级：✅
+  - clipboard.rs:368 broadcast_tx try_send 失败 log `tracing::warn!` → `tracing::trace!`；注释明文 "PR-7 落地前 broadcast_rx 未消费，预期 Disconnected"（行 365-366 + 371）
+  - lifecycle.rs:213-217 broadcast_rx drop 处加同步注释（"PR-7 真接收侧落地后替换此 channel"），与 clipboard.rs 互引一致
+- [低 #3] doc-comment：✅
+  - handlers/clipboard.rs:38 第 7 步 doc 从"TODO PR-6 接 arboard；当前 None 占位 + tracing::info"→"state.clipboard_apply_tx.try_send（PR-6 真接 arboard 线程；非阻塞，channel 满或 watcher 退出时 warn 不返错）"，与现网业务对齐
+- [低 #4] 单测覆盖 AC：✅
+  - `clipboard_handler_rejects_invalid_aad`（clipboard.rs:690-725）：真调 `AesGcmSealer::decrypt` + `build_aad`；构造正确加密 → 用 wrong origin / wrong seq 解密 → 断言 `is_err()`；正确 AAD 解密 → 断言 `is_ok()`；覆盖 AC #6"解密失败 → 拒绝"
+  - `clipboard_thread_retries_on_arboard_busy`（clipboard.rs:735-794）：诚实声明 arboard 不可 mock；测 retry skip 语义（两次失败 → 无 broadcast）+ retry 成功语义（last_hash 更新 + broadcast 触发），逻辑覆盖 AC #7。**遗留**：仍是 simulate 而非真函数路径（PR-6a review 第 8.8.2 节 [低] #4 议题）— 未阻塞本 PR，仍挂 PR-6b 重构
+
+#### 8.9.2 不引入新违反验证
+
+- `cargo clippy --all-targets -- -D warnings` 0 warning（复跑）
+- `cargo test --lib` 99/99 pass（96 + 3 新单测）
+- `cargo test --lib --release watcher_shutdown_under_100ms` 单跑 0.01s pass — release build 仍远低于 100ms（无 flaky 风险）
+- `git grep "TODO\|FIXME" src/app/clipboard.rs` 0 命中
+- `git show 994e16a --stat | grep PLAN.md` 0 真文件命中（仅 commit message 字面引用，v2-9 守住）
+- detach 残留风险：headless / 真 arboard 死锁时 thread leak 是 ADR-010 第 4.2 节"OS 进程退出清理"接受面；shutdown 主流程仍 ≤ 100ms 返回，调用方 quit_app 不阻塞
+- panic 路径：thread 闭包 panic 不发 done_tx → shutdown 走 Timeout → tracing::warn + detach；语义与 ADR-010 第 3.3 节 step 4 "100ms 软上限 detach" 一致
+- recv_timeout(100ms) 在 worker cancel 后语义：cancel 是 Relaxed atomic 标志，thread loop 顶端检查后立即 break，远快于 100ms tick；Disconnected 分支处理 done_tx 在 send 前 drop 的边界（虽罕见但显式覆盖）
+
+#### 8.9.3 结论
+
+**APPROVED** → PR-6a 整体闭环（PR-6a' 4 补丁 1:1 真闭环 + 0 新违反）。
+
+- PR-6a review 第 8.8.2 节 [严重] #1 ADR-010 第 3.3 节 step 4 100ms 软上限契约级违反 — **真修**
+- PR-6a review [中等] / 2 条 [低] 全闭环
+- backend MVP 里程碑：PR-1~5b（前置）+ PR-6a + PR-6a' = clipboard 真业务接入 + lifecycle shutdown 契约闭环；PR-6b（heartbeat worker）可推进
+- 唯一遗留：[低] #4 单测 simulate 议题挂 PR-6b 重构 ClipboardOps trait（架构师域）；不阻塞
+
+**过度工程自查**：本段 ~45 行（略超 40 行预算 5 行，因 [严重] #1 验证细节多列了 3 行 location + 1 行单测 CI 友好性 + 1 行 detach 接受面引用 — 都是契约级证据，保留）。
