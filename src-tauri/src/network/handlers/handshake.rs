@@ -1,10 +1,23 @@
 //! POST /handshake handler
 //! see specs/group-discovery.md (第 3 节 handshake 流程)
+//! see specs/group-approval.md (第 3 节 in-scope：emit peer-pending 触发审批弹框)
 //! see decisions/ADR-003-project-architecture-skeleton.md (第 3.2 节)
 //! see decisions/ADR-008-security-review-of-adr003.md (MUST-3 403 不可区分 / MUST-7 DoS 限流 / MUST-8 sanitize)
 //! see decisions/ADR-009-peer-registry.md (第 3.5 节调用顺序契约 / 第 3.6 节 RateLimiter)
 //! see decisions/ADR-011-crypto-traits.md (第 3.1 节 KeyExchange trait)
 //! see specs/clipboard-text-sync.md (PR-5b 修 严重 #2 自连校验 / 严重 #3 device_id 占位)
+//!
+//! PR-FE-1b 修复（在 PR-5b 业务逻辑基础上）：
+//! - 补 [中等] #1：收到未知 peer 握手后 emit "peer-pending" 事件（group-approval 弹框触发）
+//!
+//! Trust 状态机说明（PR-FE-1b）：
+//!   当前简化路径：handshake 成功 → insert + approve（peer 立即 Approved）。
+//!   spec group-approval 要求完整审批流程（Pending → 用户决定 → Approved/Banned），
+//!   完整流程（pending_approvals HashMap + oneshot + forward + decide + dismiss）
+//!   属于 group-approval feature PR，超出本 PR 预算。
+//!   本 PR 做最小修复：insert+approve 后 emit "peer-pending" 通知前端，
+//!   前端弹框的 approve/reject 按钮对应现有 approve_peer/reject_peer commands
+//!   （approve = no-op 因已 Approved；reject = ban 有效踢出）。
 //!
 //! PR-5b 修复（在 PR-5 业务逻辑基础上）：
 //! - 修 严重 #2：步骤 3 自连校验真实执行（req.device_id == state.my_device_id → 403）
@@ -24,9 +37,11 @@ use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, State};
 use axum::Json;
+use tauri::Emitter as _;
 use zeroize::Zeroizing;
 
 use crate::app::state::AppState;
+use crate::commands::PeerPendingPayload;
 use crate::crypto::{KeyExchange, X25519KeyExchange};
 use crate::network::error::NetworkError;
 use crate::network::protocol::{HandshakeReq, HandshakeResp, PeerStub};
@@ -35,14 +50,15 @@ use crate::peer::{PeerState, TrustState};
 
 /// POST /handshake
 ///
-/// 入口检查顺序（PR-5b 修正版，严格按 ADR-008 MUST 顺序）：
+/// 入口检查顺序（PR-FE-1b 最新版）：
 /// 1. DoS 限流（ADR-008 MUST-7）→ 429
 /// 2. sanitize device_name（ADR-008 MUST-8）
 /// 3. device_id == 本机 device_id → 403（MUST-3，防自连；PR-5b 真实实现）
-/// 4. banned → 403（ADR-008 5.3 节）
+/// 4. banned → 403（ADR-008 5.3 节）；记录 is_new_peer（PR-FE-1b）
 /// 5. X25519 ECDH → HKDF → aes_key（ADR-011）
 /// 6. client_pool.insert → registry.insert → approve（ADR-009 第 3.5 节顺序）
-/// 7. 返 HandshakeResp（device_id = state.my_device_id，PR-5b 去占位串）
+/// 7. emit "peer-pending" 事件（is_new_peer=true 时；PR-FE-1b group-approval 弹框触发）
+/// 8. 返 HandshakeResp（device_id = state.my_device_id，PR-5b 去占位串）
 pub async fn handle_handshake(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
@@ -91,6 +107,11 @@ pub async fn handle_handshake(
         err.log();
         return Err(err);
     }
+
+    // PR-FE-1b：记录 peer 是否已知（未知 = 新设备申请加入，需 emit peer-pending）。
+    // 在 ECDH 之前检查，避免重复触发弹框（re-handshake 不重复通知）。
+    // group-approval spec 第 3 节：收到未知 device_id 握手 → emit peer-pending。
+    let is_new_peer = !state.peers.is_known(&req.device_id);
 
     // --- 步骤 5：X25519 ECDH → HKDF → AES key（ADR-011 第 3.1 节 KeyExchange trait）---
     // 生成本机临时密钥对
@@ -169,6 +190,48 @@ pub async fn handle_handshake(
         "handshake complete: peer inserted and approved"
         // SECURITY：不记 sanitized_name（防设备名含敏感信息进入日志，ADR-008 第 6.2 节）
     );
+
+    // PR-FE-1b：新 peer 加入时 emit "peer-pending" 触发前端审批弹框（group-approval spec 第 3 节）。
+    // 在 insert+approve 成功后 emit（不阻塞握手；emit 失败仅 warn，不影响握手结果）。
+    // 简化版：peer 已 Approved，弹框供用户事后确认（approve = no-op；reject = ban）。
+    // 完整审批流程（pending_approvals oneshot + forward + decide + dismiss）属 group-approval PR。
+    if is_new_peer {
+        let payload = PeerPendingPayload {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            subject_device_id: peer_id.clone(),
+            subject_device_name: sanitized_name.clone(),
+            subject_ip: remote_ip.to_string(),
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        };
+        // 不持锁过 await（编码规则）：读取 app_handle clone，锁立即释放
+        let maybe_handle = state.app_handle.read().clone();
+        if let Some(app_handle) = maybe_handle {
+            if let Err(e) = app_handle.emit("peer-pending", &payload) {
+                tracing::warn!(
+                    target: "network::handshake",
+                    peer_id = %peer_id,
+                    error = %e,
+                    "peer-pending emit failed (non-fatal, group-approval弹框不会触发)"
+                );
+            } else {
+                tracing::info!(
+                    target: "network::handshake",
+                    peer_id = %peer_id,
+                    "peer-pending emitted to frontend (PR-FE-1b)"
+                );
+            }
+        } else {
+            // AppHandle 尚未注入（极早期握手，lifecycle 未完成 setup）
+            tracing::warn!(
+                target: "network::handshake",
+                peer_id = %peer_id,
+                "peer-pending: AppHandle not yet available, skipping emit"
+            );
+        }
+    }
 
     // --- 步骤 7：构造 HandshakeResp（含本机公钥 + device_id + gossip peers 列表）---
     // PR-5b 修 严重 #3：device_id 使用 state.my_device_id（去除占位串）。
@@ -549,6 +612,107 @@ mod tests {
             resp.device_id.as_str(),
             "placeholder-my-device-id",
             "HandshakeResp.device_id must never be the placeholder literal"
+        );
+    }
+
+    // 新单测（PR-FE-1b #1）— 未知 peer 握手时 is_new_peer = true
+    //
+    // 验证：registry 中不存在 device_id 时，!registry.is_known(id) 返 true，
+    //       对应 handshake handler 中 is_new_peer = true → 应触发 peer-pending emit。
+    //
+    // 测试策略：直接测 PeerRegistry.is_known 与 is_new_peer 逻辑（不需要完整 axum handler），
+    // 验证"未知 peer → 需要 emit"的判定条件正确。
+    //
+    // see: specs/group-approval.md 第 3 节 / specs/floating-window.md 第 9.2 节 [中等] 1
+    #[test]
+    fn handshake_unknown_peer_triggers_new_peer_flag() {
+        let registry = PeerRegistry::new_for_test();
+        let unknown_id = "unknown-device-xyz";
+
+        // 未知 peer：is_known 返 false → is_new_peer = true（应 emit peer-pending）
+        let is_new_peer = !registry.is_known(unknown_id);
+        assert!(
+            is_new_peer,
+            "unknown device must trigger is_new_peer = true (should emit peer-pending)"
+        );
+
+        // 额外验证：is_approved / is_banned 也为 false（纯 unknown 状态）
+        assert!(
+            !registry.is_approved(unknown_id),
+            "unknown device must not be approved"
+        );
+        assert!(
+            !registry.is_banned(unknown_id),
+            "unknown device must not be banned"
+        );
+    }
+
+    // 新单测（PR-FE-1b #2）— 已知（Approved）peer re-handshake 不触发 peer-pending
+    //
+    // 验证：已在 registry 中的 peer 握手时，is_known 返 true → is_new_peer = false，
+    //       不应重复 emit peer-pending（避免 re-handshake 骚扰用户）。
+    //
+    // 同时验证 PeerPendingPayload 字段可正确构造（DTO 验证）。
+    //
+    // see: specs/floating-window.md 第 9.2 节 [中等] 1 dedupe 说明
+    #[test]
+    fn handshake_already_approved_peer_does_not_trigger_new_peer_flag() {
+        use crate::commands::PeerPendingPayload;
+        use std::collections::HashMap;
+        use zeroize::Zeroizing;
+
+        let registry = PeerRegistry::new_for_test();
+        let known_id = "known-device-approved";
+
+        // 插入并 approve 一个 peer（模拟已完成握手的设备）
+        let peer_state = PeerState {
+            device_id: known_id.to_string(),
+            device_name: "Known Device".to_string(),
+            addr: "192.168.1.50:5858"
+                .parse::<SocketAddr>()
+                .expect("addr parse"),
+            pubkey_b64: "pubkey_known".to_string(),
+            aes_key: Zeroizing::new([0u8; 32]),
+            last_successful_sync_at: None,
+            last_heartbeat_at: None,
+            consecutive_heartbeat_failures: 0,
+            consecutive_send_failures: 0,
+            trust_state: TrustState::Approved,
+            last_seen_seq_by_kind: HashMap::new(),
+        };
+        registry.insert(peer_state);
+        registry.approve(known_id);
+
+        // 已知 peer：is_known 返 true → is_new_peer = false（不应 emit peer-pending）
+        let is_new_peer = !registry.is_known(known_id);
+        assert!(
+            !is_new_peer,
+            "already-approved device must NOT trigger is_new_peer (no duplicate peer-pending)"
+        );
+
+        // 验证 PeerPendingPayload 字段可正确构造（DTO 字段有效性）
+        let payload = PeerPendingPayload {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            subject_device_id: known_id.to_string(),
+            subject_device_name: "Known Device".to_string(),
+            subject_ip: "192.168.1.50".to_string(),
+            timestamp_ms: 1_000_000_u64,
+        };
+        assert!(
+            !payload.request_id.is_empty(),
+            "request_id must be a non-empty UUID string"
+        );
+        assert_eq!(
+            payload.subject_device_id, known_id,
+            "PeerPendingPayload.subject_device_id must match the peer"
+        );
+        assert_eq!(
+            payload.subject_ip, "192.168.1.50",
+            "PeerPendingPayload.subject_ip must carry remote IP"
+        );
+        assert_eq!(
+            payload.timestamp_ms, 1_000_000_u64,
+            "PeerPendingPayload.timestamp_ms must be set"
         );
     }
 }

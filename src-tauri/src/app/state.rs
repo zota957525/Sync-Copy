@@ -5,6 +5,7 @@
 //! see specs/clipboard-text-sync.md (PR-6 arboard 接入 + mpsc 通道真接)
 //! see specs/settings-panel.md (PR-FE-0 Config 持久化)
 //! see specs/history-list.md (PR-FE-0 in-memory HistoryStore)
+//! see specs/group-approval.md (PR-FE-1b：peer-pending emit 需要 AppHandle)
 //!
 //! 构造顺序（ADR-009 第 5 节 #5 + ADR-010 第 3.2 节 step 3）：
 //!   my_device_id = uuid::Uuid::new_v4().to_string()
@@ -15,6 +16,15 @@
 //!   → mpsc::sync_channel::<String>(64)  [PR-6 新增：clipboard apply 通道]
 //!   → SharedConfig (Config::load)         [PR-FE-0 新增：config 持久化]
 //!   → Arc<HistoryStore>::new()            [PR-FE-0 新增：in-memory history]
+//!   → app_handle 由 lib.rs setup 注入     [PR-FE-1b 新增：axum handler emit 用]
+//!
+//! PR-FE-1b 新增：
+//!   - app_handle：Arc<parking_lot::RwLock<Option<tauri::AppHandle>>>
+//!     启动期 None；lib.rs setup 闭包注入真实 AppHandle。
+//!     axum handler（如 handshake）通过 state.app_handle.read().as_ref() 取用 emit 事件。
+//!     AppHandle 实现 Clone + Send + Sync（Tauri 2），直接存储安全。
+//!     PeerRegistry 不持 AppHandle（ADR-009 第 4.3 节 纯逻辑层约束）；
+//!     此字段在 AppState 层（而非 PeerRegistry 层）持有，符合架构分层。
 //!
 //! PR-6 新增：
 //!   - clipboard_apply_tx：std::sync::mpsc::SyncSender<String>（handler 解密后发 plaintext）
@@ -33,7 +43,7 @@ use std::sync::{
     Arc,
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::app::client_pool::ClientPool;
 use crate::app::config::{load_shared_config, SharedConfig};
@@ -52,6 +62,9 @@ use crate::peer::PeerRegistry;
 /// Tauri command 通过 `tauri::State<'_, AppState>` 访问。
 ///
 /// 字段命名遵循 ADR-010 第 3.1 节 + ADR-009 第 3.6 节。
+///
+/// PR-FE-1b 新增：
+/// - `app_handle`：`Arc<RwLock<Option<tauri::AppHandle>>>`（axum handler emit 事件用）
 ///
 /// PR-6 新增：
 /// - `clipboard_apply_tx`：`SyncSender<String>`（handler 解密后发 plaintext；std::sync::mpsc）
@@ -77,6 +90,21 @@ pub struct AppState {
     pub client_pool: Arc<ClientPool>,
     /// 应用生命周期管理器（ADR-010 第 3.1 节）
     pub lifecycle: Arc<Lifecycle>,
+
+    /// Tauri AppHandle（PR-FE-1b：axum handler emit 事件用）。
+    ///
+    /// 初始为 None；lib.rs setup 闭包注入真实 AppHandle（Tauri runtime 就绪后）。
+    /// axum handler 通过 `state.app_handle.read().as_ref().map(|h| h.emit(...))` 使用。
+    ///
+    /// 使用 Arc<RwLock<Option<...>>> 包装：
+    /// - new() 时 AppHandle 还未存在，先 None 占位
+    /// - setup 回调注入后始终 Some（服务期不 take）
+    /// - Clone 时共享同一 Arc（所有 AppState clone 看到同一 AppHandle）
+    ///
+    /// AppHandle 实现 Clone + Send + Sync（Tauri 2），直接存储安全。
+    /// 注：PeerRegistry 不持 AppHandle（ADR-009 第 4.3 节纯逻辑层约束），
+    ///     此字段在 AppState 层持有，不违反该约束。
+    pub app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
 
     /// 剪切板明文应用 Sender（PR-6 真接 arboard 线程）。
     ///
@@ -152,6 +180,8 @@ impl AppState {
             rate_limiter,
             client_pool,
             lifecycle,
+            // PR-FE-1b：AppHandle 初始 None；lib.rs setup 闭包注入
+            app_handle: Arc::new(RwLock::new(None)),
             clipboard_apply_tx: Arc::new(clipboard_apply_tx),
             clipboard_apply_rx: Arc::new(Mutex::new(Some(clipboard_apply_rx))),
             config,

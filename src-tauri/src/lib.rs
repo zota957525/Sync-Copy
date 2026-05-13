@@ -84,6 +84,13 @@ pub fn run() {
             // ADR-010 第 3.2 节：start() 7 步占位
             let app_handle = app.handle().clone();
             let state = app.state::<crate::app::state::AppState>().inner().clone();
+
+            // PR-FE-1b：注入 AppHandle 到 AppState，使 axum handler 可 emit Tauri 事件。
+            // 此时 Tauri runtime 已就绪（setup 回调内），AppHandle 有效。
+            // 注入后 axum handshake handler 可 emit "peer-pending" 事件（group-approval 弹框）。
+            *state.app_handle.write() = Some(app_handle.clone());
+            tracing::debug!(target: "app::state", "AppHandle injected into AppState (PR-FE-1b)");
+
             let lifecycle = state.lifecycle.clone();
 
             tauri::async_runtime::spawn(async move {
