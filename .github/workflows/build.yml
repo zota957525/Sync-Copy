@@ -7,7 +7,62 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Gate 1: Rust unit + integration tests + clippy
+  # 先跑 cargo test + clippy，保证"代码健康度门禁"（specs/cross-platform-build.md 第 5.4 节）
+  # 两个 OS 并行运行，任一失败即阻断后续 tauri build job（needs: gate）
+  # ---------------------------------------------------------------------------
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos-universal
+            extra_targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - os: windows-latest
+            name: windows-x64
+            extra_targets: ''
+
+    runs-on: ${{ matrix.os }}
+    name: Gate ${{ matrix.name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.extra_targets }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          key: gate-${{ matrix.name }}
+
+      # --- Cargo unit tests（--lib：src/ 内 #[cfg(test)] 单测）---
+      - name: Unit tests (--lib)
+        run: cargo --manifest-path src-tauri/Cargo.toml test --lib
+
+      # --- Cargo integration tests（tests/ 目录下的集成测试）---
+      - name: Integration tests (--tests)
+        run: cargo --manifest-path src-tauri/Cargo.toml test --tests
+
+      # --- Clippy 静态分析（-D warnings 把所有 warning 升为错误）---
+      - name: Clippy
+        run: cargo --manifest-path src-tauri/Cargo.toml clippy --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # Gate 2: Tauri bundle build + artifact upload
+  # 依赖 gate job 全绿后才运行。
+  # 当前阶段（P5-1 backend MVP）frontend 极简（src/ 含最小 SvelteKit scaffold）；
+  # tauri build 需要 npm 依赖 + WebView2（Win）+ Xcode（Mac）等环境。
+  # CI runner 的 macos-latest / windows-latest 已预装这些工具，可直接运行。
+  # ---------------------------------------------------------------------------
   build:
+    needs: gate
     strategy:
       fail-fast: false
       matrix:
@@ -43,7 +98,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
-          key: ${{ matrix.name }}
+          key: build-${{ matrix.name }}
 
       - name: Install frontend dependencies
         run: npm ci
@@ -93,7 +148,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          # tauri 2 的 release binary 在 target/release 下，名字来自 Cargo.toml 的 package.name
+          # tauri 2 release binary 路径来自 Cargo.toml package.name = "sync-copy"
           RAW_EXE="src-tauri/target/release/sync-copy.exe"
           if [ ! -f "$RAW_EXE" ]; then
             echo "::error::raw exe not found at $RAW_EXE"
