@@ -43,26 +43,22 @@ use crate::peer::sanitize::sanitize_device_name;
 /// 实现 N≥3 设备"一次 dial 全组连通"的 gossip mesh。
 ///
 /// 校验顺序（ADR-008 MUST-3 通用 403 body）：
-///   1. rate_limiter 限流（复用 handshake 限流器，防 announce DoS）
-///   2. origin_device_id 必须已在本机 PeerRegistry approved（否则 403）
-///      — 防止陌生 IP 注入 peer（要求"已知可信 peer"才能 announce 新 peer）
-///   3. req.device_id != my_device_id（自连拒绝，403）— group-discovery AC #7
-///   4. req.device_id 不在 banned set（403）
-///   5. req.device_id 已在 PeerRegistry → 200 + 不 dial（dedupe，group-discovery AC #2）
-///   6. 否则：spawn dial_handshake(stub.addr) — 反向连接新 peer
+///   1. origin_device_id 必须已在本机 PeerRegistry approved（否则 403）。
+///      防止陌生 IP 注入 peer；announce 不走 RateLimiter，origin 已 approved 门禁兜底，
+///      /handshake 端独立限流（handshake.rs 步骤 1）。
+///   2. req.device_id != my_device_id（自连拒绝，403）— group-discovery AC #7
+///   3. req.device_id 不在 banned set（403）
+///   4. req.device_id 已在 PeerRegistry → 200 + 不 dial（dedupe，group-discovery AC #2）
+///   5. 否则：spawn dial_handshake(stub.addr) — 反向连接新 peer
 ///
 /// 失败不重试（best-effort）；下次 handshake 时会再 propagate。
 pub async fn handle_peers_announce(
     State(state): State<Arc<AppState>>,
     Json(req): Json<GossipAnnouncePayload>,
 ) -> Result<StatusCode, NetworkError> {
-    // --- 步骤 1：DoS 限流（复用 handshake rate_limiter 防 announce 洪水）---
-    // SECURITY（ADR-008 MUST-7）：announce 无前置密钥协商，与 handshake 同等威胁面。
-    // 使用 origin_device_id 作为限流 key（已通过步骤 2 验证，但此处先检查，防洪水）
-    // 注意：announce 的 DoS 威胁较低（origin 必须 approved），限流仅防合法 peer 误用。
-    // 简化处理：此处不调 rate_limiter（origin 已 approved），仅防步骤 2 快路径拒绝。
-
-    // --- 步骤 2：鉴权 — origin_device_id 必须已 approved（ADR-008 MUST-3）---
+    // --- 步骤 1：鉴权 — origin_device_id 必须已 approved（ADR-008 MUST-3）---
+    // announce 不走 RateLimiter：origin 必须 approved 门禁已充当第一道防线，
+    // 陌生 IP 在此步即被 403 阻断；/handshake 端独立限流（handshake.rs 步骤 1）。
     // 防止陌生 IP 伪造 announce 注入 peer；只有已知可信 peer 才能 announce 新 peer。
     if !state.peers.is_approved(&req.origin_device_id) {
         tracing::warn!(
@@ -75,7 +71,7 @@ pub async fn handle_peers_announce(
         return Err(err);
     }
 
-    // --- 步骤 3：自连拒绝（group-discovery AC #7，ADR-008 MUST-3）---
+    // --- 步骤 2：自连拒绝（group-discovery AC #7，ADR-008 MUST-3）---
     if req.device_id == state.my_device_id {
         tracing::warn!(
             target: "network::peers",
@@ -87,7 +83,7 @@ pub async fn handle_peers_announce(
         return Err(err);
     }
 
-    // --- 步骤 4：banned set 拒绝（ADR-008 5.3 节防 zombie）---
+    // --- 步骤 3：banned set 拒绝（ADR-008 5.3 节防 zombie）---
     if state.peers.is_banned(&req.device_id) {
         tracing::warn!(
             target: "network::peers",
@@ -99,7 +95,7 @@ pub async fn handle_peers_announce(
         return Err(err);
     }
 
-    // --- 步骤 5：dedupe — 已知 peer 直接 200，不重复 dial（group-discovery AC #2）---
+    // --- 步骤 4：dedupe — 已知 peer 直接 200，不重复 dial（group-discovery AC #2）---
     if state.peers.is_known(&req.device_id) {
         tracing::debug!(
             target: "network::peers",
@@ -109,19 +105,19 @@ pub async fn handle_peers_announce(
         return Ok(StatusCode::OK);
     }
 
-    // --- 步骤 6：spawn dial_handshake 反向连接新 peer（best-effort fire-and-forget）---
-    // 使用 Arc clone 避免生命周期问题；spawn 在 tokio runtime 上运行。
-    let state_clone = Arc::clone(&state.peers);
+    // --- 步骤 5：spawn dial_handshake 反向连接新 peer（best-effort fire-and-forget）---
+    // state 已经是 Arc<AppState>（axum State 萃取），Arc::clone 是廉价引用计数增加。
     let target_addr = req.addr;
     let new_peer_id = req.device_id.clone();
     let my_device_id = state.my_device_id.clone();
     let my_device_name = {
         // 取本机 device_name（从 config 中读取；v2 当前使用空字符串占位）
-        // PR-7 简化：不依赖 config，直接用 my_device_id 作为 name 的降级
+        // PR-7 简化：不依赖 config，直接用固定串作为降级展示名
         "SyncCopy".to_string()
     };
     let my_listen_port = crate::network::DEFAULT_PORT;
-    let state_arc = Arc::new(state.clone());
+    // Arc::clone(&state) 而非 Arc::new(state.clone())，避免 Arc<Arc<AppState>> 双层包装。
+    let state_arc = Arc::clone(&state);
 
     tracing::info!(
         target: "network::peers",
@@ -133,8 +129,6 @@ pub async fn handle_peers_announce(
 
     // fire-and-forget：失败不重试（best-effort，ADR 设计要求）
     tokio::spawn(async move {
-        // 避免未使用 state_clone 的 clippy 警告；此处保留用于未来扩展（如 insert_pending）
-        let _ = state_clone;
         let result = crate::network::client::dial_handshake(
             target_addr,
             &state_arc,
@@ -446,12 +440,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// 辅助：构造一个 GossipAnnouncePayload（不含实际 addr，仅用于校验逻辑验证）
-    fn make_announce(device_id: &str, origin_device_id: &str, seq: u64) -> GossipAnnouncePayload {
+    fn make_announce(device_id: &str, origin_device_id: &str) -> GossipAnnouncePayload {
         GossipAnnouncePayload {
             device_id: device_id.to_string(),
             addr: "192.168.1.99:5858".parse::<SocketAddr>().expect("addr"),
             origin_device_id: origin_device_id.to_string(),
-            seq,
         }
     }
 
@@ -462,7 +455,7 @@ mod tests {
     #[test]
     fn announce_from_unapproved_origin_rejected() {
         let registry = PeerRegistry::new_for_test();
-        let req = make_announce("new-peer-id", "unknown-origin", 1);
+        let req = make_announce("new-peer-id", "unknown-origin");
 
         // 未认证 origin：is_approved 返 false → handler 步骤 2 拒绝
         assert!(
@@ -478,7 +471,7 @@ mod tests {
     #[test]
     fn announce_self_rejected() {
         let my_device_id = "my-own-device-id";
-        let req = make_announce(my_device_id, "approved-origin", 1);
+        let req = make_announce(my_device_id, "approved-origin");
 
         // 自连：device_id == my_device_id → handler 步骤 3 拒绝（403 DeviceIdConflict）
         assert_eq!(
@@ -503,7 +496,7 @@ mod tests {
         registry.insert(make_peer("approved-origin"));
         registry.approve("approved-origin");
 
-        let req = make_announce("known-peer", "approved-origin", 2);
+        let req = make_announce("known-peer", "approved-origin");
 
         // 步骤 2：origin approved → 通过
         assert!(
@@ -531,7 +524,7 @@ mod tests {
         // 被 announce 的 peer 在 banned set
         registry.ban("banned-peer");
 
-        let req = make_announce("banned-peer", "approved-origin", 3);
+        let req = make_announce("banned-peer", "approved-origin");
 
         // 步骤 4：is_banned 返 true → handler 拒绝
         assert!(
@@ -543,13 +536,13 @@ mod tests {
     /// announce_serde_roundtrip — GossipAnnouncePayload 序列化/反序列化正确性
     ///
     /// 验证 DTO 经 JSON 序列化后字段不变（v5-6 外部接口 try-coerce 验证）。
+    /// 同时验证向后兼容性：旧端发来带 seq 字段的 JSON 能被正常解析（serde 忽略未知字段）。
     #[test]
     fn announce_serde_roundtrip() {
         let payload = GossipAnnouncePayload {
             device_id: "device-xyz".to_string(),
             addr: "192.168.1.100:5858".parse::<SocketAddr>().expect("addr"),
             origin_device_id: "origin-abc".to_string(),
-            seq: 42,
         };
 
         let json = serde_json::to_string(&payload).expect("serialize should not fail");
@@ -559,6 +552,13 @@ mod tests {
         assert_eq!(decoded.device_id, payload.device_id);
         assert_eq!(decoded.addr, payload.addr);
         assert_eq!(decoded.origin_device_id, payload.origin_device_id);
-        assert_eq!(decoded.seq, payload.seq);
+
+        // 向后兼容：旧端发来带 seq 字段时，serde 忽略未知字段，不报错
+        let old_wire =
+            r#"{"device_id":"d1","addr":"192.168.1.1:5858","origin_device_id":"o1","seq":99}"#;
+        let decoded_old: GossipAnnouncePayload =
+            serde_json::from_str(old_wire).expect("old wire with seq must still deserialize");
+        assert_eq!(decoded_old.device_id, "d1");
+        assert_eq!(decoded_old.origin_device_id, "o1");
     }
 }

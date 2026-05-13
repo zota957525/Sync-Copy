@@ -480,8 +480,7 @@ pub async fn dial_handshake(
     // PR-7 gossip announce broadcast：
     // 向本机已知的 Approved peer（除了刚握手的目标 peer）广播新 peer 信息，
     // 触发它们也去 dial 新 peer，完成全组 mesh。
-    // seq=0：announce 路径不参与 monotonic seq dedupe（best-effort，不需要保序）
-    broadcast_announce(state, &peer_id, target_addr, my_device_id, 0).await;
+    broadcast_announce(state, &peer_id, target_addr, my_device_id).await;
 
     Ok(())
 }
@@ -716,7 +715,6 @@ pub async fn broadcast_announce(
     new_peer_id: &str,
     new_peer_addr: std::net::SocketAddr,
     my_device_id: &str,
-    seq: u64,
 ) {
     // snapshot 后立即释放锁（不持锁过 await）
     let peers: Vec<PeerState> = state
@@ -741,7 +739,6 @@ pub async fn broadcast_announce(
         device_id: new_peer_id.to_string(),
         addr: new_peer_addr,
         origin_device_id: my_device_id.to_string(),
-        seq,
     };
 
     let mut tasks = Vec::with_capacity(peers.len());
@@ -753,7 +750,6 @@ pub async fn broadcast_announce(
             device_id: payload.device_id.clone(),
             addr: payload.addr,
             origin_device_id: payload.origin_device_id.clone(),
-            seq: payload.seq,
         };
 
         tasks.push(tokio::spawn(async move {

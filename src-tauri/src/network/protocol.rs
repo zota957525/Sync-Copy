@@ -72,10 +72,14 @@ pub struct PeerStub {
 ///
 /// 与旧版 AnnounceReq 的区别：
 /// - 新增 origin_device_id（announce 发起人，必须已在接收端 approved）
-/// - 新增 seq（重放保护）
 /// - 保留 device_id / addr（被 announce 的新 peer）
 ///
-/// 鉴权规则（handlers/peers.rs handle_peers_gossip_announce）：
+/// 去除 seq 字段（PR-7a nit #3）：
+///   announce 的去重由 is_known(device_id) 门禁处理（peers.rs 步骤 4），
+///   已知 peer 直接 200 短路，无需 seq 单调递增去重；
+///   旧端若发送 seq 字段，serde 默认忽略未知字段，向后兼容。
+///
+/// 鉴权规则（handlers/peers.rs handle_peers_announce）：
 ///   origin_device_id 必须已在接收端 PeerRegistry approved，否则 403。
 ///   防止陌生 IP 通过伪造 announce 注入 peer。
 #[derive(Debug, Deserialize, Serialize)]
@@ -86,8 +90,6 @@ pub struct GossipAnnouncePayload {
     pub addr: std::net::SocketAddr,
     /// announce 发起人 device_id（必须已在接收端 approved）
     pub origin_device_id: String,
-    /// 重放保护 seq（同一 origin 的 seq 单调递增）
-    pub seq: u64,
 }
 
 // ---------------------------------------------------------------------------
