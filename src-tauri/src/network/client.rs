@@ -92,10 +92,15 @@ pub async fn broadcast_clipboard(
             }
         };
 
+        // [低 nit #1 PR-5b review] 原 `_ => "text"` 会让 Trust/Ban/Leave 等 kind 静默降级，
+        // 与 build_aad 的 kind 字面不匹配（对端 decrypt 失败，且日志归因困难）。
+        // broadcast_clipboard 只允许 Text / ImagePng；其它 kind 属编程错误。
         let kind_str = match kind {
             AadKind::Text => "text",
             AadKind::ImagePng => "image_png",
-            _ => "text",
+            _ => unreachable!(
+                "broadcast_clipboard only supports Text / ImagePng; got unexpected AadKind"
+            ),
         };
 
         let req_body = ClipboardReq {
@@ -346,6 +351,25 @@ pub async fn dial_handshake(
         .await
         .map_err(|e| anyhow::anyhow!("dial_handshake: parse resp failed: {e}"))?;
 
+    let peer_id = handshake_resp.device_id.clone();
+
+    // 校验：不允许与自己握手（在 ECDH 之前短路，避免无谓计算）
+    if peer_id == my_device_id {
+        return Err(anyhow::anyhow!(
+            "dial_handshake: peer returned our own device_id, reject"
+        ));
+    }
+
+    // 校验：banned peer 拒绝 re-handshake（ADR-008 5.3 节 / ADR-009 第 3.5 节）
+    // [低 nit #2 PR-5b review] 前移到 derive_aes_key 之前，避免对 banned peer 浪费 ECDH 计算
+    // 以及派生密钥短暂存在栈上（已 Zeroizing 包装，但更早短路更好）
+    if state.peers.is_banned(&peer_id) {
+        return Err(anyhow::anyhow!(
+            "dial_handshake: peer {} is banned, skip",
+            peer_id
+        ));
+    }
+
     // 解析对端公钥
     let their_pubkey = X25519KeyExchange::pubkey_from_b64(&handshake_resp.pubkey_b64)
         .map_err(|e| anyhow::anyhow!("dial_handshake: parse peer pubkey failed: {e}"))?;
@@ -354,23 +378,6 @@ pub async fn dial_handshake(
     let raw_key = X25519KeyExchange::derive_aes_key(my_secret, &their_pubkey)
         .map_err(|e| anyhow::anyhow!("dial_handshake: derive_aes_key failed: {e}"))?;
     let aes_key = Zeroizing::new(raw_key);
-
-    let peer_id = handshake_resp.device_id.clone();
-
-    // 校验：不允许与自己握手
-    if peer_id == my_device_id {
-        return Err(anyhow::anyhow!(
-            "dial_handshake: peer returned our own device_id, reject"
-        ));
-    }
-
-    // 校验：banned peer 拒绝 re-handshake（ADR-008 5.3 节 / ADR-009 第 3.5 节）
-    if state.peers.is_banned(&peer_id) {
-        return Err(anyhow::anyhow!(
-            "dial_handshake: peer {} is banned, skip",
-            peer_id
-        ));
-    }
 
     let safe_name = sanitize_device_name(&handshake_resp.device_name.unwrap_or_default());
 

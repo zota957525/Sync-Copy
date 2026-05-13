@@ -9,5 +9,6 @@
 //! - state.rs：AppState 聚合 Arc<PeerRegistry> + Arc<RateLimiter> + Arc<ClientPool> + Arc<Lifecycle>
 
 pub mod client_pool;
+pub mod clipboard;
 pub mod lifecycle;
 pub mod state;

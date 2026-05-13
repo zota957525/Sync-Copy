@@ -5,13 +5,15 @@
 //! see decisions/ADR-011-crypto-traits.md (第 3.3 节 build_aad 调用契约)
 //! see decisions/ADR-009-peer-registry.md (第 3.2 节 invariant 5 seen_seq_and_update 第一行)
 //!
-//! PR-5 业务逻辑：
+//! PR-5 业务逻辑（延续）：
 //! - is_known + !is_banned 双重鉴权（MUST-3 / ADR-008 5.3 节）
 //! - seen_seq_and_update → 重放 200 静默丢（必须在 handler 第一行，ADR-009 invariant 5）
 //! - build_aad(kind, origin, seq) → AesGcmSealer::decrypt（ADR-011 第 3.3 节调用契约表）
-//! - 解密成功 → 通过 AppState.clipboard_apply_tx Option<Sender> 发到待应用 channel
-//!   (TODO PR-6：真接 arboard 线程；本 PR 占位 None + tracing::info)
 //! - 解密失败 → 422（NetworkError::DecryptFailed → "unprocessable"）
+//!
+//! PR-6 新增：
+//! - 解密成功 → 通过 AppState.clipboard_apply_tx SyncSender<String> try_send 发到 arboard 线程
+//! - try_send 非阻塞：channel 满时 warn + 仍返 200 OK（不影响协议层）
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -111,33 +113,55 @@ pub async fn handle_clipboard(
             NetworkError::DecryptFailed
         })?;
 
-    // --- 步骤 7：派发到待应用 channel（TODO PR-6 真接 arboard 线程）---
-    // ADR-005（future）clipboard_apply_tx：Option<mpsc::Sender<ApplyClipboardEvt>>
-    // 本 PR 仅 tracing::info 占位；PR-6 起 arboard 线程时填入真实 tx
-    //
+    // --- 步骤 7：派发到 arboard 线程（PR-6 真接）---
     // SECURITY（ADR-011 第 3.5 节）：
     //   plaintext 是剪切板明文，敏感性等同于 OS 剪切板内容；不进 tracing fields。
-    //   在本作用域结束时 drop（Rust ownership，ADR-011 第 3.5 节"caller 路径短即 drop"）
+    //   仅记 plaintext_len。
     let plaintext_len = plaintext.len();
 
-    // TODO PR-6：
-    //   if let Some(tx) = &state.clipboard_apply_tx {
-    //       let _ = tx.send(ApplyClipboardEvt { kind, data: plaintext }).await;
-    //   }
-    //
-    // 当前 AppState 有 clipboard_apply_tx: Option<mpsc::Sender<ApplyClipboardEvt>> 字段（None 占位）
-    // PR-6 起 arboard 线程后填入真实 Sender；此处仅 log 通知已就绪
-    tracing::info!(
-        target: "network::clipboard",
-        origin = %sanitize_log_field(&req.origin_device_id),
-        seq = req.seq,
-        kind = %req.kind,
-        plaintext_len,
-        "clipboard decrypted ok (TODO PR-6: send to arboard apply channel)"
-    );
-
-    // 明文在此作用域结束时 drop（Rust ownership 自动清理）
-    drop(plaintext);
+    // 将解密后的 plaintext 转为 String 发给 arboard 线程（std::sync::mpsc SyncSender）。
+    // try_send 非阻塞（channel buffer=64；若满则 log warn，不影响 handler 响应）。
+    // SECURITY：plaintext 不进 tracing fields / 不落盘。
+    match String::from_utf8(plaintext) {
+        Ok(text) => {
+            match state.clipboard_apply_tx.try_send(text) {
+                Ok(()) => {
+                    tracing::info!(
+                        target: "network::clipboard",
+                        origin = %sanitize_log_field(&req.origin_device_id),
+                        seq = req.seq,
+                        kind = %req.kind,
+                        plaintext_len,
+                        "clipboard decrypted ok, sent to arboard watcher"
+                    );
+                }
+                Err(e) => {
+                    // channel 满或 watcher 已退出（不影响协议层，仍返 200 OK）
+                    tracing::warn!(
+                        target: "network::clipboard",
+                        origin = %sanitize_log_field(&req.origin_device_id),
+                        seq = req.seq,
+                        kind = %req.kind,
+                        plaintext_len,
+                        error = %e,
+                        "clipboard apply_tx try_send failed (channel full or watcher gone)"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            // 解密后非 UTF-8（对 text kind 属于异常情况）
+            tracing::warn!(
+                target: "network::clipboard",
+                origin = %sanitize_log_field(&req.origin_device_id),
+                seq = req.seq,
+                kind = %req.kind,
+                plaintext_len,
+                error = %e,
+                "clipboard text kind plaintext is not valid UTF-8, skip apply"
+            );
+        }
+    }
 
     Ok(StatusCode::OK)
 }

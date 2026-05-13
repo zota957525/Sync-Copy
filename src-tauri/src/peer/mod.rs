@@ -421,6 +421,11 @@ impl PeerRegistry {
     }
 }
 
+/// PeerRegistry::default — 仅测试用（构造孤立 ClientPool，与生产 AppState.client_pool 不共享）。
+///
+/// [低 nit #3 PR-5b review] 若在生产路径调用，违反 invariant 3（client_pool 不共享）。
+/// PR-6：加 #[cfg(test)] 限定，防止未来在生产路径意外调用。
+#[cfg(test)]
 impl Default for PeerRegistry {
     fn default() -> Self {
         Self::new(Arc::new(ClientPool::new()))

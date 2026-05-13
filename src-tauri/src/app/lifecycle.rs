@@ -14,16 +14,19 @@
 //! PR-4 新增：
 //! - step 5 真正 axum bind（tokio::net::TcpListener + axum::serve + graceful shutdown）
 //!
-//! 不在本 PR 实现（留 PR-5+）：
-//! - 剪切板线程 arboard（step 4 占位）
+//! PR-6 新增：
+//! - step 4 真正 ClipboardWatcher::start（arboard std::thread + mpsc 通道接入）
+//! - step 4 shutdown：ClipboardWatcher::shutdown（100ms 软上限 join）
+//!
+//! 不在本 PR 实现（留 PR-7+）：
 //! - 心跳 / 健康自检业务逻辑（step 6 空 worker 占位）
-//! - leave 广播实际逻辑（step 3 占位）
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use crate::app::clipboard::ClipboardWatcher;
 use crate::app::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -79,14 +82,14 @@ pub enum StartupError {
 /// 持有所有 long-running task 的取消句柄（ADR-010 第 3.6 节 runtime owner 表）：
 /// - health_cancel：CancellationToken（心跳 worker / 健康自检）
 /// - server_shutdown_tx：oneshot::Sender（axum graceful shutdown）
-/// - clipboard 相关：PR-5 落地；当前 None
+/// - clipboard_watcher：ClipboardWatcher（std::thread arboard 轮询；PR-6 新增）
 ///
 /// 字段顺序注意事项（ADR-010 第 3.1 节 + 实施提示 #5）：
 /// log_guard **必须**是最后字段 — Drop 顺序（Rust 按声明逆序）保证
 /// tracing-appender 在所有其他字段 drop 之后才 flush（避免关闭日志丢失）。
 pub struct Lifecycle {
     /// Phase 状态机（parking_lot::RwLock — 短持锁读写）
-    phase: parking_lot::RwLock<Phase>,
+    pub(crate) phase: parking_lot::RwLock<Phase>,
 
     /// axum HTTP server 优雅关闭信号（PR-4 填充；当前 None）
     server_shutdown_tx: parking_lot::RwLock<Option<oneshot::Sender<()>>>,
@@ -101,6 +104,12 @@ pub struct Lifecycle {
     /// HTTP server task handle（PR-4 填充；当前 None）
     /// 使用 tauri::async_runtime::JoinHandle（与 spawn 返回类型一致）
     server_task: parking_lot::RwLock<Option<tauri::async_runtime::JoinHandle<()>>>,
+
+    /// arboard 剪切板轮询线程（ADR-010 第 3.6 节 — std::thread 独立 OS 线程）。
+    ///
+    /// PR-6 新增：lifecycle start step 4 构造；shutdown step 4 调 shutdown()。
+    /// 使用 parking_lot::Mutex（shutdown 时 take 确保只 shutdown 一次）。
+    clipboard_watcher: parking_lot::Mutex<Option<ClipboardWatcher>>,
 
     // --- tracing-appender NonBlocking guard ---
     // 必须是最后字段（Drop 顺序保证 log flush 在所有其他 task drop 后进行）
@@ -122,6 +131,7 @@ impl Lifecycle {
             health_cancel: CancellationToken::new(),
             health_task: parking_lot::RwLock::new(None),
             server_task: parking_lot::RwLock::new(None),
+            clipboard_watcher: parking_lot::Mutex::new(None),
             // log_guard 最后字段（Drop 顺序硬约束）
             log_guard: parking_lot::RwLock::new(None),
         })
@@ -179,11 +189,59 @@ impl Lifecycle {
             "state structs instantiated in AppState::new()"
         );
 
-        // --- Step 4：clipboard::spawn — std::thread + mpsc<ClipboardCmd> ---
-        // ADR-010 第 3.2 节 step 4：
+        // --- Step 4：ClipboardWatcher::start — std::thread + arboard + mpsc 通道 ---
+        // ADR-010 第 3.2 节 step 4（PR-6 真接实现）：
         //   std::thread::spawn 失败 → 返 ClipboardSpawn → unwind step 1（drop log_guard）
-        //   PR-5 范畴；当前占位 None。
-        tracing::debug!(target: "lifecycle", step = 4, "clipboard thread spawn (PR-5 placeholder)");
+        //   取 apply_rx（只能取一次）：从 state.clipboard_apply_rx 的 Mutex 中 take()。
+        //   若 apply_rx 已被 take（重复调用 start），仅 warn + 跳过 watcher 构造。
+        {
+            use crate::app::clipboard::{ClipboardEvent, ClipboardWatcher};
+            use std::sync::mpsc;
+
+            // take Receiver（只能被 take 一次；lifecycle 不会二次 start）
+            let apply_rx = state.clipboard_apply_rx.lock().take();
+
+            match apply_rx {
+                None => {
+                    // Receiver 已被 take（不应发生；lifecycle 不二次 start）
+                    tracing::warn!(
+                        target: "lifecycle",
+                        step = 4,
+                        "clipboard apply_rx already taken (lifecycle double-start?), skipping watcher"
+                    );
+                }
+                Some(rx) => {
+                    // broadcast_tx：watcher 检测到变化时通知异步层
+                    // 此处构造一对 SyncSender/Receiver，广播层在 PR-7 接入 broadcast_text
+                    // PR-6 范围：watcher 线程能发 ClipboardEvent；接收侧 PR-7 处理
+                    let (broadcast_tx, _broadcast_rx) = mpsc::sync_channel::<ClipboardEvent>(64);
+
+                    match ClipboardWatcher::start(broadcast_tx, rx) {
+                        Ok(watcher) => {
+                            *self.clipboard_watcher.lock() = Some(watcher);
+                            tracing::info!(
+                                target: "lifecycle",
+                                step = 4,
+                                "clipboard watcher thread started"
+                            );
+                        }
+                        Err(e) => {
+                            // ADR-010 第 3.2 节 step 4 失败 → unwind step 1（drop log_guard）
+                            tracing::error!(
+                                target: "lifecycle",
+                                step = 4,
+                                error = %e,
+                                "clipboard thread spawn failed, unwinding"
+                            );
+                            // unwind step 1：drop log_guard
+                            let _ = self.log_guard.write().take();
+                            *self.phase.write() = Phase::Dead;
+                            return Err(StartupError::ClipboardSpawn(e));
+                        }
+                    }
+                }
+            }
+        }
 
         // --- Step 5：network::server::start — 真正 axum bind + graceful shutdown ---
         // ADR-010 第 3.2 节 step 5：
@@ -268,11 +326,11 @@ impl Lifecycle {
         tracing::info!(target: "lifecycle", step = 1, phase = ?Phase::Shutting, "shutdown: phase set to Shutting");
         // emit app-shutting-down 留 PR-4（AppHandle 在 state 中；PR-3 无事件定义）
 
-        // --- Step 2：cancel health worker + 发 clipboard Shutdown 信号 ---
+        // --- Step 2：cancel health worker + 设置 clipboard cancel 标志 ---
         // ADR-010 第 3.3 节 step 2（仅发信号，不等）
+        // clipboard watcher cancel 在 step 4 调 shutdown()（先发信号，后 join）
         self.health_cancel.cancel();
         tracing::debug!(target: "lifecycle", step = 2, "shutdown: health_cancel.cancel() sent");
-        // clipboard mpsc::send Shutdown 留 PR-5
 
         // --- Step 3：leave 广播（best-effort，1500ms timeout）---
         // ADR-010 第 3.3 节 step 3
@@ -350,8 +408,21 @@ impl Lifecycle {
                     }
                 }
             }
-            // clipboard thread join 留 PR-5（100ms 软上限）
-            tracing::debug!(target: "lifecycle", step = 4, "clipboard thread join (PR-5 placeholder)");
+            // clipboard watcher shutdown（100ms 软上限，ADR-010 第 3.3 节 step 4）
+            // PR-6：ClipboardWatcher::shutdown 设 cancel=true + join（内部 100ms 超时 detach）
+            let watcher = self.clipboard_watcher.lock().take();
+            if let Some(w) = watcher {
+                let step4_clipboard_start = Instant::now();
+                w.shutdown();
+                tracing::debug!(
+                    target: "lifecycle",
+                    step = 4,
+                    actual_ms = step4_clipboard_start.elapsed().as_millis(),
+                    "clipboard_watcher shutdown complete"
+                );
+            } else {
+                tracing::debug!(target: "lifecycle", step = 4, "clipboard_watcher was None (not started)");
+            }
         }
 
         // --- Step 5：server graceful shutdown ---

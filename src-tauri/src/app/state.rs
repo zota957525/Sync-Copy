@@ -2,7 +2,7 @@
 //! see decisions/ADR-010-lifecycle.md (第 3.2 节 step 3 顺序)
 //! see decisions/ADR-009-peer-registry.md (第 3.5 节 / 第 5 节 #5 构造顺序)
 //! see decisions/ADR-003-project-architecture-skeleton.md (第 3.5 节 AppState struct)
-//! see specs/clipboard-text-sync.md (PR-5b 修 ADR-008 MUST-4 / 自连校验 / device_id 占位)
+//! see specs/clipboard-text-sync.md (PR-6 arboard 接入 + mpsc 通道真接)
 //!
 //! 构造顺序（ADR-009 第 5 节 #5 + ADR-010 第 3.2 节 step 3）：
 //!   my_device_id = uuid::Uuid::new_v4().to_string()
@@ -10,14 +10,22 @@
 //!   → Arc<PeerRegistry>::new(client_pool)  [PR-5b 落地：传入 client_pool]
 //!   → Arc<RateLimiter>::new()
 //!   → Arc<Lifecycle>::new()
+//!   → mpsc::sync_channel::<String>(64)  [PR-6 新增：clipboard apply 通道]
 //!
-//! PR-5b 新增：
-//!   - my_device_id 字段（启动期生成 UUID v4；handshake.rs 自连校验 + HandshakeResp 真值用）
-//!   - PeerRegistry::new(client_pool) 传入 client_pool（修 ADR-008 MUST-4 契约违反）
+//! PR-6 新增：
+//!   - clipboard_apply_tx：std::sync::mpsc::SyncSender<String>（handler 解密后发 plaintext）
+//!   - clipboard_apply_rx：Option<std::sync::mpsc::Receiver<String>>（lifecycle step 4 取走给 watcher）
 //!
-//! PR-5 保留：clipboard_apply_tx 占位（PR-6 真接 arboard 线程时填入真实 Sender）。
+//! PR-5b 保留：
+//!   - my_device_id 字段（启动期生成 UUID v4）
+//!   - PeerRegistry::new(client_pool) 传入 client_pool
 
-use std::sync::Arc;
+use std::sync::{
+    mpsc::{self, Receiver, SyncSender},
+    Arc,
+};
+
+use parking_lot::Mutex;
 
 use crate::app::client_pool::ClientPool;
 use crate::app::lifecycle::Lifecycle;
@@ -25,36 +33,19 @@ use crate::peer::rate_limit::RateLimiter;
 use crate::peer::PeerRegistry;
 
 // ---------------------------------------------------------------------------
-// ApplyClipboardEvt（PR-5 占位；PR-6 arboard 线程接入时使用）
-// ---------------------------------------------------------------------------
-
-/// 剪切板内容应用事件（从解密 handler 发到 arboard 线程）。
-///
-/// PR-5 占位：`clipboard_apply_tx` 当前为 None；
-/// PR-6 起 arboard 线程时填入真实 mpsc::Sender<ApplyClipboardEvt>，
-/// clipboard handler 将把解密后的明文通过此 channel 发到 arboard 线程写 OS 剪切板。
-///
-/// SECURITY（ADR-011 第 3.5 节）：
-/// 此结构体携带剪切板明文，敏感性等同于 OS 剪切板内容；
-/// 禁止 tracing 输出 / 落盘 / 跨进程传递。
-#[allow(dead_code)] // PR-6 前不使用；保留字段定义供类型检查
-pub struct ApplyClipboardEvt {
-    /// 内容类型（"text" | "image_png"）
-    pub kind: String,
-    /// 明文字节（解密后）
-    pub data: Vec<u8>,
-}
-
-// ---------------------------------------------------------------------------
 // AppState struct（ADR-010 第 3.2 节 step 3）
 // ---------------------------------------------------------------------------
 
 /// 应用全局状态。作为 Tauri managed state 注入（`.manage(app_state)`）。
 ///
-/// 所有字段为 Arc — 可跨线程共享（Send + Sync）。
+/// 所有字段为 Arc / 原始 Clone — 可跨线程共享（Send + Sync）。
 /// Tauri command 通过 `tauri::State<'_, AppState>` 访问。
 ///
 /// 字段命名遵循 ADR-010 第 3.1 节 + ADR-009 第 3.6 节。
+///
+/// PR-6 新增：
+/// - `clipboard_apply_tx`：`SyncSender<String>`（handler 解密后发 plaintext；std::sync::mpsc）
+/// - `clipboard_apply_rx`：`Mutex<Option<Receiver<String>>>`（lifecycle step 4 take 给 watcher）
 #[derive(Clone)]
 pub struct AppState {
     /// 本机 device_id（启动期 UUID v4 生成，整个生命周期不变）。
@@ -66,8 +57,7 @@ pub struct AppState {
     ///
     /// SECURITY（ADR-008 第 4.1 节）：
     /// device_id 是 UUID 形式（非敏感），可进 tracing fields。
-    /// 但禁止在 403 响应 body 中返回（让攻击者枚举本机 device_id —
-    /// ADR-008 第 4.1 节 409 → 403 不可区分决议）。
+    /// 但禁止在 403 响应 body 中返回（让攻击者枚举本机 device_id）。
     pub my_device_id: String,
     /// 统一 peer 状态库（ADR-009 第 3.2 节）
     pub peers: Arc<PeerRegistry>,
@@ -77,15 +67,25 @@ pub struct AppState {
     pub client_pool: Arc<ClientPool>,
     /// 应用生命周期管理器（ADR-010 第 3.1 节）
     pub lifecycle: Arc<Lifecycle>,
-    /// 剪切板内容应用 channel（PR-5 占位，PR-6 真接 arboard 线程时填入）。
+
+    /// 剪切板明文应用 Sender（PR-6 真接 arboard 线程）。
     ///
-    /// clipboard handler 解密成功后通过此 Sender 把明文发到 arboard 专属线程写 OS 剪切板。
-    /// 当前为 None：PR-6 启动 arboard 线程后赋值真实 Sender；handler 侧已有
-    /// `if let Some(tx) = &state.clipboard_apply_tx` 守卫（不会 panic）。
+    /// clipboard handler 解密成功后通过此 SyncSender 把 plaintext 发到 arboard 专属线程。
+    /// 使用 std::sync::mpsc::SyncSender（与 arboard std::thread 自然搭配；
+    /// handler 侧在 async 上下文用 try_send 非阻塞发送，不依赖 tokio）。
     ///
     /// SECURITY（ADR-011 第 3.5 节）：
-    /// 此 Sender 传递剪切板明文；Receiver 端（arboard 线程）禁止落盘 / tracing 明文。
-    pub clipboard_apply_tx: Option<Arc<tokio::sync::mpsc::Sender<ApplyClipboardEvt>>>,
+    /// 此 Sender 传递剪切板明文；禁止落盘 / tracing 明文字段。
+    pub clipboard_apply_tx: Arc<SyncSender<String>>,
+
+    /// 剪切板明文应用 Receiver（lifecycle step 4 take 给 ClipboardWatcher）。
+    ///
+    /// 使用 Mutex<Option<...>> 包装：
+    /// - Lifecycle::start step 4 调 `.take()` 取走 Receiver 给 ClipboardWatcher，之后为 None。
+    /// - AppState::Clone 时 Receiver 在 Arc<Mutex<Option<...>>> 内共享（不重复 take）。
+    ///
+    /// 注意：Receiver 只能被 take 一次；第二次 take 返 None（lifecycle 不会二次 start）。
+    pub clipboard_apply_rx: Arc<Mutex<Option<Receiver<String>>>>,
 }
 
 impl AppState {
@@ -99,6 +99,7 @@ impl AppState {
         //   2. PeerRegistry::new(client_pool)（传入 client_pool — ADR-008 MUST-4 契约）
         //   3. RateLimiter（无依赖）
         //   4. Lifecycle（持有 health_cancel / task handles）
+        //   5. mpsc::sync_channel::<String>(64)（PR-6 新增：clipboard apply 通道）
         let my_device_id = uuid::Uuid::new_v4().to_string();
         let client_pool = Arc::new(ClientPool::new());
         // ADR-009 第 3.2 节：PeerRegistry::new 接受 Arc<ClientPool>
@@ -107,10 +108,15 @@ impl AppState {
         let rate_limiter = Arc::new(RateLimiter::new());
         let lifecycle = Lifecycle::new();
 
+        // PR-6：clipboard apply 通道（std::sync::mpsc，与 arboard std::thread 自然搭配）
+        // buffer_size=64：handler 解密后 try_send 非阻塞；arboard 线程 try_recv 消费。
+        // SECURITY（ADR-011 第 3.5 节）：此 channel 传递剪切板明文，不 tracing 字段。
+        let (clipboard_apply_tx, clipboard_apply_rx) = mpsc::sync_channel::<String>(64);
+
         tracing::debug!(
             target: "app::state",
             my_device_id = %my_device_id,
-            "AppState::new() constructed (my_device_id + client_pool + peers + rate_limiter + lifecycle)"
+            "AppState::new() constructed (my_device_id + client_pool + peers + rate_limiter + lifecycle + clipboard_apply_channel)"
         );
 
         Self {
@@ -119,8 +125,8 @@ impl AppState {
             rate_limiter,
             client_pool,
             lifecycle,
-            // PR-5 占位：clipboard_apply_tx = None（PR-6 arboard 线程启动后填入）
-            clipboard_apply_tx: None,
+            clipboard_apply_tx: Arc::new(clipboard_apply_tx),
+            clipboard_apply_rx: Arc::new(Mutex::new(Some(clipboard_apply_rx))),
         }
     }
 }

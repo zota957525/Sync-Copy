@@ -85,88 +85,16 @@ pub async fn handle_leave(
 }
 
 // ---------------------------------------------------------------------------
-// 单元测试（leave 原子 remove）
+// 单元测试（leave handler 鉴权逻辑）
 // ---------------------------------------------------------------------------
+//
+// [低 nit #4 PR-5b review] leave_atomic_remove_inner_and_pool 已在 PR-5b 删除：
+// 该测试使用孤立 pool（与 registry.client_pool 不共享），无法验证 invariant 3；
+// 等效覆盖已由 peer::tests::remove_clears_client_pool_atomic 提供（peer/mod.rs）。
 
 #[cfg(test)]
 mod tests {
-    use crate::app::client_pool::ClientPool;
-    use crate::peer::{PeerRegistry, PeerState, TrustState};
-    use std::collections::HashMap;
-    use std::net::SocketAddr;
-    use std::sync::Arc;
-    use zeroize::Zeroizing;
-
-    fn make_peer(id: &str) -> PeerState {
-        PeerState {
-            device_id: id.to_string(),
-            device_name: format!("device-{id}"),
-            addr: "127.0.0.1:9999".parse::<SocketAddr>().expect("addr parse"),
-            pubkey_b64: "test_pubkey".to_string(),
-            aes_key: Zeroizing::new([0u8; 32]),
-            last_successful_sync_at: None,
-            last_heartbeat_at: None,
-            consecutive_heartbeat_failures: 0,
-            consecutive_send_failures: 0,
-            trust_state: TrustState::Approved,
-            last_seen_seq_by_kind: HashMap::new(),
-        }
-    }
-
-    /// leave_atomic_remove_inner_and_pool：
-    /// remove 后 inner + approved + banned 三集合都不含 id（MUST-4 原子顺序）
-    #[test]
-    fn leave_atomic_remove_inner_and_pool() {
-        let pool = Arc::new(ClientPool::new());
-        let registry = PeerRegistry::new_for_test();
-        let peer_id = "leave-test-peer";
-
-        // 先 insert + approve
-        registry.insert(make_peer(peer_id));
-        registry.approve(peer_id);
-
-        // 也在 client_pool 放一个 entry（模拟握手后状态）
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("test client build");
-        pool.insert(peer_id, client);
-
-        // 前置验证
-        assert!(
-            registry.is_known(peer_id),
-            "peer must be in inner before leave"
-        );
-        assert!(
-            registry.is_approved(peer_id),
-            "peer must be approved before leave"
-        );
-        assert!(
-            pool.get(peer_id).is_some(),
-            "client must be in pool before leave"
-        );
-
-        // PeerRegistry::remove（内部调顺序：inner → approved → banned）
-        let removed = registry.remove(peer_id);
-        assert!(removed.is_some(), "remove must return Some");
-
-        // MUST-4 原子性验证
-        assert!(
-            !registry.is_known(peer_id),
-            "inner must not contain peer after remove"
-        );
-        assert!(
-            !registry.is_approved(peer_id),
-            "approved must not contain peer after remove"
-        );
-        assert!(
-            !registry.is_banned(peer_id),
-            "banned must not contain peer after remove"
-        );
-        // 注意：client_pool.remove 需要 PeerRegistry 持有 Arc<ClientPool> 才能在 remove 内部调
-        // 当前 PeerRegistry 不持有 client_pool（PR-5 scope：不改 PeerRegistry 构造函数）
-        // client_pool 的 remove 由 handler 在 registry.remove 返回后单独调用（见 leave handler 上方注释）
-    }
+    use crate::peer::PeerRegistry;
 
     /// leave_rejects_unknown：未知 peer 的 leave → is_known false → 403 路径
     #[test]
