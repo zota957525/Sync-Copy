@@ -211,9 +211,10 @@ impl Lifecycle {
                     );
                 }
                 Some(rx) => {
-                    // broadcast_tx：watcher 检测到变化时通知异步层
-                    // 此处构造一对 SyncSender/Receiver，广播层在 PR-7 接入 broadcast_text
-                    // PR-6 范围：watcher 线程能发 ClipboardEvent；接收侧 PR-7 处理
+                    // broadcast_tx：watcher 检测到变化时通知异步层。
+                    // PR-7 落地前 broadcast_rx 未消费，try_send 预期返回 Disconnected；
+                    // clipboard.rs poll_text_clipboard 内 try_send 失败降级为 trace 级别
+                    // 避免噪音（PR-7 真接收侧落地后替换此 channel，届时删除此注释）。
                     let (broadcast_tx, _broadcast_rx) = mpsc::sync_channel::<ClipboardEvent>(64);
 
                     match ClipboardWatcher::start(broadcast_tx, rx) {

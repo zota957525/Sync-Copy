@@ -225,3 +225,54 @@ priority: P0
 #### 8.7.4 结论
 
 APPROVED → 推 `REVIEW_PASSED`。3 严重违反全代码层 + 单测层闭环；4 新单测真验证关键不变式；cargo 三件套全 green。新发现仅 2 条 [低]（Default 脚枪 + leave 测试遗留）+ 2 条原 [低/nit] 未修（PR-5b 范围外）— 均挂 PR-6 顺手清理，不阻塞 backend MVP 里程碑。
+
+### 8.8 Code Review v3 — PR-6a 真业务接入 (2026-05-10 · commit fd0573c)
+
+**结论**：CHANGES_REQUESTED — 1 [严重] ADR 契约级违反（shutdown 100ms 软上限未真实现）+ 1 [中等] 日志噪音 + 2 [低]；功能层环路防止逻辑正确；4 nit 全闭环 + cargo 三件套 green + 96/96 tests pass。
+
+#### 8.8.1 五聚焦点意见
+
+- **环路防止**：✅ 代码逻辑正确。`apply_text_to_clipboard` (clipboard.rs:244-264) 先 `set_text` 后立即更新 `last_hash`，写入失败分支不更新 hash（顺序原子，v0 教训落地）；`poll_text_clipboard` (clipboard.rs:320-325) 比较 hash 跳过未变化。AC #3/#4 闭环。
+- **lifecycle 集成**：❌ 不合格。**`ClipboardWatcher::shutdown`（clipboard.rs:110-143）未真正实现 100ms 软上限**：helper.join() 无 timeout，违反 ADR-010 第 3.3 节 step 4 "clipboard 100ms 软上限" 契约（见 8.8.2 严重 #1）。step 4 启动失败 unwind 路径 ✓；apply_rx `Mutex<Option<Receiver>>` take 单点 ✓（lifecycle.rs:202）。
+- **mpsc 通道选型**：✅ 选 `std::sync::mpsc::sync_channel(64)` 合理（arboard 在 std::thread，自然搭配）；handler 内用 `try_send` 非阻塞（clipboard.rs:127 handler）；buffer 64 对快速复制场景已够（每秒最多 1 次本地 poll + 远端入 64 buffer，溢出概率极低）。
+- **4 nit 真闭环**：✅ 全闭环。#1 (client.rs:101 unreachable!) — AadKind 有 9 变体，broadcast_clipboard 只用 Text/ImagePng，其它编程错误；#2 (client.rs:363-371 banned 前移到 derive_aes_key 之前) ✓；#3 (peer/mod.rs:425 `#[cfg(test)] impl Default`) — 生产路径 grep 0 调用 ✓；#4 (leave.rs 删除 leave_atomic_remove_inner_and_pool) — 等效覆盖在 peer/mod.rs:839 remove_clears_client_pool_atomic ✓。
+- **不引入新违反**：✅ cargo clippy --all-targets -D warnings 0 warning；cargo test --lib 96/96 pass；commit 不含 PLAN.md / target / DS_Store；生产路径无 TODO / unimplemented / unsafe；placeholder 残留全在 #[cfg(test)] 或文档注释内（grep 验证）。
+
+#### 8.8.2 新发现问题
+
+##### [严重] shutdown 100ms 软上限未真实现，违反 ADR-010 第 3.3 节 step 4 契约
+- 文件：`src-tauri/src/app/clipboard.rs:113-120`
+- 现象：注释声称"100ms 软上限：用 park_timeout 不可靠，改用 spin-wait join. 实现：用另一线程 join，主线程等 100ms"，但实际 helper.join() **无任何 timeout**：`.spawn(move || handle.join()).ok().and_then(|h| h.join().ok())`——主线程对 helper 的 join 同样是无限等。若 clipboard 线程因 arboard 死锁（v0 教训：Windows 偶发占用）不退出，shutdown 无限阻塞 → 违反 ADR-010 第 3.3 节"clipboard 100ms 软上限 detach"+ 总硬上限 ≤ 2800ms。
+- 风险：用户点退出 → 进程 hang；ADR-010 lessons-learned 第 4 段 4 退出路径全部失守。
+- 建议修法：用 `std::sync::mpsc::channel()` + helper 线程内 `let _ = handle.join(); let _ = done_tx.send(());`，主线程 `done_rx.recv_timeout(Duration::from_millis(100))`，超时即 detach helper（不再 join 它）。tracing 区分 "joined" / "timeout detached" 两种路径。
+
+##### [中等] lifecycle.rs:217 broadcast_rx 立即 drop → 每次本地剪切板变化触发一行 warn 日志
+- 文件：`src-tauri/src/app/lifecycle.rs:217`
+- 现象：step 4 内 `let (broadcast_tx, _broadcast_rx) = mpsc::sync_channel::<ClipboardEvent>(64);` — `_broadcast_rx` 在 scope 结束立即 drop。watcher 线程内 `broadcast_tx.try_send` (clipboard.rs:331) 每次本地剪切板变化都返 `Disconnected` 错误并触发 `tracing::warn!`（clipboard.rs:332-336）。commit message 说"接收侧 PR-7 处理"是有意为之，但日志层面会让看 prod log 的人误判为 bug。
+- 风险：信号噪音 — 真出问题时反而被淹没；用户 P0 自测时看到 warn 会疑惑。
+- 建议修法：方案 A — 在 PR-6a 阶段把 broadcast_tx.try_send 失败的 warn 降级为 trace + 注释 "PR-7 接收侧落地前预期 Disconnected"；方案 B — PR-6a 仍保 broadcast_rx，spawn 一个吸收线程 `loop { let _ = rx.recv(); }` 让 try_send 不再 Disconnected（更干净）；方案 C — PR-6a 不构造 broadcast channel，watcher 临时接 `Option<SyncSender>` None（最少改动）。建议方案 A（最小补丁）。
+
+##### [低] handler 文档注释 stale
+- 文件：`src-tauri/src/network/handlers/clipboard.rs:38`
+- 现象：函数 doc-comment 第 7 步仍写 `"发到 clipboard_apply_tx（TODO PR-6 接 arboard；当前 None 占位 + tracing::info）"`，但 clipboard_apply_tx 已不是 Option，且 PR-6a 已真接。Sync Copy SDLC 强调"文档同步代码（v4-1）"，遗漏属低危但需补。
+- 建议修法：把第 7 步更新为 `"发到 state.clipboard_apply_tx.try_send（PR-6 真接 arboard 线程；非阻塞，channel 满或 watcher 退出时 warn 不返错）"`。
+
+##### [低] clipboard 单测全为"逻辑 simulate"未覆盖真函数路径
+- 文件：`src-tauri/src/app/clipboard.rs:415-628`
+- 现象：watcher_skips_empty / watcher_skips_oversize / watcher_skips_unchanged / watcher_broadcasts_on_change / apply_writes_local_no_loop 5 个核心单测都**不调** `poll_text_clipboard` / `apply_text_to_clipboard`，而是把分支逻辑在测试体内重写一遍（"simulate: if text.is_empty() { return; }"）。后果：若 implementer 在真函数中写错（如忘记更新 last_hash），单测仍 pass — 单测沦为"复读代码注释"。
+- 建议修法：apply_text_to_clipboard 拆出纯 hash 计算 + 状态更新的内部 helper（不依赖 `&mut arboard::Clipboard`），让单测真调该 helper；或加 trait `ClipboardOps { fn set_text / fn get_text }` 让单测注入 mock。当前实现单测**编译通过即认为绿**，覆盖度名义高、信号低。
+- 不阻塞 PR-6a，但建议挂 PR-6b 重构。
+
+#### 8.8.3 结论
+
+CHANGES_REQUESTED → 主窗口编排闭环。
+
+- [严重] shutdown 100ms 软上限 必须修（ADR-010 契约级违反，新策略仍走"派 backend-impl 静默落 → 静默通过"，**不需要回报用户**）
+- [中等] broadcast_rx drop warn 噪音 顺手降级（同补丁）
+- 2 条 [低] 可挂 PR-6b（文档注释 stale + 单测真覆盖）
+
+环路防止 5 个 AC 真闭环（spec 第 4 节 AC #3/#4/#5/#6/#7 + v0 lessons learned 第 4.2 节都对齐）；4 nit 全清；不引入新违反；cargo 三件套 green — 整体方向正确，仅 lifecycle.shutdown timeout 实现有 bug。
+
+#### 8.8.4 过度工程自查
+
+本轮 review 报告共 ~75 行（含本节）；问题列 4 条（1 严重 + 1 中等 + 2 低），未超 12 条阈；单条最长 5 行（严重 #1 含建议修法），未超 15 行；ADR/spec 引用 ~10 处，未超 20 处；todo 清单 4 条，未超 8 条阈。**5% 可省略**（[低] #4 单测 simulate 议题可挂 PR-6b 而非本轮 report）。

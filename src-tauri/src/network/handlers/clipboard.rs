@@ -35,7 +35,8 @@ use crate::peer::sanitize::sanitize_log_field;
 /// 4. 取 peer aes_key（clone，不持锁过 await）
 /// 5. build_aad(kind, origin_device_id, seq)（ADR-011 第 3.3 节）
 /// 6. AesGcmSealer::decrypt(key, nonce_b64, ct_b64, aad) → 失败 422
-/// 7. 发到 clipboard_apply_tx（TODO PR-6 接 arboard；当前 None 占位 + tracing::info）
+/// 7. 发到 state.clipboard_apply_tx.try_send（PR-6 真接 arboard 线程；
+///    非阻塞，channel 满或 watcher 退出时 warn 不返错）
 /// 8. 返 200 OK
 pub async fn handle_clipboard(
     State(state): State<Arc<AppState>>,
