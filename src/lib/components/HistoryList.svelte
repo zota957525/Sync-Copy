@@ -12,7 +12,7 @@
    *
    * 颜色：history-list.md 第 6.5 节字典 + floating-window.md 第 6.5 节
    */
-  import { historyStore, delHistoryItem, recopyItem } from "$lib/stores/history.svelte";
+  import { historyStore, delHistoryItem, recopyItem, refreshHistory } from "$lib/stores/history.svelte";
   import type { HistoryItem } from "$lib/types";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import {
@@ -22,6 +22,7 @@
     COLOR_TEXT_SUCCESS,
     FONT_SIZE_DEFAULT,
     FONT_SIZE_SECONDARY,
+    FONT_SIZE_HINT,
   } from "$lib/style/tokens";
 
   // ---------------------------------------------------------------------------
@@ -119,6 +120,24 @@
 </script>
 
 <div class="list-container">
+  <!-- store 级错误 banner（delete/clearAll 失败时显示）-->
+  {#if historyStore.error}
+    <div class="error-banner" role="alert">
+      <span class="error-msg" style:color={COLOR_TEXT_DANGER} style:font-size={FONT_SIZE_HINT}>
+        {historyStore.error}
+      </span>
+      <button
+        class="retry-btn"
+        style:color={COLOR_TEXT_DANGER}
+        style:font-size={FONT_SIZE_HINT}
+        onclick={() => refreshHistory()}
+        aria-label="重试"
+      >
+        重试
+      </button>
+    </div>
+  {/if}
+
   {#if historyStore.items.length === 0}
     <div class="empty">
       <span class="empty-main" style:color={COLOR_TEXT_SECONDARY} style:font-size={FONT_SIZE_DEFAULT}>
@@ -213,6 +232,42 @@
     overflow-y: auto;
     display: flex;
     flex-direction: column;
+  }
+
+  /* store 级错误 banner */
+  .error-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 10px;
+    background: rgba(239, 68, 68, 0.10);
+    border-bottom: 1px solid rgba(239, 68, 68, 0.18);
+    flex-shrink: 0;
+    gap: 6px;
+  }
+
+  .error-msg {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .retry-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0 4px;
+    font-family: inherit;
+    flex-shrink: 0;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    opacity: 0.85;
+  }
+
+  .retry-btn:hover {
+    opacity: 1;
   }
 
   /* 空态 */

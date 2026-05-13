@@ -3,27 +3,22 @@
    * FloatingWindow — 主浮窗容器
    *
    * 布局（spec floating-window.md 第 6.3 节 wireframe）：
-   *   顶部状态栏 36px（drag-region + StatusDot + 状态文字 + 按钮组：加入 / − / ⚙）
+   *   顶部状态栏 36px（FloatingHeader 组件，含 drag-region + StatusDot + 按钮组）
    *   中间内容区（历史列表 HistoryList / settings）
    *   底部 footer 24px（IP:PORT + 设备名）
    *   brand line 16px
    *
-   * PR-FE-2 新增：
-   *   - ⚙ 按钮切换到 settings view（SettingsPanel 组件）
-   *   - main view 中渲染 ApprovalDialog 覆盖层
-   *
-   * PR-FE-3 新增：
-   *   - 历史列表区域改为渲染 HistoryList 组件
-   *   - 顶部 − 按钮触发 collapseToBall()（window setSize 48×48）
-   *   - ball view 渲染 FloatingBall；单击 FloatingBall 展开回 window
+   * PR-FE-2 新增：⚙ 按钮切换到 settings view + ApprovalDialog 覆盖层
+   * PR-FE-3 新增：历史列表区域渲染 HistoryList；顶部 − 按钮折叠为 FloatingBall
+   * PR-FE-3a 重构：collapseToBall/expandFromBall 提取到 useBallCollapse hook；
+   *             顶部状态栏提取到 FloatingHeader 组件
    *
    * 视觉（第 6.5 节字典）：
    *   背景 rgba(28,28,32,0.88) + backdrop-filter:blur(20px) + 圆角 10px + 1px 微高亮边
    *
    * 拖拽：data-tauri-drag-region（capabilities/default.json 已含 core:window:allow-start-dragging）
    */
-  import { getCurrentWindow, LogicalSize, currentMonitor, PhysicalPosition } from "@tauri-apps/api/window";
-  import StatusDot from "./StatusDot.svelte";
+  import FloatingHeader from "./FloatingHeader.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import ApprovalDialog from "./ApprovalDialog.svelte";
   import HistoryList from "./HistoryList.svelte";
@@ -31,20 +26,17 @@
   import {
     COLOR_WINDOW_BG,
     COLOR_WINDOW_BORDER,
-    COLOR_TEXT_PRIMARY,
     COLOR_TEXT_SECONDARY,
     COLOR_TEXT_BRAND,
     COLOR_TEXT_SUCCESS,
-    COLOR_BTN_PRIMARY_BG,
-    COLOR_DIVIDER,
     FONT_FAMILY,
-    FONT_SIZE_DEFAULT,
     FONT_SIZE_SECONDARY,
     FONT_SIZE_BRAND,
   } from "$lib/style/tokens";
   import { statusStore } from "$lib/stores/status.svelte";
   import { approvalStore } from "$lib/stores/approval.svelte";
   import { historyStore } from "$lib/stores/history.svelte";
+  import { createBallCollapse } from "$lib/hooks/useBallCollapse.svelte";
 
   // ---------------------------------------------------------------------------
   // View 状态：main | settings | ball
@@ -62,58 +54,19 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 折叠为球 / 展开（floating-ball.md 第 3 节）
+  // 折叠为球 / 展开（floating-ball.md 第 3 节，逻辑委托 useBallCollapse hook）
   // ---------------------------------------------------------------------------
 
-  const DEFAULT_EXPANDED = { w: 320, h: 420 };
-  // 记住展开尺寸（不需要 rune，跨函数共享即可）
-  let lastExpandedSize = { ...DEFAULT_EXPANDED };
+  const { collapseToBall: _collapse, expandFromBall: _expand } = createBallCollapse();
 
   async function collapseToBall(): Promise<void> {
-    try {
-      const win = getCurrentWindow();
-      const physical = await win.outerSize();
-      const scale    = await win.scaleFactor();
-      lastExpandedSize = {
-        w: Math.round(physical.width  / scale),
-        h: Math.round(physical.height / scale),
-      };
-      currentView = "ball";
-      await win.setSize(new LogicalSize(48, 48));
-    } catch (e) {
-      // non-fatal：记录但不阻断
-      console.warn("collapseToBall failed:", e);
-    }
+    await _collapse();
+    currentView = "ball";
   }
 
   async function expandFromBall(): Promise<void> {
-    try {
-      const { w, h } = lastExpandedSize.w > 40 ? lastExpandedSize : DEFAULT_EXPANDED;
-      currentView = "main";
-      const win = getCurrentWindow();
-      await win.setSize(new LogicalSize(w, h));
-      // 视口校正：确保窗口在监视器内完全可见
-      const monitor = await currentMonitor();
-      if (monitor) {
-        const pos   = await win.outerPosition();
-        const scale = await win.scaleFactor();
-        const monX = monitor.position.x;
-        const monY = monitor.position.y;
-        const monW = monitor.size.width;
-        const monH = monitor.size.height;
-        const winW = w * scale;
-        const winH = h * scale;
-        const maxX = monX + monW - winW;
-        const maxY = monY + monH - winH;
-        const newX = Math.max(monX, Math.min(pos.x, maxX));
-        const newY = Math.max(monY, Math.min(pos.y, maxY));
-        if (newX !== pos.x || newY !== pos.y) {
-          await win.setPosition(new PhysicalPosition(newX, newY));
-        }
-      }
-    } catch (e) {
-      console.warn("expandFromBall failed:", e);
-    }
+    currentView = "main";
+    await _expand();
   }
 
   // ---------------------------------------------------------------------------
@@ -185,48 +138,16 @@
   {:else}
     <!-- ---- Main View ---- -->
 
-    <!-- 顶部状态栏：36px，整行 drag-region，按钮独立 pointer-events -->
-    <div class="statusbar" data-tauri-drag-region>
-      <div class="statusbar-left" data-tauri-drag-region>
-        <StatusDot state={dotState} size={8} />
-        <span class="status-text" style:color={COLOR_TEXT_SECONDARY} style:font-size={FONT_SIZE_SECONDARY}>
-          {statusText}
-        </span>
-      </div>
-      <div class="statusbar-right">
-        <!-- [加入] 胶囊按钮（PR-FE-3 接入 JoinDialog）-->
-        <button
-          class="btn-join"
-          style:background={COLOR_BTN_PRIMARY_BG}
-          style:color={COLOR_TEXT_PRIMARY}
-          style:font-size={FONT_SIZE_SECONDARY}
-          aria-label="加入小组"
-        >
-          加入
-        </button>
-        <!-- − 折叠为球按钮（floating-ball spec 第 3 节）-->
-        <button
-          class="btn-icon"
-          style:color={COLOR_TEXT_SECONDARY}
-          onclick={collapseToBall}
-          aria-label="折叠为球"
-        >
-          −
-        </button>
-        <!-- ⚙ 设置按钮 -->
-        <button
-          class="btn-icon"
-          style:color={COLOR_TEXT_SECONDARY}
-          onclick={openSettings}
-          aria-label="设置"
-        >
-          ⚙
-        </button>
-      </div>
-    </div>
+    <!-- 顶部状态栏（FloatingHeader 组件） -->
+    <FloatingHeader
+      {dotState}
+      {statusText}
+      oncollapse={collapseToBall}
+      onsettings={openSettings}
+    />
 
     <!-- 分割线 -->
-    <div class="divider" style:background={COLOR_DIVIDER}></div>
+    <div class="divider" style:background="rgba(255,255,255,0.07)"></div>
 
     <!-- 历史列表区域（相对定位，ApprovalDialog 绝对叠加） -->
     <div class="history-area">
@@ -239,7 +160,7 @@
     </div>
 
     <!-- 分割线 -->
-    <div class="divider" style:background={COLOR_DIVIDER}></div>
+    <div class="divider" style:background="rgba(255,255,255,0.07)"></div>
 
     <!-- 底部 footer：24px，IP:PORT + 设备名 -->
     <div class="footer">
@@ -279,80 +200,6 @@
     user-select: none;
     /* 子组件 ApprovalDialog 需要 position:relative 作为定位上下文 */
     position: relative;
-  }
-
-  /* ---- 顶部状态栏 ---- */
-  .statusbar {
-    height: 36px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0 10px;
-    flex-shrink: 0;
-    cursor: grab;
-  }
-
-  .statusbar:active {
-    cursor: grabbing;
-  }
-
-  .statusbar-left {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex: 1;
-    min-width: 0;
-  }
-
-  .status-text {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .statusbar-right {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-    pointer-events: auto;
-  }
-
-  /* [加入] 胶囊按钮 */
-  .btn-join {
-    padding: 2px 8px;
-    border-radius: 10px;
-    border: none;
-    cursor: pointer;
-    font-weight: 500;
-    transition: filter 80ms ease;
-  }
-
-  .btn-join:hover {
-    filter: brightness(1.1);
-  }
-
-  .btn-join:active {
-    transform: scale(0.95);
-  }
-
-  /* − / ⚙ 图标按钮 */
-  .btn-icon {
-    width: 22px;
-    height: 22px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 50%;
-    border: none;
-    background: transparent;
-    cursor: pointer;
-    font-size: 13px;
-    transition: background 80ms ease;
-  }
-
-  .btn-icon:hover {
-    background: rgba(255, 255, 255, 0.12);
   }
 
   /* ---- 分割线 ---- */
