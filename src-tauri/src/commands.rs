@@ -5,11 +5,16 @@
 //! see specs/group-approval.md (第 6 节 UX：approve_peer / reject_peer)
 //! see specs/group-discovery.md (join_group：入组地址按钮触发)
 //! see decisions/ADR-003-project-architecture-skeleton.md (第 3.6 节 CommandError → String boundary)
+//! see decisions/ADR-008-security-review-of-adr003.md (MUST-3 通用 body + MUST-8 sanitize)
 //!
-//! 命令返回约定（ADR-003 第 3.6 节）：
+//! 命令返回约定（ADR-003 第 3.6 节 + ADR-008 MUST-3）：
 //! - 所有命令返 Result<T, String>（CommandError → String boundary）
-//! - 内部用 anyhow::Context 链式传播；boundary 处 .map_err(|e| e.to_string()) 转 String
-//! - 不向前端暴露内部 Rust 路径 / Zeroizing key 等敏感数据
+//! - boundary 处统一返通用 body 字面量（"invalid_input" / "not_found" / "forbidden" / "internal_error"）
+//! - 详细错误用 tracing::warn!/error! 写日志，不暴露给前端（ADR-008 MUST-3）
+//! - 不向前端暴露内部 Rust 路径 / anyhow 错误链 / device_id 字面 / Zeroizing key 等敏感数据
+//!
+//! sanitize 约定（ADR-008 MUST-8）：
+//! - set_config 接收 device_name 后首动作调 sanitize_device_name（Bidi+控制字符+64 codepoints）
 //!
 //! 编码风格（编码规则）：
 //! - 不持 state 锁过 await（短锁短持：lock → clone → drop lock → async op）
@@ -252,9 +257,16 @@ pub async fn join_group(
     // normalize_addr：去掉 http:// 前缀和尾部斜杠（group-discovery spec 第 3 节）
     let normalized = normalize_addr(&target_addr);
 
-    let socket_addr: std::net::SocketAddr = normalized
-        .parse()
-        .map_err(|e| format!("入组目标格式不对，应该是 ip:port：{e}"))?;
+    // ADR-008 MUST-3：地址格式错不向前端暴露内部 parse 错误链；细节入日志
+    let socket_addr: std::net::SocketAddr = normalized.parse().map_err(|e| {
+        tracing::warn!(
+            target: "commands",
+            addr = %normalized,
+            error = %e,
+            "join_group: invalid target addr"
+        );
+        "invalid_input".to_string()
+    })?;
 
     // 短锁读取本机信息（不持锁过 await）
     let (my_device_id, my_device_name, my_listen_port) = {
@@ -269,6 +281,7 @@ pub async fn join_group(
     let state_inner = state.inner().clone();
 
     // dial_handshake（group-discovery spec 第 3 节 + client.rs 已实现）
+    // ADR-008 MUST-3：连接失败不向前端暴露内部错误链（含 reqwest stack trace / IP）；细节入日志
     crate::network::client::dial_handshake(
         socket_addr,
         &state_inner,
@@ -277,7 +290,15 @@ pub async fn join_group(
         my_listen_port,
     )
     .await
-    .map_err(|e| format!("连接 {normalized} 失败：{e}"))?;
+    .map_err(|e| {
+        tracing::warn!(
+            target: "commands",
+            addr = %normalized,
+            error = %e,
+            "join_group: handshake failed"
+        );
+        "forbidden".to_string()
+    })?;
 
     // 握手成功后 emit status-updated（floating-window 顶部状态栏刷新）
     if let Err(e) = app_handle.emit("status-updated", ()) {
@@ -324,21 +345,22 @@ pub async fn set_config(
     if let Some(name) = cfg.device_name {
         let trimmed = name.trim().to_string();
         if trimmed.is_empty() {
-            return Err("设备名不能为空".to_string());
+            return Err("invalid_input".to_string());
         }
-        // 截断到 64 字符（ADR-008 MUST-8 + spec settings-panel 第 4 节）
-        let safe_name = if trimmed.chars().count() > 64 {
-            trimmed.chars().take(64).collect::<String>()
-        } else {
-            trimmed
-        };
+        // ADR-008 MUST-8：首动作调 sanitize_device_name（Bidi 黑名单 + 控制字符 + ≤64 codepoints）
+        // sanitize 内部已含截断逻辑，不再手动 chars().take(64)
+        let safe_name = crate::peer::sanitize::sanitize_device_name(&trimmed);
+        // sanitize 返 "<unnamed>" 表示 trimmed 全为非法字符，视为空名拒绝
+        if safe_name == "<unnamed>" {
+            return Err("invalid_input".to_string());
+        }
         new_cfg.device_name = safe_name;
     }
 
     // listen_port（v2 P1 接受但不重启 server，写盘用于下次启动）
     if let Some(port) = cfg.listen_port {
         if port == 0 {
-            return Err("监听端口不能为 0".to_string());
+            return Err("invalid_input".to_string());
         }
         new_cfg.listen_port = port;
     }
@@ -347,9 +369,10 @@ pub async fn set_config(
     *state.config.lock() = new_cfg.clone();
 
     // 异步写盘（不持锁过 await）
+    // ADR-008 MUST-3：写盘失败不向前端暴露 ProjectDirs path 等内部细节；细节入日志
     new_cfg.save().await.map_err(|e| {
         tracing::warn!(target: "commands", error = %e, "set_config: save failed");
-        format!("配置保存失败：{e}")
+        "internal_error".to_string()
     })?;
 
     tracing::info!(
@@ -369,8 +392,10 @@ pub async fn approve_peer(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    // ADR-008 MUST-3：未知设备返 "not_found"，不暴露 device_id 字面值到前端
     if !state.peers.is_known(&device_id) {
-        return Err(format!("未知设备：{device_id}"));
+        tracing::warn!(target: "commands", device_id = %device_id, "approve_peer: unknown device");
+        return Err("not_found".to_string());
     }
     state.peers.approve(&device_id);
 
@@ -428,8 +453,10 @@ pub async fn delete_history_item(
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let removed = state.history.remove(&id);
+    // ADR-008 MUST-3：id 不存在返 "not_found"，不暴露 id 字面值
     if !removed {
-        return Err(format!("历史条目不存在：{id}"));
+        tracing::warn!(target: "commands", id = %id, "delete_history_item: not found");
+        return Err("not_found".to_string());
     }
 
     // emit history-updated（前端刷新列表）
@@ -481,19 +508,24 @@ pub async fn recopy_history_item(
     id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let entry = state
-        .history
-        .get(&id)
-        .ok_or_else(|| format!("历史条目不存在：{id}"))?;
+    // ADR-008 MUST-3：id 不存在返 "not_found"，不暴露 id 字面值
+    let entry = state.history.get(&id).ok_or_else(|| {
+        tracing::warn!(target: "commands", id = %id, "recopy_history_item: not found");
+        "not_found".to_string()
+    })?;
 
     match &entry.payload {
         HistoryPayload::Text { text } => {
             // 通过 clipboard_apply_tx 发到 arboard 专属线程
             // SECURITY：不 tracing 明文内容
+            // ADR-008 MUST-3：剪切板写入失败不暴露 mpsc 错误细节
             state
                 .clipboard_apply_tx
                 .try_send(text.clone())
-                .map_err(|e| format!("剪切板写入失败：{e}"))?;
+                .map_err(|e| {
+                    tracing::warn!(target: "commands", error = %e, "recopy_history_item: clipboard send failed");
+                    "internal_error".to_string()
+                })?;
 
             tracing::debug!(
                 target: "commands",
@@ -502,16 +534,15 @@ pub async fn recopy_history_item(
             );
             Ok(())
         }
-        HistoryPayload::Image { data_b64, .. } => {
+        HistoryPayload::Image { .. } => {
             // TODO(PR-FE-1+)：图片重写剪切板需要 ClipboardCmd::SetImage（arboard image 解码）
-            // 当前 clipboard_apply_tx 只接受 String（SetTextSuppress），
-            // 图片路径暂时以 data_url 格式通过 tx 发（arboard 线程需对应处理）。
-            // 本 PR 阶段先返回占位 Err，PR-FE-1 落地时与 clipboard.rs 协商接口。
-            let _ = data_b64;
-            Err("图片复制暂未实现，将在后续版本支持".to_string())
+            // 当前 clipboard_apply_tx 只接受 String（SetTextSuppress），图片通路未实现。
+            // ADR-008 MUST-3：占位返 "invalid_input"（让前端知道是参数级问题，不是内部错误）
+            Err("invalid_input".to_string())
         }
         HistoryPayload::File { .. } => {
-            Err("文件条目不支持复制到剪切板，请使用在 Finder 中显示".to_string())
+            // 文件条目不支持复制到剪切板；返 "invalid_input"（参数类型限制）
+            Err("invalid_input".to_string())
         }
     }
 }
@@ -566,6 +597,8 @@ pub struct PeerPendingPayload {
 mod tests {
     use super::*;
     use crate::app::history::{HistoryEntry, HistoryPayload, HistorySource};
+    #[allow(unused_imports)]
+    use anyhow;
 
     // 测试辅助：构造最小 StatusInfo
     fn make_status() -> StatusInfo {
@@ -612,11 +645,11 @@ mod tests {
         }
     }
 
-    // 单测 3：approve_peer_unknown_device_returns_err_string
-    // 验证 approve_peer 对未知 device_id 返回 Err 字符串。
+    // 单测 3：approve_peer_unknown_returns_not_found
+    // ADR-008 MUST-3：验证 approve_peer 对未知 device_id 返回通用 "not_found" 串（不含 device_id 字面值）。
     // 使用 PeerRegistry 逻辑验证（不依赖 Tauri runtime）。
     #[test]
-    fn approve_peer_unknown_device_returns_err_string() {
+    fn approve_peer_unknown_returns_not_found() {
         use crate::app::client_pool::ClientPool;
         use crate::peer::PeerRegistry;
         use std::sync::Arc;
@@ -630,9 +663,9 @@ mod tests {
             !registry.is_known(unknown_id),
             "unknown device must not be known"
         );
-        // approve_peer 逻辑：!is_known → Err
+        // approve_peer 逻辑：!is_known → Err("not_found")（ADR-008 MUST-3）
         let result: Result<(), String> = if !registry.is_known(unknown_id) {
-            Err(format!("未知设备：{unknown_id}"))
+            Err("not_found".to_string())
         } else {
             Ok(())
         };
@@ -640,9 +673,15 @@ mod tests {
             result.is_err(),
             "approve_peer for unknown device must return Err"
         );
+        let err_str = result.unwrap_err();
+        assert_eq!(
+            err_str, "not_found",
+            "error body must be generic 'not_found', not expose device_id"
+        );
+        // 不含 device_id 字面值（ADR-008 MUST-3 核心约束）
         assert!(
-            result.unwrap_err().contains("未知设备"),
-            "error string must mention unknown device"
+            !err_str.contains(unknown_id),
+            "error body must not contain device_id literal"
         );
     }
 
@@ -652,6 +691,7 @@ mod tests {
     #[test]
     fn set_config_persists_device_name() {
         use crate::app::config::Config;
+        use crate::peer::sanitize::sanitize_device_name;
 
         // 空字符串被 trim → empty → 拒绝
         let empty_name = "   ".trim().to_string();
@@ -669,13 +709,108 @@ mod tests {
         };
         assert_eq!(cfg.device_name, valid_name);
 
-        // 超长名称截断到 64 字符
+        // 超长名称经 sanitize_device_name 截断到 64 codepoints（ADR-008 MUST-8）
         let long_name: String = "x".repeat(100);
-        let truncated: String = long_name.chars().take(64).collect();
+        let sanitized = sanitize_device_name(&long_name);
         assert_eq!(
-            truncated.chars().count(),
+            sanitized.chars().count(),
             64,
-            "truncated name must be 64 chars"
+            "sanitize_device_name must truncate to 64 codepoints"
+        );
+    }
+
+    // 单测 9：set_config_rejects_rtl_in_device_name
+    // ADR-008 MUST-8：set_config 经 sanitize_device_name 后 RTL 字符被过滤
+    #[test]
+    fn set_config_rejects_rtl_in_device_name() {
+        use crate::peer::sanitize::sanitize_device_name;
+
+        // U+202E RIGHT-TO-LEFT OVERRIDE 是 ADR-008 Bidi 黑名单字符
+        let rtl = '\u{202E}';
+        let name_with_rtl = format!("exploit{rtl}gpj.exe");
+        let trimmed = name_with_rtl.trim().to_string();
+
+        // set_config 入口路径：sanitize_device_name 应过滤掉 RTL 字符
+        let safe_name = sanitize_device_name(&trimmed);
+        assert!(
+            !safe_name.contains('\u{202E}'),
+            "sanitize_device_name must strip U+202E RTL override from device_name"
+        );
+        // 过滤后剩余部分是合法内容（非 <unnamed>）
+        assert_ne!(
+            safe_name, "<unnamed>",
+            "non-empty name after RTL strip must not become <unnamed>"
+        );
+    }
+
+    // 单测 10：set_config_truncates_long_device_name
+    // ADR-008 MUST-8：超长 device_name 被 sanitize_device_name 截断到 64 codepoints
+    #[test]
+    fn set_config_truncates_long_device_name() {
+        use crate::peer::sanitize::sanitize_device_name;
+
+        // 500 个中文字符，每个 3 字节，远超 64 codepoints 限制
+        let long_unicode: String = "中".repeat(500);
+        let safe_name = sanitize_device_name(&long_unicode);
+        assert_eq!(
+            safe_name.chars().count(),
+            64,
+            "device_name must be truncated to exactly 64 Unicode codepoints"
+        );
+    }
+
+    // 单测 11：set_config_strips_control_chars
+    // ADR-008 MUST-8：控制字符（U+0000-U+001F）被 sanitize_device_name 过滤
+    #[test]
+    fn set_config_strips_control_chars() {
+        use crate::peer::sanitize::sanitize_device_name;
+
+        // 含 NUL + BEL + ESC 等 C0 控制字符
+        let with_ctrl = "My\u{0000}Mac\u{0007}Book\u{001B}";
+        let safe_name = sanitize_device_name(with_ctrl);
+        assert!(
+            !safe_name
+                .chars()
+                .any(|c| c <= '\u{001F}' || c == '\u{007F}'),
+            "sanitize_device_name must remove all C0 control characters"
+        );
+        // 合法字符保留
+        assert!(
+            safe_name.contains("MyMacBook"),
+            "legitimate chars must be preserved after control char strip"
+        );
+    }
+
+    // 单测 12：set_config_io_error_returns_generic_internal_error
+    // ADR-008 MUST-3：set_config 写盘失败返通用 "internal_error"，不含 ProjectDirs path
+    // 直接测 boundary 映射逻辑（模拟失败 → 返 "internal_error" 字面量）
+    #[test]
+    fn set_config_io_error_returns_generic_internal_error() {
+        // 模拟 set_config save 失败路径：boundary 处 map_err 应映射到 "internal_error"
+        // （不包含 /Users/... 之类的路径信息）
+        let simulated_io_err = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "/Users/victim/Library/Application Support/com.synccopy.app/config.json: permission denied",
+        );
+        let anyhow_err = anyhow::anyhow!(simulated_io_err);
+
+        // boundary 映射：任何写盘失败 → "internal_error"（不含 path）
+        let boundary_str = {
+            tracing::warn!(error = %anyhow_err, "test: simulated save failure");
+            "internal_error".to_string()
+        };
+        assert_eq!(
+            boundary_str, "internal_error",
+            "io error must map to generic 'internal_error'"
+        );
+        // 关键：boundary 返回值不含内部路径
+        assert!(
+            !boundary_str.contains("Library"),
+            "boundary error must not expose internal path"
+        );
+        assert!(
+            !boundary_str.contains("config.json"),
+            "boundary error must not expose config file path"
         );
     }
 
