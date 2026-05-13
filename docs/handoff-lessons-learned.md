@@ -163,7 +163,14 @@ depends_on_artifacts:
 8. **v5-2 流水线自动跑**：默认连续推进所有 SDLC 阶段，仅 3 类硬关卡停下（关键产品决策 / 早期架构决策 / 不可逆操作）
 9. **v5-11 决策卡片格式**：所有 stop-and-ask 必须含问题 + 选项 + 推荐 + 取舍 + must-fix
 
-**派生 1 条（用户反馈 2026-05-09 演化）**：
+**派生 2 条（用户反馈 2026-05-09 / 2026-05-10 演化）**：
+
+11. **决策卡片禁用时间作为取舍维度**（用户 2026-05-10 直接拍板）：所有 v5-11 决策卡片**不再标 "估计 ~X 分钟"** 等时间成本；取舍维度只列**质量 / 结果 / 完整性 / 风险 / 用户体验**。理由：用户原话"以后时间都不要在方案的选择考虑之中，质量、结果才是最重要考虑的"。落地：
+    - ❌ 取舍段不写"~15 分钟"/"~90 分钟"
+    - ❌ 不做"快但有缺口 vs 慢但完整"对比
+    - ✅ 仅按质量维度分级：完整 / 简化 / 有缺口 / 推迟
+    - ✅ 推荐项必须是质量上最优解；如有"足够 vs 完美"取舍，仅描述未来改进路径
+    - 默认偏好：D 类（最干净 / 最完整）优于 A 类（最快可行）
 
 10. **决策卡片密度过滤**：主窗口在向用户呈现决策卡片前，必须自查"这是否真的是用户能判断的事"——按下表三档分类：
 
@@ -308,6 +315,9 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 | 2026-05-10 | **PR-7a 3 nit 修复完成**（commit 86ac6ac）：nit #1 方案 A 改注释（删"RateLimiter 限流"虚假声明，改准确"announce 不走 RateLimiter，origin approved 兜底"）/ nit #2 双层 Arc 改 Arc::clone(&state) / nit #3 方案 A 删 seq 字段 + 加向后兼容测试。cargo test 仍 122 passed。**v5-1 第 5 次约束有效**：grep RateLimiter peers.rs 0 虚假声明 + protocol.rs GossipAnnouncePayload 只剩 3 字段实证 | nit 修复 + 自查诚实延续 |
 | 2026-05-10 | **🎯 里程碑 5：v2.0 backend 范围 100% 完成 — P5-2 N=3 gossip 集成测试 PASS**（commit 085ae08）。test_three_instance_gossip_mesh 起 3 axum 实例 + polling 5s timeout 验证 gossip 双路径：C 通过 B.resp.peers 自动 dial A（gossip_dial_stub）+ A 通过 B.broadcast_announce 自动 dial C。6 断言全 mapping spec AC #2 + ADR-009 invariant 3（client_pool 一致性）。手测 S2 从"预期 FAIL"翻 PASS。**cargo test 123 passed**（114 lib + 9 tests）。**累计完整 v2.0 backend**：19 commits / 123 单测 / 5 ADR + 8 必修 MUST-1~8 全代码层 / handshake ECDH / clipboard AES-GCM AAD / heartbeat 5s + 隐形掉线 force_rebuild / arboard 真接（PNG 跳过 + 1MB 限 + sha256 环路防） / lifecycle 4 阶段 + axum graceful shutdown / N≥3 gossip mesh 全打通。**v0 实战 bug 隐形掉线根治**。**下一阶段决策**：A docs-writer 文档化 + release-engineer 出 v2.0.0-beta backend-only / B 切前端 frontend-implementer 做 floating-window + tray + history-list + settings / C 跳到发布出 backend-only / D 休息 | v2.0 backend 完整 + gossip 真闭环 |
 | 2026-05-10 | 用户选 B → **P3-FE-1 stack 落盘 4 commits**：PR-FE-0 commands.rs 11 命令 + history/config 模块 / PR-FE-0a 静默修 2 严重（MUST-8 sanitize + MUST-3 通用 body）/ PR-FE-1 前端脚手架 9 文件（ipc.ts 11 wrapper + types + tokens 视觉字典 + StatusDot + FloatingWindow 280 行）/ PR-FE-1a [低] CSS 变量 1 行修 / PR-FE-1b peer-pending emit + AppHandle 注入 AppState（trust 状态机方向决策记录）。**146 cargo test 全过**（137 lib + 9 tests）+ npm run check 0 error 0 warning + npm run build 成功。**LM-1 进度 7/10**（frontend-implementer agent 升级 7-section）。**trust 状态机决策记录**：handshake 当前自动 approve 简化路径（ADR-009 第 3.3 节注释"Pending v2 实质不出现"）；PR-FE-1b 采最小方案 emit peer-pending 通知前端（前端弹框 approve→no-op, reject→真 ban）；**完整 group-approval 工作流（pending_approvals + 30s oneshot + forward + decide + dismiss）推迟到 group-approval feature PR**。**v5-1 review 6 次拦截价值**（PR-2/3/5/6b/7/FE-0）：自查诚实约束有效避免占位 / 注释撒谎 / 内部链泄露 | FE 第一批 + trust 决策 + review 价值 |
+| 2026-05-10 | **PR-FE-2 + PR-FE-2a + PR-FE-3 stack 落盘 3 commits**：PR-FE-2 settings 面板 + group-approval 弹框 + view 切换（6 文件，ApprovalDialog 含 30s 倒计时三色阈值，ClearConfirm 拆出保持单文件 ≤ 250 行）/ PR-FE-2a backend tray 菜单注册（lib.rs +152 行，build_tray + show/hide window，ADR-010 P0 例外加 tracing::warn 观测线，emit window-shown）/ PR-FE-3 history-list + floating-ball（5 文件，HistoryList 247 行 + FloatingBall 113 行 + history store 乐观更新 + window-shown listen）。**累计 v2.0**：26 commits / 148 cargo test + 0 npm check error / 11 IPC + 4 事件全闭环 / 前端 7 组件 + 3 store / Tray 菜单完整 | FE 三批闭环 |
+| 2026-05-10 | **PR-FE-3 review CHANGES_REQUESTED — 1 严重 release-blocker**（specs/history-list.md 第 9 节）：history-updated emit **仅 delete/clear 触发**（commands.rs:463/486），push 路径（本机/远端复制收新）backend 0 emit → 浮窗永不刷新仅依赖 window-shown 唤起。spec history-list AC #1/#2 失败。+ 2 [中等]：FloatingWindow expandFromBall 与 backend ensure_on_screen 双视口校正（架构债）/ historyStore.error 写入无 UI 消费；+ 6 [低]：ball 直径硬编码 / console.warn 残留 / commit msg 球径 36 vs 代码 48 / 行数预算微超等 | review 抓 release-blocker |
+| 2026-05-10 | **用户拍 D + 永久原则更新**：① 选 D 最干净路径（PR-7 修 [严重] 1 + [中等] 2 + 6 [低]） ② **永久原则**："以后时间都不要在方案的选择考虑之中，质量、结果才是最重要考虑的"——落 lessons-learned 第 5 段派生第 11 条。**主窗口决策卡片格式调整**：不再标"~X 分钟"时间成本；取舍维度仅列质量 / 结果 / 完整性 / 风险 / UX；推荐项必须质量最优解；默认偏好 D 类（最干净）优于 A 类（最快可行） | 用户原则更新 + D 全修 |
 
 **懒迁移待办**（ADR-002 第 3 节登记）：
 

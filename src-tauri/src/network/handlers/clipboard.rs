@@ -1,5 +1,6 @@
 //! POST /clipboard handler
 //! see specs/clipboard-text-sync.md (第 3 节 + 第 4 节 AC)
+//! see specs/history-list.md (第 3 节 push 路径 + history-updated emit)
 //! see decisions/ADR-003-project-architecture-skeleton.md (第 3.2 节)
 //! see decisions/ADR-008-security-review-of-adr003.md (MUST-3 / MUST-8)
 //! see decisions/ADR-011-crypto-traits.md (第 3.3 节 build_aad 调用契约)
@@ -14,12 +15,21 @@
 //! PR-6 新增：
 //! - 解密成功 → 通过 AppState.clipboard_apply_tx SyncSender<String> try_send 发到 arboard 线程
 //! - try_send 非阻塞：channel 满时 warn + 仍返 200 OK（不影响协议层）
+//!
+//! PR-7 新增（spec history-list.md 第 9.2 节 [严重] 1 修复）：
+//! - 解密成功后 push HistoryEntry(Remote) 到 state.history + emit "history-updated"
+//! - 方案 B：调用方显式 emit（最显式、最少侵入 history.rs 内部）
+//! - SECURITY（ADR-011 第 3.5 节）：push entry 时不 tracing 明文内容
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use std::sync::Arc;
 
+use tauri::Emitter as _;
+
+use crate::app::clipboard::sha256_hex;
+use crate::app::history::{make_text_history_entry, HistorySource};
 use crate::app::state::AppState;
 use crate::crypto::{build_aad, AadKind, AesGcmSealer, Sealer};
 use crate::network::error::NetworkError;
@@ -114,17 +124,59 @@ pub async fn handle_clipboard(
             NetworkError::DecryptFailed
         })?;
 
-    // --- 步骤 7：派发到 arboard 线程（PR-6 真接）---
+    // --- 步骤 7：派发到 arboard 线程（PR-6 真接）+ push history + emit（PR-7 新增）---
     // SECURITY（ADR-011 第 3.5 节）：
     //   plaintext 是剪切板明文，敏感性等同于 OS 剪切板内容；不进 tracing fields。
     //   仅记 plaintext_len。
     let plaintext_len = plaintext.len();
 
-    // 将解密后的 plaintext 转为 String 发给 arboard 线程（std::sync::mpsc SyncSender）。
+    // 将解密后的 plaintext 转为 String，发给 arboard 线程 + push history + emit history-updated。
     // try_send 非阻塞（channel buffer=64；若满则 log warn，不影响 handler 响应）。
     // SECURITY：plaintext 不进 tracing fields / 不落盘。
     match String::from_utf8(plaintext) {
         Ok(text) => {
+            // --- PR-7：push HistoryEntry(Remote) → emit history-updated ---
+            // 在 try_send 之前 push（history push 是同步操作，不持锁过 await）。
+            // 即使后续 clipboard apply_tx try_send 失败，history 仍应记录此条目
+            // （spec history-list.md 第 3 节：history 与 clipboard 写入独立）。
+            // SECURITY（ADR-011 第 3.5 节）：不 tracing 明文 text 内容。
+            {
+                // 取 device_name 用于 Remote source（短锁短持，不持锁过后续操作）
+                let device_name = state
+                    .peers
+                    .get(&req.origin_device_id)
+                    .map(|p| p.device_name.clone())
+                    .unwrap_or_else(|| req.origin_device_id.clone());
+
+                let content_hash = sha256_hex(&text);
+                let entry = make_text_history_entry(
+                    text.clone(),
+                    HistorySource::Remote { device_name },
+                    content_hash,
+                );
+                state.history.push(entry);
+
+                // emit history-updated（非阻塞；AppHandle::emit 是同步的）
+                if let Some(handle) = state.app_handle.read().as_ref() {
+                    if let Err(e) = handle.emit("history-updated", ()) {
+                        tracing::warn!(
+                            target: "network::clipboard",
+                            origin = %sanitize_log_field(&req.origin_device_id),
+                            error = %e,
+                            "handle_clipboard: emit history-updated failed (non-fatal)"
+                        );
+                    }
+                }
+
+                tracing::debug!(
+                    target: "app::history",
+                    origin = %sanitize_log_field(&req.origin_device_id),
+                    source = "remote",
+                    "history entry pushed from remote clipboard ingest"
+                );
+            }
+
+            // --- 派发到 arboard 线程（PR-6 真接）---
             match state.clipboard_apply_tx.try_send(text) {
                 Ok(()) => {
                     tracing::info!(

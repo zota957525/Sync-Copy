@@ -173,6 +173,33 @@ impl HistoryStore {
     }
 }
 
+/// 构造文本类型的 HistoryEntry（history push 路径辅助函数）。
+///
+/// 供 lifecycle broadcast 消费路径 + network clipboard handler 路径复用。
+/// see specs/history-list.md 第 3 节，see decisions/ADR-003（第 3.5 节 AppState）。
+///
+/// content_hash = SHA-256 hex（spec 第 5.2 节；crate-internal only）。
+pub(crate) fn make_text_history_entry(
+    text: String,
+    source: HistorySource,
+    content_hash: String,
+) -> HistoryEntry {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    HistoryEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp_ms,
+        source,
+        content_hash: Some(content_hash),
+        payload: HistoryPayload::Text { text },
+    }
+}
+
 impl Default for HistoryStore {
     fn default() -> Self {
         Self {
@@ -293,5 +320,64 @@ mod tests {
         store.push(make_text_entry("id-2", Some("hash-b"), "world"));
         store.clear();
         assert_eq!(store.count(), 0, "clear must empty the store");
+    }
+
+    // PR-7 新增单测：验证 make_text_history_entry 构造正确的 HistoryEntry
+    // spec history-list.md 第 3 节：text entry 含 id / timestamp_ms / source / content_hash / payload
+    #[test]
+    fn make_text_history_entry_local_source() {
+        let text = "hello world".to_string();
+        let hash = "aabbcc".to_string();
+        let entry =
+            super::make_text_history_entry(text.clone(), HistorySource::Local, hash.clone());
+
+        // id 是 UUID v4 格式（非空字符串）
+        assert!(!entry.id.is_empty(), "entry.id must not be empty");
+        // timestamp_ms > 0（使用 UNIX epoch，当前时间应远大于 0）
+        assert!(entry.timestamp_ms > 0, "entry.timestamp_ms must be > 0");
+        // source 是 Local
+        assert!(
+            matches!(entry.source, HistorySource::Local),
+            "source must be Local"
+        );
+        // content_hash 与传入一致
+        assert_eq!(
+            entry.content_hash.as_deref(),
+            Some("aabbcc"),
+            "content_hash must match"
+        );
+        // payload 是 Text
+        match entry.payload {
+            HistoryPayload::Text { text: t } => {
+                assert_eq!(t, text, "payload.text must match input");
+            }
+            _ => panic!("expected Text payload"),
+        }
+    }
+
+    // PR-7 新增单测：验证 make_text_history_entry 支持 Remote source
+    // spec history-list.md 第 3 节：source = { kind: "remote", device_name: "..." }
+    #[test]
+    fn make_text_history_entry_remote_source() {
+        let entry = super::make_text_history_entry(
+            "remote text".to_string(),
+            HistorySource::Remote {
+                device_name: "工作 Mac".to_string(),
+            },
+            "deadbeef".to_string(),
+        );
+
+        match &entry.source {
+            HistorySource::Remote { device_name } => {
+                assert_eq!(device_name, "工作 Mac", "device_name must match");
+            }
+            HistorySource::Local => panic!("expected Remote source"),
+        }
+        // content_hash 正确传递
+        assert_eq!(
+            entry.content_hash.as_deref(),
+            Some("deadbeef"),
+            "content_hash must be passed through"
+        );
     }
 }

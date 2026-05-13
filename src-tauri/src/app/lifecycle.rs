@@ -22,6 +22,10 @@
 //! PR-6b 新增：
 //! - step 6 真正 HeartbeatWorker::start（主动 ping + 隐形掉线检测）
 //! - shutdown step 4 调 HeartbeatWorker::shutdown（500ms deadline）
+//!
+//! PR-7 新增（spec history-list.md 第 9.2 节 [严重] 1 修复）：
+//! - step 4 真正消费 broadcast_rx（spawn tokio task → push history → emit history-updated）
+//! - 本机 clipboard 变化路径：TextChanged → HistoryEntry(Local) push + emit
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -222,10 +226,8 @@ impl Lifecycle {
                 }
                 Some(rx) => {
                     // broadcast_tx：watcher 检测到变化时通知异步层。
-                    // PR-7 落地前 broadcast_rx 未消费，try_send 预期返回 Disconnected；
-                    // clipboard.rs poll_text_clipboard 内 try_send 失败降级为 trace 级别
-                    // 避免噪音（PR-7 真接收侧落地后替换此 channel，届时删除此注释）。
-                    let (broadcast_tx, _broadcast_rx) = mpsc::sync_channel::<ClipboardEvent>(64);
+                    // PR-7 落地：broadcast_rx 真正被消费（spawn tokio task 监听 → push history → emit）。
+                    let (broadcast_tx, broadcast_rx) = mpsc::sync_channel::<ClipboardEvent>(64);
 
                     match ClipboardWatcher::start(broadcast_tx, rx) {
                         Ok(watcher) => {
@@ -235,6 +237,58 @@ impl Lifecycle {
                                 step = 4,
                                 "clipboard watcher thread started"
                             );
+
+                            // PR-7：消费 broadcast_rx — 本机 clipboard 变化 → push history → emit history-updated
+                            // 设计（spec history-list.md 第 3 节 / 方案 B：调用方显式 emit）：
+                            //   std::sync::mpsc::Receiver 不支持 async recv，用 spawn_blocking 包装。
+                            //   当 ClipboardWatcher 线程退出时 broadcast_tx drop，broadcast_rx.iter() 自然结束。
+                            // SECURITY（ADR-011 第 3.5 节）：push entry 时不 tracing 明文内容。
+                            let state_for_broadcast = state.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let state_inner = state_for_broadcast;
+                                // spawn_blocking：std::sync::mpsc::Receiver::iter() 是 blocking 操作，
+                                // 不能在 tokio async 上下文中直接调用（会阻塞 runtime thread）。
+                                tokio::task::spawn_blocking(move || {
+                                    use crate::app::clipboard::sha256_hex;
+                                    use crate::app::history::{HistorySource, make_text_history_entry};
+                                    use tauri::Emitter as _;
+
+                                    for event in broadcast_rx.iter() {
+                                        match event {
+                                            ClipboardEvent::TextChanged(text) => {
+                                                let hash = sha256_hex(&text);
+                                                let entry = make_text_history_entry(
+                                                    text,
+                                                    HistorySource::Local,
+                                                    hash,
+                                                );
+                                                state_inner.history.push(entry);
+
+                                                // emit history-updated（非持锁操作，AppHandle::emit 是同步的）
+                                                if let Some(handle) = state_inner.app_handle.read().as_ref() {
+                                                    if let Err(e) = handle.emit("history-updated", ()) {
+                                                        tracing::warn!(
+                                                            target: "lifecycle",
+                                                            error = %e,
+                                                            "clipboard broadcast: emit history-updated failed (non-fatal)"
+                                                        );
+                                                    }
+                                                }
+
+                                                tracing::debug!(
+                                                    target: "app::history",
+                                                    source = "local",
+                                                    "history entry pushed from local clipboard change"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    tracing::debug!(
+                                        target: "lifecycle",
+                                        "broadcast_rx consumer task exited (clipboard watcher stopped)"
+                                    );
+                                }).await.ok();
+                            });
                         }
                         Err(e) => {
                             // ADR-010 第 3.2 节 step 4 失败 → unwind step 1（drop log_guard）

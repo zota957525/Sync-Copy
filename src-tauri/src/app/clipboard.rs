@@ -362,14 +362,13 @@ fn poll_text_clipboard(
     *last_hash = Some(hash);
 
     // broadcast_tx.try_send（SyncSender bound=64，非阻塞）
-    // PR-7 落地前 broadcast_rx 未消费，预期返回 Disconnected；降级 trace 避免噪音。
-    // PR-7 真接收侧落地后改回 warn（届时 Disconnected 不再是预期行为）。
+    // PR-7 落地：broadcast_rx 真正被消费（lifecycle step 4 spawn_blocking consumer task）。
+    // try_send 失败（channel 满或 consumer task 已退出）记 warn，不影响剪切板轮询主循环。
     if let Err(e) = broadcast_tx.try_send(ClipboardEvent::TextChanged(text)) {
-        tracing::trace!(
+        tracing::warn!(
             target: "clipboard",
             error = %e,
-            // PR-7 落地前 broadcast_rx 未消费，预期 Disconnected；trace 级别避免噪音
-            "broadcast_tx try_send failed (receiver dropped or full)"
+            "broadcast_tx try_send failed (channel full or consumer task gone)"
         );
     }
 }
@@ -405,6 +404,19 @@ fn sha256_text(text: &str) -> [u8; 32] {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&result);
     arr
+}
+
+/// 计算文本的 SHA-256 hash，返回小写 hex 字符串。
+///
+/// 供 history push 路径用于 content_hash 字段（spec history-list.md 第 3 节）。
+/// hash 是明文 hash，跨机器一致（spec 第 5.2 节 content_hash 说明）。
+pub(crate) fn sha256_hex(text: &str) -> String {
+    let bytes = sha256_text(text);
+    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{:02x}", b);
+        s
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +455,31 @@ mod tests {
         let h1 = sha256_text("text_a");
         let h2 = sha256_text("text_b");
         assert_ne!(h1, h2, "different text must produce different hash");
+    }
+
+    // -----------------------------------------------------------------------
+    // PR-7 新增单测：sha256_hex 格式验证
+    // spec history-list.md 第 3 节：content_hash 是 SHA-256 hex 字符串
+    // -----------------------------------------------------------------------
+    #[test]
+    fn sha256_hex_format_and_consistency() {
+        let hex = sha256_hex("hello world");
+        // SHA-256 输出 32 字节 = 64 hex 字符
+        assert_eq!(hex.len(), 64, "sha256_hex must produce 64-char hex string");
+        // 只含小写 hex 字符
+        assert!(
+            hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "sha256_hex output must be lowercase hex digits"
+        );
+        // 相同输入，两次 hex 相同（确定性）
+        let hex2 = sha256_hex("hello world");
+        assert_eq!(hex, hex2, "sha256_hex must be deterministic");
+        // 不同输入，hex 不同
+        let hex3 = sha256_hex("different content");
+        assert_ne!(
+            hex, hex3,
+            "different inputs must produce different sha256_hex"
+        );
     }
 
     // -----------------------------------------------------------------------
