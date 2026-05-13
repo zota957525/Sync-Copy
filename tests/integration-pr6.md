@@ -46,23 +46,27 @@
 
 ## 场景 S2：三机 gossip 自动扩展
 
-对应 spec: group-discovery.md 第 4 节 AC #2
+对应 spec: group-discovery.md 第 4 节 AC #2（PR-7 / commit 86ac6ac 已实现）
 
 步骤：
 1. A、B 已在同一小组（`小组 · 2 台`）
-2. C 启动 SyncCopy，点「加入」，输入 **A 的** IP:PORT
-3. A 审批通过
+2. C 启动 SyncCopy，点「加入」，输入 **B 的** IP:PORT（也可输入 A 的，效果相同）
+3. B 侧审批通过
 4. 等待 ≤ 5 秒
-5. 验证：A、B、C 三台均显示 `小组 · 3 台`（gossip 自动扩展 B ↔ C）
+5. 验证：A、B、C 三台均显示 `小组 · 3 台`
+
+gossip 路径说明（PR-7 实现，PR-7a commit 86ac6ac）：
+- C dial B → B 的 HandshakeResp.peers 含 A 的 stub → C 自动 gossip_dial_stub 向 A 发起握手 → C.peers 加入 A
+- C dial B 完成后 B 调 broadcast_announce(C) → A 收到 announce → A spawn dial_handshake(C.addr) → A.peers 加入 C
+- 结果：三机均互相 Approved，`小组 · 3 台`
 
 预期：
-- C 加入 A 后，自动发起与 B 的握手（gossip）
-- 三机均互相 Approved
+- B 审批通过后 ≤ 5 秒内，A、B、C 三台均显示 `小组 · 3 台`
+- C 的 peers 包含 A（gossip_dial_stub 路径）
+- A 的 peers 包含 C（broadcast_announce 路径）
+- 三机均互相 Approved（六个方向均连通）
 
 实测：（填）
-
-注意：当前 v2 的 HandshakeResp 未实现 peers 列表返回，gossip 可能尚未工作。
-若本场景 FAIL，记录为"gossip 未实现（PR-7+ 待接入）"，不阻塞整体 backend MVP 评估。
 
 ---
 
@@ -200,8 +204,8 @@
 
 ## 已知 fail / 待跟进
 
-- gossip（S2）：当前 HandshakeResp 未包含 peers 列表，三机 gossip 自动扩展未实现，
-  需 PR-7+ 接入 peers 字段返回，手测 S2 预期 FAIL / SKIP
-- 前端 UI（`小组 · N 台` 状态显示）依赖 PR-7 前端接入，P5-1 阶段 backend 测试用 tracing 日志验证状态变化
-- clipboard_apply_tx 接收侧（PR-7）：文本同步 S1 步骤 6 能通过的前提是 arboard 线程正常消费明文，
-  若 PR-6a' 后 arboard 在 CI headless 环境 init 失败，S1 B 侧仅能验证 handler 返 200 而不验证剪切板写入
+- gossip（S2）：PR-7（commit 1d9e41a）+ PR-7a（commit 86ac6ac）已完整实现，
+  集成测试 test_three_instance_gossip_mesh 9 pass 验证（P5-2）。S2 预期 PASS。
+- 前端 UI（`小组 · N 台` 状态显示）依赖前端 Tauri command 接入，backend 测试用 tracing 日志验证状态变化
+- clipboard_apply_tx 接收侧：文本同步 S1 步骤 6 能通过的前提是 arboard 线程正常消费明文，
+  若 arboard 在 CI headless 环境 init 失败，S1 B 侧仅能验证 handler 返 200 而不验证剪切板写入

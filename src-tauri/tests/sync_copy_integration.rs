@@ -8,7 +8,7 @@
 //!
 //! 覆盖的 spec AC：
 //!   clipboard-text-sync AC #1/#3/#6/#7
-//!   group-discovery AC #1/#7（self-connect 403）
+//!   group-discovery AC #1/#2（N=3 gossip mesh，S9）/#7（self-connect 403）
 //!   peer-heartbeat AC #5（leave 清理 client_pool）
 //!   e2e-encryption AC #3（错误 AAD → decrypt 失败 → 422）
 //!
@@ -523,6 +523,128 @@ async fn test_crypto_encrypt_decrypt_roundtrip_and_tamper() {
 //   ADR-008 MUST-3（自连校验依赖真实 my_device_id）
 //   clipboard-text-sync AC（AAD 中 origin_device_id 非常量，跨 peer 重放保护）
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// S9: N=3 gossip mesh 自动扩展（group-discovery AC #2）
+//
+// 覆盖：
+//   group-discovery spec 第 4 节 AC #2（三机全连通）
+//   ADR-009 invariant 3（client_pool.contains == peers.contains）
+//
+// 场景：
+//   1. A dial B → 双向握手，A.peers 有 B，B.peers 有 A
+//   2. C dial B → B 在 HandshakeResp.peers 中返回 A 的 stub → C 自动 gossip dial A
+//              → B 在 dial_handshake 末尾 broadcast_announce(C) → A 收到 announce → A dial C
+//   等待最长 5s（polling 每 100ms 检查），验证四个方向全部连通：
+//     A.peers 含 C、B.peers 含 C、C.peers 含 A、C.peers 含 B
+// ---------------------------------------------------------------------------
+
+/// 起 3 个 axum 实例 A/B/C，A-B 先握手，C dial B，等 gossip 异步完成（≤ 5s），
+/// 断言三机两两 is_approved（group-discovery spec 第 4 节 AC #2）。
+#[tokio::test]
+async fn test_three_instance_gossip_mesh() {
+    let (state_a, addr_a, handle_a) = spawn_test_instance().await;
+    let (state_b, addr_b, handle_b) = spawn_test_instance().await;
+    let (state_c, addr_c, handle_c) = spawn_test_instance().await;
+
+    let device_id_a = state_a.my_device_id.clone();
+    let device_id_b = state_b.my_device_id.clone();
+    let device_id_c = state_c.my_device_id.clone();
+
+    // --- 步骤 1：A dial B，建立初始双向连接 ---
+    dial_handshake(addr_b, &state_a, &device_id_a, "DeviceA", addr_a.port())
+        .await
+        .expect("A dial B should succeed (gossip mesh step 1)");
+
+    // 确认 A-B 双向已连通
+    assert!(state_a.peers.is_approved(&device_id_b), "A must know B after initial handshake");
+    assert!(state_b.peers.is_approved(&device_id_a), "B must know A after initial handshake");
+
+    // --- 步骤 2：C dial B ---
+    // B 的 HandshakeResp.peers 此时含 A（B 已知 A Approved）。
+    // dial_handshake 成功后：
+    //   a) gossip_dial_stub：C 拿到 resp.peers=[A_stub]，spawn gossip_dial_stub(A.addr)
+    //   b) broadcast_announce：C dial B 完成后 B 侧 handler 触发 broadcast_announce(C, A_addr)，
+    //      A 收到 announce 后 spawn dial_handshake(C.addr)
+    dial_handshake(addr_b, &state_c, &device_id_c, "DeviceC", addr_c.port())
+        .await
+        .expect("C dial B should succeed (gossip mesh step 2)");
+
+    // C-B 直接握手已确立
+    assert!(state_c.peers.is_approved(&device_id_b), "C must know B after direct handshake");
+    assert!(state_b.peers.is_approved(&device_id_c), "B must know C after direct handshake");
+
+    // --- 步骤 3：polling 等待 gossip 异步完成（≤ 5000ms）---
+    // gossip 路径是 fire-and-forget spawn，需等待异步任务完成：
+    //   路径 1：C 的 gossip_dial_stub(A.addr) → C.peers 加入 A
+    //   路径 2：B 的 broadcast_announce(C) → A 收到 → A dial C → A.peers 加入 C
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(5000);
+    loop {
+        let a_knows_c = state_a.peers.is_approved(&device_id_c);
+        let c_knows_a = state_c.peers.is_approved(&device_id_a);
+
+        if a_knows_c && c_knows_a {
+            break;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            // 超时：输出当前连通状态辅助诊断
+            panic!(
+                "gossip mesh NOT converged within 5000ms (group-discovery AC #2):\n\
+                 A.peers.contains(C) = {a_knows_c}  (path: B.broadcast_announce → A dial C)\n\
+                 C.peers.contains(A) = {c_knows_a}  (path: C.gossip_dial_stub → C dial A)\n\
+                 A.device_id = {device_id_a}\n\
+                 B.device_id = {device_id_b}\n\
+                 C.device_id = {device_id_c}\n\
+                 addr_a = {addr_a}, addr_b = {addr_b}, addr_c = {addr_c}"
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // --- 步骤 4：完整断言（group-discovery AC #2 四个方向）---
+
+    // 断言 1：A 通过 broadcast_announce 路径收到 C（B → A announce）
+    assert!(
+        state_a.peers.is_approved(&device_id_c),
+        "A.peers 应含 C（B 的 broadcast_announce → A dial C，group-discovery AC #2）"
+    );
+
+    // 断言 2：B 直接握手已有 C（步骤 2 直接验证的延伸）
+    assert!(
+        state_b.peers.is_approved(&device_id_c),
+        "B.peers 应含 C（直接握手，group-discovery AC #2）"
+    );
+
+    // 断言 3：C 通过 gossip_dial_stub 路径收到 A（resp.peers 扩展）
+    assert!(
+        state_c.peers.is_approved(&device_id_a),
+        "C.peers 应含 A（gossip_dial_stub via resp.peers，group-discovery AC #2）"
+    );
+
+    // 断言 4：C 直接握手已有 B
+    assert!(
+        state_c.peers.is_approved(&device_id_b),
+        "C.peers 应含 B（直接握手，group-discovery AC #2）"
+    );
+
+    // 断言 5（可选，ADR-009 invariant 3）：
+    // A 的 client_pool 含 C（dial_handshake 写入 client_pool 先于 peers.insert）
+    assert!(
+        state_a.client_pool.get(&device_id_c).is_some(),
+        "A.client_pool 应含 C（ADR-009 invariant 3：client_pool.contains == peers.contains）"
+    );
+    // C 的 client_pool 含 A
+    assert!(
+        state_c.client_pool.get(&device_id_a).is_some(),
+        "C.client_pool 应含 A（ADR-009 invariant 3）"
+    );
+
+    handle_a.abort();
+    handle_b.abort();
+    handle_c.abort();
+}
 
 /// A dial B 握手后，A 在 registry 里记录的 B 的 device_id 应与 B 的 my_device_id 一致，
 /// 且不为占位串 "placeholder-my-device-id"。
