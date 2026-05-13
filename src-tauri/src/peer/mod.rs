@@ -390,6 +390,60 @@ impl PeerRegistry {
     }
 
     // -----------------------------------------------------------------------
+    // 写方法 — heartbeat worker 专用（PR-6b peer-heartbeat.md 第 4 节 AC）
+    // -----------------------------------------------------------------------
+
+    /// 心跳成功：清零 consecutive_heartbeat_failures + 更新 last_heartbeat_at。
+    ///
+    /// ADR-008 5.2 节硬约束：**不**更新 last_successful_sync_at。
+    /// last_successful_sync_at 仅在 broadcast 200 OK 时由 record_send_ok 更新。
+    pub fn update_heartbeat_success(&self, id: &str) {
+        self.record_heartbeat_ok(id);
+    }
+
+    /// 递增 consecutive_heartbeat_failures 并返回新计数。
+    ///
+    /// 调用方用返回值与 FORCE_REBUILD_LIMIT 比较（PR-6b heartbeat_worker.rs）。
+    pub fn increment_heartbeat_failure(&self, id: &str) -> u32 {
+        self.record_heartbeat_fail(id)
+    }
+
+    /// 读取当前 consecutive_heartbeat_failures（只读，不修改）。
+    pub fn get_consecutive_heartbeat_failures(&self, id: &str) -> u32 {
+        self.inner
+            .read()
+            .get(id)
+            .map(|s| s.consecutive_heartbeat_failures)
+            .unwrap_or(0)
+    }
+
+    /// 强制重连成功后归零 consecutive_heartbeat_failures。
+    pub fn reset_heartbeat_failures(&self, id: &str) {
+        if let Some(state) = self.inner.write().get_mut(id) {
+            state.consecutive_heartbeat_failures = 0;
+        }
+    }
+
+    /// 广播 200 OK 时更新 last_successful_sync_at（仅此入口写）。
+    ///
+    /// ADR-008 5.2 节：last_successful_sync_at 仅在广播 200 OK 确认时写，
+    /// 不在心跳成功时写。调用方：network/client.rs::broadcast_clipboard 200 OK 路径。
+    pub fn update_last_successful_sync_at(&self, id: &str) {
+        self.record_send_ok(id);
+    }
+
+    /// 强制重连后更新 aes_key（re-handshake 路径）。
+    ///
+    /// SECURITY（ADR-008 MUST-2）：参数 key 为 Zeroizing 包装，
+    /// 赋值后旧 key 字节随旧 Zeroizing drop 自动清零。
+    pub fn update_aes_key(&self, id: &str, key: zeroize::Zeroizing<[u8; 32]>) {
+        if let Some(state) = self.inner.write().get_mut(id) {
+            // 旧 aes_key（Zeroizing）在此赋值时 drop → 自动清零（ADR-008 MUST-2）
+            state.aes_key = key;
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // 写方法 — seq dedupe（ADR-008 4.2 节 replay 防御）
     // -----------------------------------------------------------------------
 

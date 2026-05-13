@@ -419,6 +419,94 @@ pub async fn dial_handshake(
 }
 
 // ---------------------------------------------------------------------------
+// ping — heartbeat worker 专用，向单个 peer POST /heartbeat
+// ---------------------------------------------------------------------------
+
+/// 专用心跳超时（heartbeat worker 要求快速失败）
+const PING_TIMEOUT_MS: u64 = 2000;
+
+/// 向单个 peer POST /heartbeat（heartbeat worker 主循环调用）。
+///
+/// 使用 client_pool 中已有的 per-peer Client（不 lazy-add）。
+/// client_pool miss → 返 Err（peer 可能已被移除，调用方按失败处理）。
+///
+/// 200 OK → Ok(())
+/// 非 200 / timeout / 连接错误 → Err（调用方 increment_heartbeat_failure）
+///
+/// SECURITY（ADR-009 第 3.2 节 P1）：
+/// peer.aes_key 不进 tracing fields；仅记 peer_id + status。
+pub async fn ping(
+    state: &AppState,
+    peer_id: &str,
+    peer_addr: std::net::SocketAddr,
+) -> anyhow::Result<()> {
+    use crate::network::protocol::HeartbeatReq;
+
+    let client = state.client_pool.get(peer_id).ok_or_else(|| {
+        anyhow::anyhow!("ping: no client in pool for peer {peer_id} (peer may have been removed)")
+    })?;
+
+    let url = format!("http://{}:{}/heartbeat", peer_addr.ip(), peer_addr.port());
+
+    // seq=0：心跳探活不参与 monotonic seq dedupe（接收端 record_heartbeat_ok 不写 seq）
+    let req_body = HeartbeatReq {
+        origin_device_id: state.my_device_id.clone(),
+        seq: 0,
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(PING_TIMEOUT_MS),
+        client.post(&url).json(&req_body).send(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(resp)) if resp.status().is_success() => {
+            tracing::debug!(
+                target: "network::client::ping",
+                peer_id = %peer_id,
+                addr = %peer_addr,
+                "ping: 200 OK"
+            );
+            Ok(())
+        }
+        Ok(Ok(resp)) => {
+            let status = resp.status();
+            tracing::warn!(
+                target: "network::client::ping",
+                peer_id = %peer_id,
+                addr = %peer_addr,
+                status = %status,
+                "ping: non-2xx response"
+            );
+            Err(anyhow::anyhow!("ping: peer {peer_id} returned {status}"))
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "network::client::ping",
+                peer_id = %peer_id,
+                addr = %peer_addr,
+                error = %e,
+                "ping: request error"
+            );
+            Err(anyhow::anyhow!("ping: request failed for {peer_id}: {e}"))
+        }
+        Err(_timeout) => {
+            tracing::warn!(
+                target: "network::client::ping",
+                peer_id = %peer_id,
+                addr = %peer_addr,
+                timeout_ms = PING_TIMEOUT_MS,
+                "ping: timeout"
+            );
+            Err(anyhow::anyhow!(
+                "ping: timeout for peer {peer_id} after {PING_TIMEOUT_MS}ms"
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 单元测试
 // ---------------------------------------------------------------------------
 

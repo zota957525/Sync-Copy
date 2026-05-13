@@ -89,7 +89,8 @@ pub struct FileReq {
 // ---------------------------------------------------------------------------
 
 /// 心跳请求（POST /heartbeat）。
-#[derive(Debug, Deserialize)]
+/// Serialize 用于 client.rs::ping 发起 POST /heartbeat 请求（PR-6b）。
+#[derive(Debug, Deserialize, Serialize)]
 pub struct HeartbeatReq {
     pub origin_device_id: String,
     pub seq: u64,

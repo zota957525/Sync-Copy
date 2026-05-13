@@ -116,6 +116,18 @@ impl ClientPool {
     pub fn is_empty(&self) -> bool {
         self.inner.read().is_empty()
     }
+
+    /// 强制重连后窗口期 cleanup 专用：用于 force_rebuild_connection 的二次校验清理。
+    ///
+    /// 与 `remove` 语义相同，但调用来源不同：
+    /// - `remove`：由 PeerRegistry::remove/ban 内部调用（维护 invariant 3）
+    /// - `remove_for_rebuild`：由 heartbeat_worker::force_rebuild_connection 在
+    ///   client_pool.replace 后发现 peer 已 banned/removed 时调用善后，
+    ///   避免孤立 Client 留在 pool 中（ADR-009 第 4.3 节副作用 #3 窗口期兜底）
+    pub(crate) fn remove_for_rebuild(&self, id: &str) {
+        tracing::debug!(target: "app::client_pool", id = %id, "remove_for_rebuild (post-replace cleanup)");
+        self.inner.write().remove(id);
+    }
 }
 
 impl Default for ClientPool {

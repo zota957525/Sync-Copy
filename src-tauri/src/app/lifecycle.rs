@@ -3,6 +3,7 @@
 //! see decisions/ADR-008-security-review-of-adr003.md (MUST-5 panic hook / fatal 三件套)
 //! see decisions/ADR-009-peer-registry.md (第 3.5 节 / 第 5 节实施提示 #5 启动顺序)
 //! see decisions/ADR-003-project-architecture-skeleton.md (第 3.5 节 lifecycle owner)
+//! see specs/peer-heartbeat.md (第 4 节 AC #8 / 第 1.1 节 隐形掉线)
 //!
 //! PR-3 范围（ADR-010 第 3 节）：
 //! - Phase enum 4 态 + 状态转移
@@ -18,8 +19,9 @@
 //! - step 4 真正 ClipboardWatcher::start（arboard std::thread + mpsc 通道接入）
 //! - step 4 shutdown：ClipboardWatcher::shutdown（100ms 软上限 join）
 //!
-//! 不在本 PR 实现（留 PR-7+）：
-//! - 心跳 / 健康自检业务逻辑（step 6 空 worker 占位）
+//! PR-6b 新增：
+//! - step 6 真正 HeartbeatWorker::start（主动 ping + 隐形掉线检测）
+//! - shutdown step 4 调 HeartbeatWorker::shutdown（500ms deadline）
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,6 +29,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::app::clipboard::ClipboardWatcher;
+use crate::app::heartbeat_worker::HeartbeatWorker;
 use crate::app::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -111,6 +114,12 @@ pub struct Lifecycle {
     /// 使用 parking_lot::Mutex（shutdown 时 take 确保只 shutdown 一次）。
     clipboard_watcher: parking_lot::Mutex<Option<ClipboardWatcher>>,
 
+    /// 心跳 worker + 隐形掉线检测（ADR-010 第 3.6 节 / peer-heartbeat.md 第 4 节 AC #8）。
+    ///
+    /// PR-6b 新增：lifecycle start step 6 构造；shutdown step 4 调 shutdown(500ms)。
+    /// 使用 parking_lot::Mutex（shutdown 时 take 确保只 shutdown 一次）。
+    heartbeat_worker: parking_lot::Mutex<Option<HeartbeatWorker>>,
+
     // --- tracing-appender NonBlocking guard ---
     // 必须是最后字段（Drop 顺序保证 log flush 在所有其他 task drop 后进行）
     // ADR-010 第 3.1 节 + 实施提示 #5 反模式：
@@ -132,6 +141,7 @@ impl Lifecycle {
             health_task: parking_lot::RwLock::new(None),
             server_task: parking_lot::RwLock::new(None),
             clipboard_watcher: parking_lot::Mutex::new(None),
+            heartbeat_worker: parking_lot::Mutex::new(None),
             // log_guard 最后字段（Drop 顺序硬约束）
             log_guard: parking_lot::RwLock::new(None),
         })
@@ -268,30 +278,19 @@ impl Lifecycle {
         }
         tracing::info!(target: "lifecycle", step = 5, port = crate::network::DEFAULT_PORT, "HTTP server started");
 
-        // --- Step 6：health worker spawn（空 worker + cancel token 占位）---
+        // --- Step 6：HeartbeatWorker::start — 心跳 worker + 隐形掉线检测 ---
         // ADR-010 第 3.2 节 step 6：
         //   心跳 worker + 健康自检合并为同一 task；持 health_cancel child token。
-        //   PR-3：spawn 空 worker（cancel token check + sleep loop），真正业务 PR-4/5。
+        //   PR-6b：HeartbeatWorker::start 接替占位 worker，真正实现：
+        //   - 每 5s 主动 ping 所有 Approved peer（spec peer-heartbeat 第 4 节 AC #1）
+        //   - 连续失败 >= 3 → force_rebuild_connection（spec peer-heartbeat 第 4 节 AC #8）
+        //   - 隐形掉线检测：30s 无 broadcast + 15s 无 heartbeat → force_rebuild（第 1.1 节）
         {
-            let cancel_child = self.health_cancel.child_token();
-            let handle = tauri::async_runtime::spawn(async move {
-                // 空 worker 占位：每 5 秒检查 cancel token，满足 ADR-010 第 3.6 节 cancel 机制
-                // PR-4/5 落地时替换为真正的 heartbeat + health-check 逻辑
-                loop {
-                    tokio::select! {
-                        _ = cancel_child.cancelled() => {
-                            tracing::debug!(target: "lifecycle::health_worker", "cancelled, exiting");
-                            break;
-                        }
-                        _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                            tracing::trace!(target: "lifecycle::health_worker", "tick (placeholder)");
-                        }
-                    }
-                }
-            });
-            *self.health_task.write() = Some(handle);
+            let state_arc = Arc::new(state.clone());
+            let worker = HeartbeatWorker::start(state_arc, self.health_cancel.clone());
+            *self.heartbeat_worker.lock() = Some(worker);
         }
-        tracing::debug!(target: "lifecycle", step = 6, "health worker spawned (placeholder)");
+        tracing::info!(target: "lifecycle", step = 6, "heartbeat worker started (PR-6b: ping + hidden-dead detection)");
 
         // --- Step 7：emit app-ready；Phase → Running ---
         // ADR-010 第 3.2 节 step 7：
@@ -375,40 +374,56 @@ impl Lifecycle {
             }
         }
 
-        // --- Step 4：join health_task + clipboard_thread ---
+        // --- Step 4：join heartbeat_worker + clipboard_thread ---
         // ADR-010 第 3.3 节 step 4（health 500ms / clipboard 100ms）
         // 步骤 6 顺序锁：step 6 clear 必须在 step 4 join 完成后才能执行（防 race）
         {
-            let step4_start = Instant::now();
             const HEALTH_JOIN_DEADLINE_MS: u64 = 500;
 
-            let task = self.health_task.write().take();
-            if let Some(handle) = task {
-                // tauri::async_runtime::JoinHandle<T> 实现 Future，Output = tauri::Result<T>
-                let join_result =
-                    tokio::time::timeout(Duration::from_millis(HEALTH_JOIN_DEADLINE_MS), handle)
-                        .await;
-                let actual_ms = step4_start.elapsed().as_millis() as u64;
-                match join_result {
-                    Ok(Ok(())) => {
-                        tracing::debug!(target: "lifecycle", step = 4, actual_ms, "health_task joined");
-                    }
-                    Ok(Err(e)) => {
-                        // tauri::Error（通常封装 tokio JoinError，表示 task panic）
-                        tracing::warn!(target: "lifecycle", step = 4, error = %e, "health_task join error");
-                    }
-                    Err(_timeout) => {
-                        tracing::warn!(
-                            target: "lifecycle",
-                            step = 4,
-                            deadline_ms = HEALTH_JOIN_DEADLINE_MS,
-                            actual_ms,
-                            "shutdown step 4: health_task join timed out"
-                        );
-                        // handle 已被 take()；abort 的 AbortHandle 留 PR-4 存储
+            // PR-6b：HeartbeatWorker::shutdown（500ms deadline，ADR-010 第 3.3 节 step 4）
+            let hb_worker = self.heartbeat_worker.lock().take();
+            if let Some(worker) = hb_worker {
+                let step4_hb_start = Instant::now();
+                worker
+                    .shutdown(Duration::from_millis(HEALTH_JOIN_DEADLINE_MS))
+                    .await;
+                tracing::debug!(
+                    target: "lifecycle",
+                    step = 4,
+                    actual_ms = step4_hb_start.elapsed().as_millis(),
+                    "heartbeat_worker shutdown complete"
+                );
+            } else {
+                // 兼容旧 health_task（非 HeartbeatWorker 路径，如测试中手动设 phase）
+                let task = self.health_task.write().take();
+                if let Some(handle) = task {
+                    let step4_start = Instant::now();
+                    let join_result = tokio::time::timeout(
+                        Duration::from_millis(HEALTH_JOIN_DEADLINE_MS),
+                        handle,
+                    )
+                    .await;
+                    let actual_ms = step4_start.elapsed().as_millis() as u64;
+                    match join_result {
+                        Ok(Ok(())) => {
+                            tracing::debug!(target: "lifecycle", step = 4, actual_ms, "health_task joined");
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(target: "lifecycle", step = 4, error = %e, "health_task join error");
+                        }
+                        Err(_timeout) => {
+                            tracing::warn!(
+                                target: "lifecycle",
+                                step = 4,
+                                deadline_ms = HEALTH_JOIN_DEADLINE_MS,
+                                actual_ms,
+                                "shutdown step 4: health_task join timed out"
+                            );
+                        }
                     }
                 }
             }
+
             // clipboard watcher shutdown（100ms 软上限，ADR-010 第 3.3 节 step 4）
             // PR-6：ClipboardWatcher::shutdown 设 cancel=true + join（内部 100ms 超时 detach）
             let watcher = self.clipboard_watcher.lock().take();
