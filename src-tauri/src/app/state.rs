@@ -3,6 +3,8 @@
 //! see decisions/ADR-009-peer-registry.md (第 3.5 节 / 第 5 节 #5 构造顺序)
 //! see decisions/ADR-003-project-architecture-skeleton.md (第 3.5 节 AppState struct)
 //! see specs/clipboard-text-sync.md (PR-6 arboard 接入 + mpsc 通道真接)
+//! see specs/settings-panel.md (PR-FE-0 Config 持久化)
+//! see specs/history-list.md (PR-FE-0 in-memory HistoryStore)
 //!
 //! 构造顺序（ADR-009 第 5 节 #5 + ADR-010 第 3.2 节 step 3）：
 //!   my_device_id = uuid::Uuid::new_v4().to_string()
@@ -11,10 +13,16 @@
 //!   → Arc<RateLimiter>::new()
 //!   → Arc<Lifecycle>::new()
 //!   → mpsc::sync_channel::<String>(64)  [PR-6 新增：clipboard apply 通道]
+//!   → SharedConfig (Config::load)         [PR-FE-0 新增：config 持久化]
+//!   → Arc<HistoryStore>::new()            [PR-FE-0 新增：in-memory history]
 //!
 //! PR-6 新增：
 //!   - clipboard_apply_tx：std::sync::mpsc::SyncSender<String>（handler 解密后发 plaintext）
 //!   - clipboard_apply_rx：Option<std::sync::mpsc::Receiver<String>>（lifecycle step 4 取走给 watcher）
+//!
+//! PR-FE-0 新增：
+//!   - config：SharedConfig（Arc<Mutex<Config>>，lifecycle step 2 加载）
+//!   - history：Arc<HistoryStore>（in-memory，进程退出即清）
 //!
 //! PR-5b 保留：
 //!   - my_device_id 字段（启动期生成 UUID v4）
@@ -28,6 +36,8 @@ use std::sync::{
 use parking_lot::Mutex;
 
 use crate::app::client_pool::ClientPool;
+use crate::app::config::{load_shared_config, SharedConfig};
+use crate::app::history::HistoryStore;
 use crate::app::lifecycle::Lifecycle;
 use crate::peer::rate_limit::RateLimiter;
 use crate::peer::PeerRegistry;
@@ -86,6 +96,17 @@ pub struct AppState {
     ///
     /// 注意：Receiver 只能被 take 一次；第二次 take 返 None（lifecycle 不会二次 start）。
     pub clipboard_apply_rx: Arc<Mutex<Option<Receiver<String>>>>,
+
+    /// 持久化配置（device_name / listen_port / peer_hint）。
+    ///
+    /// PR-FE-0：lifecycle step 2 加载；commands.rs set_config 保存。
+    /// 使用 Arc<parking_lot::Mutex<Config>>（短持锁，不跨 await）。
+    pub config: SharedConfig,
+
+    /// in-memory 历史列表（进程退出即清，spec 00-product-overview 第 3 节已锁定不持久化）。
+    ///
+    /// PR-FE-0：commands.rs get_history / delete_history_item / clear_history / recopy_history_item 读写。
+    pub history: Arc<HistoryStore>,
 }
 
 impl AppState {
@@ -113,10 +134,16 @@ impl AppState {
         // SECURITY（ADR-011 第 3.5 节）：此 channel 传递剪切板明文，不 tracing 字段。
         let (clipboard_apply_tx, clipboard_apply_rx) = mpsc::sync_channel::<String>(64);
 
+        // PR-FE-0：Config::load（lifecycle step 2 的真正实现）
+        let config = load_shared_config();
+
+        // PR-FE-0：in-memory HistoryStore
+        let history = HistoryStore::new();
+
         tracing::debug!(
             target: "app::state",
             my_device_id = %my_device_id,
-            "AppState::new() constructed (my_device_id + client_pool + peers + rate_limiter + lifecycle + clipboard_apply_channel)"
+            "AppState::new() constructed (my_device_id + client_pool + peers + rate_limiter + lifecycle + clipboard_apply_channel + config + history)"
         );
 
         Self {
@@ -127,6 +154,8 @@ impl AppState {
             lifecycle,
             clipboard_apply_tx: Arc::new(clipboard_apply_tx),
             clipboard_apply_rx: Arc::new(Mutex::new(Some(clipboard_apply_rx))),
+            config,
+            history,
         }
     }
 }

@@ -10,9 +10,15 @@
 //!
 //! PR-6b 新增：
 //! - heartbeat_worker.rs：主动 ping all peers + 隐形掉线检测（peer-heartbeat.md 第 1.1 节）
+//!
+//! PR-FE-0 新增：
+//! - config.rs：Config 持久化（device_name / listen_port / peer_hint）
+//! - history.rs：in-memory 历史列表 store（spec history-list.md MAX_HISTORY=50）
 
 pub mod client_pool;
 pub mod clipboard;
+pub mod config;
 pub mod heartbeat_worker;
+pub mod history;
 pub mod lifecycle;
 pub mod state;

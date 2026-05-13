@@ -557,8 +557,14 @@ async fn test_three_instance_gossip_mesh() {
         .expect("A dial B should succeed (gossip mesh step 1)");
 
     // 确认 A-B 双向已连通
-    assert!(state_a.peers.is_approved(&device_id_b), "A must know B after initial handshake");
-    assert!(state_b.peers.is_approved(&device_id_a), "B must know A after initial handshake");
+    assert!(
+        state_a.peers.is_approved(&device_id_b),
+        "A must know B after initial handshake"
+    );
+    assert!(
+        state_b.peers.is_approved(&device_id_a),
+        "B must know A after initial handshake"
+    );
 
     // --- 步骤 2：C dial B ---
     // B 的 HandshakeResp.peers 此时含 A（B 已知 A Approved）。
@@ -571,8 +577,14 @@ async fn test_three_instance_gossip_mesh() {
         .expect("C dial B should succeed (gossip mesh step 2)");
 
     // C-B 直接握手已确立
-    assert!(state_c.peers.is_approved(&device_id_b), "C must know B after direct handshake");
-    assert!(state_b.peers.is_approved(&device_id_c), "B must know C after direct handshake");
+    assert!(
+        state_c.peers.is_approved(&device_id_b),
+        "C must know B after direct handshake"
+    );
+    assert!(
+        state_b.peers.is_approved(&device_id_c),
+        "B must know C after direct handshake"
+    );
 
     // --- 步骤 3：polling 等待 gossip 异步完成（≤ 5000ms）---
     // gossip 路径是 fire-and-forget spawn，需等待异步任务完成：

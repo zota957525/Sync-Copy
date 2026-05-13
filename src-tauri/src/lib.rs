@@ -25,6 +25,10 @@ pub mod app;
 // PR-4：axum router skeleton + handlers + error 层 + lifecycle step 5 真正 bind
 pub mod network;
 
+// commands module（PR-FE-0 Tauri IPC 命令层）
+// 为前端 UI（PR-FE-1/2/3）提供所有 IPC 命令入口
+pub mod commands;
+
 // ---------------------------------------------------------------------------
 // Tauri 入口（ADR-010 第 3.5 节：panic hook 在最早入口注册）
 // ---------------------------------------------------------------------------
@@ -53,7 +57,21 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
-        .invoke_handler(tauri::generate_handler![quit_app])
+        .invoke_handler(tauri::generate_handler![
+            quit_app,
+            // PR-FE-0：前端 UI 命令（specs: floating-window / settings-panel / history-list / group-approval / group-discovery）
+            commands::get_status,
+            commands::get_peers,
+            commands::join_group,
+            commands::get_config,
+            commands::set_config,
+            commands::approve_peer,
+            commands::reject_peer,
+            commands::get_history,
+            commands::delete_history_item,
+            commands::clear_history,
+            commands::recopy_history_item,
+        ])
         .setup(|app| {
             use tauri::Manager as _;
 
