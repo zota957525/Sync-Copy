@@ -118,7 +118,7 @@
       class="addr-btn"
       onclick={copyAddr}
       aria-label="复制地址"
-      style="color:{copied ? 'var(--color-success)' : COLOR_TEXT_SECONDARY}; font-size:{FONT_SIZE_SECONDARY};"
+      style="color:{copied ? COLOR_TEXT_SUCCESS : COLOR_TEXT_SECONDARY}; font-size:{FONT_SIZE_SECONDARY};"
     >
       {copied ? "已复制" : statusStore.listenAddr}
     </button>
