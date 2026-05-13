@@ -154,3 +154,44 @@ PR-4（v2-9）：IMPL_DONE → REVIEW_PASSED。下游可启 PR-5 决策点。
 ### 8.6 建议主窗口下一步
 
 APPROVED → 不需要回报用户。建议主窗口直接推进 PR-5 决策点（handler happy path / crypto 接入 / qa 集成）；可选派 backend-impl 静默落 8.2 第 1 条（PortBind 真 unwind 时序补丁）作为 PR-5 第一个子任务。
+
+---
+
+## 8. Code Review — PR-7 Gossip Mesh Auto-Expansion / 2026-05-10 commit bacb9d2
+
+**结论**：APPROVED（4 聚焦点全通过；2 条 [低 nit] 不阻塞，建议下批扫尾）
+
+### 8.1 4 聚焦点验证
+
+1. 协议层正确性 — PASS。`PeerStub { device_id, addr }` 最小化（不含 pubkey/aes_key，protocol.rs:60-65）；`HandshakeResp.peers` `#[serde(default)]` 向后兼容（旧端 ≤ PR-6 不送 peers 字段仍能 decode，由集成测试 test_handshake_device_id_not_placeholder 间接覆盖）；`GossipAnnouncePayload` 明文 OK（v2 不要求 announce 加密，ADR-008 未覆盖）。
+2. handshake peers 附加 — PASS。handshake.rs:180-192 `snapshot().filter(p.trust_state == Approved && p.device_id != req.device_id).map(PeerStub{device_id, addr})`，严格 ADR-009 第 3.3 节 trust 互斥（Pending/Banned 不传播）+ 不发请求方自己。snapshot 的 aes_key clone 仅停留栈帧不出 handler（ADR-009 第 3.2 节 P1 合规）。新增 2 单测 handshake_response_includes_approved_peers / excludes_banned_peers_and_requester 覆盖。
+3. /peers/announce 鉴权 — PASS。peers.rs:67-110 严格按 ADR-008 MUST-3 顺序：origin 必须 approved（403 NotInPeers）→ 自连拒（403 DeviceIdConflict）→ banned 拒（403 Banned）→ dedupe 已知 peer（200 不 dial）→ 否则 spawn dial_handshake。所有 403 走 NetworkError 通用 body（不可枚举）。5 单测覆盖（unapproved_origin / self / dedupe / banned / serde_roundtrip）。
+4. 客户端 gossip + broadcast_announce 边界 — PASS。client.rs:36 `GOSSIP_MAX_CONCURRENT=3` + line 444 `.take(3)` 双闸防 cascade；gossip_dial_stub 失败 → 早 return 不写 PeerRegistry/client_pool → 0 zombie state（line 540-606 各失败分支均 return 不 insert）；line 516 spawn-time 二次 dedupe（is_known || is_banned → return）防 race；line 698 注释明示"gossip_dial_stub 不再触发二次 gossip/announce" → cascade 一跳终止。
+
+### 8.2 必修补丁数：0（APPROVED）
+
+无 BLOCKED 项。MUST-3 通用 403 / MUST-7 handshake 限流（handshake.rs 已落地，announce 路径见 8.3 第 1 条）/ ADR-009 trust 互斥 全部合规。复跑：cargo clippy --all-targets -D warnings 0 warning / cargo test --lib 114 pass / cargo test --tests 8 pass / cargo fmt --check 0 diff。生产路径 0 unwrap（所有 unwrap/expect 都在 #[cfg(test)] 之内）。git show bacb9d2 不含 PLAN.md。
+
+### 8.3 新发现 [低 nit]（不阻塞，建议下批扫尾）
+
+- [低 nit #1] handle_peers_announce 注释 / commit message 与代码偏差。peers.rs:59-63 注释写"步骤 1：DoS 限流"但实际**未调用 rate_limiter**（line 63 自承"此处不调 rate_limiter"）；commit message 第 12 行声称"RateLimiter 限流（复用 HandshakeRateLimiter）"与代码不一致。ADR-008 MUST-7 字面仅约束 /handshake 端点，announce 不限流可接受（origin 必须 approved，威胁面较低），但**注释 + commit 描述属虚假陈述**，建议下批 PR 改注释为"announce 不限流（origin 已 approved 门禁兜底）"或真接入 rate_limiter。
+- [低 nit #2] peers.rs:114-124 `Arc::new(state.clone())` 双层 Arc 冗余。`state: Arc<AppState>` 经 axum State 取出后，`state.clone()` 已是 Arc clone（cheap，AppState `#[derive(Clone)]` 且 fat 字段全是 Arc），再用 `Arc::new(...)` 包成 `Arc<Arc<AppState>>` 无功能损害但语义冗余。可简化为 `let state_arc = Arc::clone(&state);` 或直接传 `state.clone()`。同行 124 `state_clone` 命名误导（实际是 `Arc<PeerRegistry>`，与下一行 `state_arc` 名冲）。
+- [低 nit #3] GossipAnnouncePayload.seq 字段定义但 handle_peers_announce **未消费**。protocol.rs:90 注释写"重放保护 seq（同一 origin 的 seq 单调递增）"，但 peers.rs 无 seen_seq_and_update 调用（对比 handle_trust line 195-200 / handle_ban line 248-254 都做了）。威胁面有限（dedupe by is_known 已短路已知 peer），但 spec / DTO 注释与实现不一致——建议下批要么接入 seen_seq_and_update(origin, AadKind::Announce, seq)，要么删 seq 字段或改注释为"v2 占位，暂不验证"。
+
+### 8.4 测试覆盖评估
+
+- cargo test --lib 114 pass（PR-7 新增 7 单测：handshake 侧 2 + peers 侧 5）；cargo test --tests 集成 8 pass（PR-7 修了 HandshakeResp struct literal 加 peers: vec![]）。
+- AC 覆盖：spec 第 4 节 AC #2（N=3 自动 gossip 扩展）在单元层有 announce_already_known_dedupe + handshake_response_includes_approved_peers 间接覆盖；**真三机集成测试缺失**——backend-implementer 自承"留 qa-tester 补"。建议 qa-tester 用 3 个 tokio::spawn 起 3 个 in-process AppState 模拟 A/B/C，验"C dial A 后 5s 内三方均 is_known(全部)"。
+- 边界场景未覆盖：gossip_dial_stub 的 race window（spawn 后另一路径并发 insert 同 peer_id）目前靠 line 516 + line 621 两次 is_known 检查兜底，但**无单测验证 race 场景**——非阻塞，可推迟。
+
+### 8.5 结论
+
+APPROVED → 建议 PLAN.md：PR-7 IMPL_DONE → REVIEW_PASSED。下一步派 qa-tester 补 N=3 gossip 集成测试 + 手测 S2（spec 第 4 节 AC #2）。8.3 三条 [低 nit] 建议主窗口按新策略静默派 backend-impl 一并打小补丁 PR-7a（≤ 30 行），不必停回报用户。
+
+### 8.6 过度工程自查
+
+本 review 段约 70 行（4 聚焦点 + 3 nit + 测试 + 结论），略超 50 行预算 ~40%。可压缩点：8.1 各聚焦点描述可短一档（每点 1 行而非 2-3 行），但权衡"4 聚焦点逐条对应任务原文" → 保留细节便于 implementer 落 nit 时定位。下批 review 段控制在 50 行内。
+
+### 8.7 owner 边界自查
+
+`git status -s` 仅 specs/group-discovery.md 1 行追加变更（追加在文件末尾第 159+ 行）；未触 src-tauri/** / src/** / 任何 ADR / 任何 spec 第 1-7 节 / PLAN.md。owner 边界合规。
