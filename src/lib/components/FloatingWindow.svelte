@@ -3,8 +3,8 @@
    * FloatingWindow — 主浮窗容器
    *
    * 布局（spec floating-window.md 第 6.3 节 wireframe）：
-   *   顶部状态栏 36px（drag-region + StatusDot + 状态文字 + 按钮组）
-   *   中间内容区（历史列表，PR-FE-3 充实；本批占位）
+   *   顶部状态栏 36px（drag-region + StatusDot + 状态文字 + 按钮组：加入 / − / ⚙）
+   *   中间内容区（历史列表 HistoryList / settings）
    *   底部 footer 24px（IP:PORT + 设备名）
    *   brand line 16px
    *
@@ -12,14 +12,22 @@
    *   - ⚙ 按钮切换到 settings view（SettingsPanel 组件）
    *   - main view 中渲染 ApprovalDialog 覆盖层
    *
+   * PR-FE-3 新增：
+   *   - 历史列表区域改为渲染 HistoryList 组件
+   *   - 顶部 − 按钮触发 collapseToBall()（window setSize 48×48）
+   *   - ball view 渲染 FloatingBall；单击 FloatingBall 展开回 window
+   *
    * 视觉（第 6.5 节字典）：
    *   背景 rgba(28,28,32,0.88) + backdrop-filter:blur(20px) + 圆角 10px + 1px 微高亮边
    *
    * 拖拽：data-tauri-drag-region（capabilities/default.json 已含 core:window:allow-start-dragging）
    */
+  import { getCurrentWindow, LogicalSize, currentMonitor, PhysicalPosition } from "@tauri-apps/api/window";
   import StatusDot from "./StatusDot.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import ApprovalDialog from "./ApprovalDialog.svelte";
+  import HistoryList from "./HistoryList.svelte";
+  import FloatingBall from "./FloatingBall.svelte";
   import {
     COLOR_WINDOW_BG,
     COLOR_WINDOW_BORDER,
@@ -36,12 +44,14 @@
   } from "$lib/style/tokens";
   import { statusStore } from "$lib/stores/status.svelte";
   import { approvalStore } from "$lib/stores/approval.svelte";
+  import { historyStore } from "$lib/stores/history.svelte";
 
   // ---------------------------------------------------------------------------
-  // View 状态：main | settings
+  // View 状态：main | settings | ball
   // ---------------------------------------------------------------------------
 
-  let currentView = $state<"main" | "settings">("main");
+  type ViewState = "main" | "settings" | "ball";
+  let currentView = $state<ViewState>("main");
 
   function openSettings(): void {
     currentView = "settings";
@@ -49,6 +59,61 @@
 
   function closeSettings(): void {
     currentView = "main";
+  }
+
+  // ---------------------------------------------------------------------------
+  // 折叠为球 / 展开（floating-ball.md 第 3 节）
+  // ---------------------------------------------------------------------------
+
+  const DEFAULT_EXPANDED = { w: 320, h: 420 };
+  // 记住展开尺寸（不需要 rune，跨函数共享即可）
+  let lastExpandedSize = { ...DEFAULT_EXPANDED };
+
+  async function collapseToBall(): Promise<void> {
+    try {
+      const win = getCurrentWindow();
+      const physical = await win.outerSize();
+      const scale    = await win.scaleFactor();
+      lastExpandedSize = {
+        w: Math.round(physical.width  / scale),
+        h: Math.round(physical.height / scale),
+      };
+      currentView = "ball";
+      await win.setSize(new LogicalSize(48, 48));
+    } catch (e) {
+      // non-fatal：记录但不阻断
+      console.warn("collapseToBall failed:", e);
+    }
+  }
+
+  async function expandFromBall(): Promise<void> {
+    try {
+      const { w, h } = lastExpandedSize.w > 40 ? lastExpandedSize : DEFAULT_EXPANDED;
+      currentView = "main";
+      const win = getCurrentWindow();
+      await win.setSize(new LogicalSize(w, h));
+      // 视口校正：确保窗口在监视器内完全可见
+      const monitor = await currentMonitor();
+      if (monitor) {
+        const pos   = await win.outerPosition();
+        const scale = await win.scaleFactor();
+        const monX = monitor.position.x;
+        const monY = monitor.position.y;
+        const monW = monitor.size.width;
+        const monH = monitor.size.height;
+        const winW = w * scale;
+        const winH = h * scale;
+        const maxX = monX + monW - winW;
+        const maxY = monY + monH - winH;
+        const newX = Math.max(monX, Math.min(pos.x, maxX));
+        const newY = Math.max(monY, Math.min(pos.y, maxY));
+        if (newX !== pos.x || newY !== pos.y) {
+          await win.setPosition(new PhysicalPosition(newX, newY));
+        }
+      }
+    } catch (e) {
+      console.warn("expandFromBall failed:", e);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -88,11 +153,10 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 历史数量（用于 SettingsPanel disabled 判断；PR-FE-3 充实后由 historyStore 提供）
+  // historyCount → SettingsPanel disabled 判断
   // ---------------------------------------------------------------------------
 
-  // 暂时 hardcode 0（PR-FE-3 接入 historyStore 后替换）
-  const historyCount = 0;
+  let historyCount = $derived(historyStore.items.length);
 
   // ---------------------------------------------------------------------------
   // 是否展示审批覆盖层
@@ -110,7 +174,11 @@
   style:border-color={COLOR_WINDOW_BORDER}
 >
 
-  {#if currentView === "settings"}
+  {#if currentView === "ball"}
+    <!-- ---- Ball View ---- -->
+    <FloatingBall onexpand={expandFromBall} />
+
+  {:else if currentView === "settings"}
     <!-- ---- Settings View ---- -->
     <SettingsPanel onclose={closeSettings} {historyCount} />
 
@@ -136,6 +204,15 @@
         >
           加入
         </button>
+        <!-- − 折叠为球按钮（floating-ball spec 第 3 节）-->
+        <button
+          class="btn-icon"
+          style:color={COLOR_TEXT_SECONDARY}
+          onclick={collapseToBall}
+          aria-label="折叠为球"
+        >
+          −
+        </button>
         <!-- ⚙ 设置按钮 -->
         <button
           class="btn-icon"
@@ -153,9 +230,7 @@
 
     <!-- 历史列表区域（相对定位，ApprovalDialog 绝对叠加） -->
     <div class="history-area">
-      <span class="history-empty" style:color={COLOR_TEXT_SECONDARY} style:font-size={FONT_SIZE_SECONDARY}>
-        暂无同步记录
-      </span>
+      <HistoryList />
 
       <!-- 审批弹框覆盖层（仅 main view + 队列非空时显示） -->
       {#if showApproval}
@@ -261,7 +336,7 @@
     transform: scale(0.95);
   }
 
-  /* ⚙ 图标按钮 */
+  /* − / ⚙ 图标按钮 */
   .btn-icon {
     width: 22px;
     height: 22px;
@@ -289,15 +364,8 @@
   /* ---- 历史区域 ---- */
   .history-area {
     flex: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
     overflow: hidden;
     position: relative;
-  }
-
-  .history-empty {
-    text-align: center;
   }
 
   /* ---- 底部 footer ---- */
