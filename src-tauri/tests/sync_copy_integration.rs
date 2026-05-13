@@ -26,9 +26,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sync_copy_lib::app::state::AppState;
+use sync_copy_lib::crypto::AadKind;
 use sync_copy_lib::network::build_router;
 use sync_copy_lib::network::client::{broadcast_clipboard, broadcast_leave, dial_handshake};
-use sync_copy_lib::crypto::AadKind;
 
 // ---------------------------------------------------------------------------
 // 测试辅助函数
@@ -262,10 +262,7 @@ async fn test_invalid_aad_decrypt_rejected() {
         .expect("握手应成功");
 
     // 取 B 侧记录的 A 的 aes_key（B 用来解密 A 发的消息）
-    let peer_a_in_b = state_b
-        .peers
-        .get(&device_id_a)
-        .expect("B 应知道 A");
+    let peer_a_in_b = state_b.peers.get(&device_id_a).expect("B 应知道 A");
     let b_decrypt_key: [u8; 32] = *peer_a_in_b.aes_key;
 
     // 构造：用 A 的 key 加密，但 AAD 使用错误的 seq（B 解密时 AAD 不匹配 → 422）
@@ -283,7 +280,7 @@ async fn test_invalid_aad_decrypt_rejected() {
     // 构造 ClipboardReq（seq 与加密时的 AAD 使用的 seq 不同）
     let req = ClipboardReq {
         origin_device_id: device_id_a.clone(),
-        seq: correct_seq,       // 正确 seq（B 用此 seq 重建 AAD）
+        seq: correct_seq, // 正确 seq（B 用此 seq 重建 AAD）
         kind: "text".to_string(),
         nonce_b64,
         ciphertext_b64,
@@ -371,9 +368,7 @@ async fn test_unknown_peer_clipboard_rejected() {
 /// 确保所有协议字段经 JSON 序列化/反序列化后字节不变。
 #[tokio::test]
 async fn test_protocol_dto_serde_roundtrip() {
-    use sync_copy_lib::network::protocol::{
-        ClipboardReq, HandshakeReq, HandshakeResp, LeaveReq,
-    };
+    use sync_copy_lib::network::protocol::{ClipboardReq, HandshakeReq, HandshakeResp, LeaveReq};
 
     // HandshakeReq round-trip
     let req = HandshakeReq {
@@ -385,26 +380,46 @@ async fn test_protocol_dto_serde_roundtrip() {
     let json = serde_json::to_string(&req).expect("HandshakeReq serialize 应成功");
     let decoded: HandshakeReq =
         serde_json::from_str(&json).expect("HandshakeReq deserialize 应成功");
-    assert_eq!(decoded.device_id, req.device_id, "HandshakeReq.device_id round-trip");
-    assert_eq!(decoded.listen_port, req.listen_port, "HandshakeReq.listen_port round-trip");
+    assert_eq!(
+        decoded.device_id, req.device_id,
+        "HandshakeReq.device_id round-trip"
+    );
+    assert_eq!(
+        decoded.listen_port, req.listen_port,
+        "HandshakeReq.listen_port round-trip"
+    );
 
-    // HandshakeResp round-trip（含 device_name Option 字段）
+    // HandshakeResp round-trip（含 device_name Option 字段 + PR-7 peers 列表）
     let resp = HandshakeResp {
         device_id: "device-b-uuid".to_string(),
         pubkey_b64: "dGVzdHB1YmtleWIy".to_string(),
         device_name: Some("Device B".to_string()),
+        peers: vec![], // PR-7：gossip peers 列表（此测试用空）
     };
     let json = serde_json::to_string(&resp).expect("HandshakeResp serialize 应成功");
     let decoded: HandshakeResp =
         serde_json::from_str(&json).expect("HandshakeResp deserialize 应成功");
-    assert_eq!(decoded.device_id, resp.device_id, "HandshakeResp.device_id round-trip");
-    assert_eq!(decoded.device_name, resp.device_name, "HandshakeResp.device_name round-trip");
+    assert_eq!(
+        decoded.device_id, resp.device_id,
+        "HandshakeResp.device_id round-trip"
+    );
+    assert_eq!(
+        decoded.device_name, resp.device_name,
+        "HandshakeResp.device_name round-trip"
+    );
+    // PR-7：peers 字段 serde roundtrip
+    assert_eq!(
+        decoded.peers.len(),
+        0,
+        "HandshakeResp.peers round-trip (empty)"
+    );
 
     // HandshakeResp 中 device_name=None 时不序列化该字段（skip_serializing_if）
     let resp_no_name = HandshakeResp {
         device_id: "id-x".to_string(),
         pubkey_b64: "key".to_string(),
         device_name: None,
+        peers: vec![], // PR-7
     };
     let json = serde_json::to_string(&resp_no_name).expect("serialize");
     assert!(
@@ -426,7 +441,10 @@ async fn test_protocol_dto_serde_roundtrip() {
         serde_json::from_str(&json).expect("ClipboardReq deserialize 应成功");
     assert_eq!(decoded.seq, clip_req.seq, "ClipboardReq.seq round-trip");
     assert_eq!(decoded.kind, clip_req.kind, "ClipboardReq.kind round-trip");
-    assert!(!decoded.is_snapshot, "ClipboardReq.is_snapshot default false");
+    assert!(
+        !decoded.is_snapshot,
+        "ClipboardReq.is_snapshot default false"
+    );
 
     // LeaveReq round-trip
     let leave_req = LeaveReq {
@@ -434,8 +452,7 @@ async fn test_protocol_dto_serde_roundtrip() {
         seq: 7,
     };
     let json = serde_json::to_string(&leave_req).expect("LeaveReq serialize 应成功");
-    let decoded: LeaveReq =
-        serde_json::from_str(&json).expect("LeaveReq deserialize 应成功");
+    let decoded: LeaveReq = serde_json::from_str(&json).expect("LeaveReq deserialize 应成功");
     assert_eq!(decoded.origin_device_id, leave_req.origin_device_id);
     assert_eq!(decoded.seq, leave_req.seq);
 }
@@ -466,10 +483,7 @@ async fn test_crypto_encrypt_decrypt_roundtrip_and_tamper() {
     let decrypted = sealer
         .decrypt(&key, &nonce_b64, &ciphertext_b64, &aad)
         .expect("decrypt 应成功");
-    assert_eq!(
-        decrypted, plaintext,
-        "decrypt 后明文应与原始明文完全一致"
-    );
+    assert_eq!(decrypted, plaintext, "decrypt 后明文应与原始明文完全一致");
 
     // 篡改 ciphertext（最后一字节取反）— GCM 认证必失败
     use base64::Engine as _;
@@ -538,8 +552,7 @@ async fn test_handshake_device_id_not_placeholder() {
         .expect("A 应通过真实 device_id_b 找到 B");
 
     assert_eq!(
-        peer_b_in_a.device_id,
-        device_id_b,
+        peer_b_in_a.device_id, device_id_b,
         "A 侧记录的 B 的 device_id 应与 B.my_device_id 一致"
     );
     assert_ne!(

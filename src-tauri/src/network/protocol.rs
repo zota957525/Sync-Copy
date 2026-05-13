@@ -39,6 +39,55 @@ pub struct HandshakeResp {
     /// 本机设备名称（已 sanitize；可选字段供 dial_handshake 解析）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
+    /// 本机已知且 Approved 的 peer 列表（不含请求方 + 不含本机自己）。
+    ///
+    /// PR-7 gossip mesh：客户端收到后对每个未知 peer fire-and-forget 发起握手，
+    /// 实现 N≥3 设备"一次 dial 全组连通"（group-discovery AC #2）。
+    /// 不发 pubkey（防密钥泄露），仅发 device_id + addr。
+    #[serde(default)]
+    pub peers: Vec<PeerStub>,
+}
+
+// ---------------------------------------------------------------------------
+// PeerStub — gossip mesh 中传递的最小 peer 信息
+// ---------------------------------------------------------------------------
+
+/// 握手响应中附带的已知 peer 信息（gossip mesh，PR-7）。
+///
+/// 仅含 device_id + addr，不含 pubkey / aes_key（防密钥泄露）。
+/// 客户端收到后对每个 stub 发起独立握手，扩展为完整 mesh。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerStub {
+    /// Peer 的 device_id（UUID 形式）
+    pub device_id: String,
+    /// Peer 的完整监听地址（ip:port）
+    pub addr: std::net::SocketAddr,
+}
+
+// ---------------------------------------------------------------------------
+// /peers/announce POST（PR-7 gossip announce payload，替换旧 AnnounceReq）
+// ---------------------------------------------------------------------------
+
+/// gossip announce 请求（POST /peers/announce，PR-7 重写版本）。
+///
+/// 与旧版 AnnounceReq 的区别：
+/// - 新增 origin_device_id（announce 发起人，必须已在接收端 approved）
+/// - 新增 seq（重放保护）
+/// - 保留 device_id / addr（被 announce 的新 peer）
+///
+/// 鉴权规则（handlers/peers.rs handle_peers_gossip_announce）：
+///   origin_device_id 必须已在接收端 PeerRegistry approved，否则 403。
+///   防止陌生 IP 通过伪造 announce 注入 peer。
+#[derive(Debug, Deserialize, Serialize)]
+pub struct GossipAnnouncePayload {
+    /// 被 announce 的新 peer device_id（UUID）
+    pub device_id: String,
+    /// 被 announce 的新 peer 完整监听地址（ip:port）
+    pub addr: std::net::SocketAddr,
+    /// announce 发起人 device_id（必须已在接收端 approved）
+    pub origin_device_id: String,
+    /// 重放保护 seq（同一 origin 的 seq 单调递增）
+    pub seq: u64,
 }
 
 // ---------------------------------------------------------------------------

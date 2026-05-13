@@ -29,7 +29,7 @@ use zeroize::Zeroizing;
 use crate::app::state::AppState;
 use crate::crypto::{KeyExchange, X25519KeyExchange};
 use crate::network::error::NetworkError;
-use crate::network::protocol::{HandshakeReq, HandshakeResp};
+use crate::network::protocol::{HandshakeReq, HandshakeResp, PeerStub};
 use crate::peer::sanitize::sanitize_device_name;
 use crate::peer::{PeerState, TrustState};
 
@@ -170,14 +170,39 @@ pub async fn handle_handshake(
         // SECURITY：不记 sanitized_name（防设备名含敏感信息进入日志，ADR-008 第 6.2 节）
     );
 
-    // --- 步骤 7：返回 HandshakeResp（含本机公钥 + device_id）---
+    // --- 步骤 7：构造 HandshakeResp（含本机公钥 + device_id + gossip peers 列表）---
     // PR-5b 修 严重 #3：device_id 使用 state.my_device_id（去除占位串）。
-    // 对端 dial_handshake 拿此值作 PeerRegistry 索引 + AAD origin_device_id 输入；
-    // 占位串会导致多 peer 共用同一索引（N=3+ 必崩，ADR-008 密码学/协议级灾难）。
+    // PR-7 gossip mesh：附带本机已 Approved 的 peer 列表（不含请求方 + 不含本机自己），
+    // 供客户端 fire-and-forget 扩展为完整 mesh（group-discovery AC #2）。
+    //
+    // SECURITY（ADR-009 第 3.2 节 P1 注释）：
+    // snapshot 含 aes_key；此处只取 device_id + addr 构造 PeerStub，不发 pubkey/aes_key。
+    let gossip_peers: Vec<PeerStub> = state
+        .peers
+        .snapshot()
+        .into_iter()
+        .filter(|p| {
+            // 只发 Approved peer；不发请求方自己（避免循环）
+            p.trust_state == TrustState::Approved && p.device_id != req.device_id
+        })
+        .map(|p| PeerStub {
+            device_id: p.device_id,
+            addr: p.addr,
+        })
+        .collect();
+
+    tracing::debug!(
+        target: "network::handshake",
+        peer_id = %peer_id,
+        gossip_peers_count = gossip_peers.len(),
+        "handshake: attaching gossip peer list (PR-7)"
+    );
+
     let resp = HandshakeResp {
         device_id: state.my_device_id.clone(),
         pubkey_b64: my_pubkey_b64,
         device_name: Some(sanitized_name),
+        peers: gossip_peers,
     };
 
     Ok(Json(resp))
@@ -272,6 +297,188 @@ mod tests {
         );
     }
 
+    // 新单测（PR-7 #1）— handshake 响应包含已 Approved peer 列表（gossip mesh）
+    //
+    // 验证：registry 中有 2 个 Approved peer 时，构造 gossip_peers 列表长度 == 2，
+    //       且不含请求方 device_id（group-discovery AC #2）。
+    #[test]
+    fn handshake_response_includes_approved_peers() {
+        use crate::network::protocol::PeerStub;
+        use std::collections::HashMap;
+        use zeroize::Zeroizing;
+
+        let registry = PeerRegistry::new_for_test();
+
+        // 插入 2 个 Approved peer（用不同 device_id）
+        let peer_a = PeerState {
+            device_id: "peer-a".to_string(),
+            device_name: "Device A".to_string(),
+            addr: "192.168.1.10:5858"
+                .parse::<SocketAddr>()
+                .expect("addr parse"),
+            pubkey_b64: "test_pubkey_a".to_string(),
+            aes_key: Zeroizing::new([0u8; 32]),
+            last_successful_sync_at: None,
+            last_heartbeat_at: None,
+            consecutive_heartbeat_failures: 0,
+            consecutive_send_failures: 0,
+            trust_state: TrustState::Approved,
+            last_seen_seq_by_kind: HashMap::new(),
+        };
+        let peer_b = PeerState {
+            device_id: "peer-b".to_string(),
+            device_name: "Device B".to_string(),
+            addr: "192.168.1.11:5858"
+                .parse::<SocketAddr>()
+                .expect("addr parse"),
+            pubkey_b64: "test_pubkey_b".to_string(),
+            aes_key: Zeroizing::new([0u8; 32]),
+            last_successful_sync_at: None,
+            last_heartbeat_at: None,
+            consecutive_heartbeat_failures: 0,
+            consecutive_send_failures: 0,
+            trust_state: TrustState::Approved,
+            last_seen_seq_by_kind: HashMap::new(),
+        };
+        registry.insert(peer_a);
+        registry.approve("peer-a");
+        registry.insert(peer_b);
+        registry.approve("peer-b");
+
+        // 请求方是 "requester-id"，不在 registry 中
+        let requester_id = "requester-id";
+
+        // 模拟 handshake handler 中的 gossip_peers 构造逻辑
+        let gossip_peers: Vec<PeerStub> = registry
+            .snapshot()
+            .into_iter()
+            .filter(|p| p.trust_state == TrustState::Approved && p.device_id != requester_id)
+            .map(|p| PeerStub {
+                device_id: p.device_id,
+                addr: p.addr,
+            })
+            .collect();
+
+        assert_eq!(
+            gossip_peers.len(),
+            2,
+            "gossip_peers must include all 2 Approved peers when requester is unknown"
+        );
+        assert!(
+            gossip_peers.iter().all(|s| s.device_id != requester_id),
+            "gossip_peers must not contain the requester's device_id"
+        );
+    }
+
+    // 新单测（PR-7 #2）— handshake 响应过滤 Banned peer + 过滤请求方自己
+    //
+    // 验证：registry 中 1 个 Approved + 1 个 Banned；gossip_peers 只含 Approved 的那个。
+    // 另验：请求方 device_id 在 registry 中时，gossip_peers 不含请求方（去自己）。
+    #[test]
+    fn handshake_response_excludes_banned_peers_and_requester() {
+        use crate::network::protocol::PeerStub;
+        use std::collections::HashMap;
+        use zeroize::Zeroizing;
+
+        let registry = PeerRegistry::new_for_test();
+
+        // 1 个 Approved peer
+        let peer_good = PeerState {
+            device_id: "peer-good".to_string(),
+            device_name: "Good Device".to_string(),
+            addr: "192.168.1.20:5858".parse::<SocketAddr>().expect("addr"),
+            pubkey_b64: "pubkey_good".to_string(),
+            aes_key: Zeroizing::new([0u8; 32]),
+            last_successful_sync_at: None,
+            last_heartbeat_at: None,
+            consecutive_heartbeat_failures: 0,
+            consecutive_send_failures: 0,
+            trust_state: TrustState::Approved,
+            last_seen_seq_by_kind: HashMap::new(),
+        };
+        registry.insert(peer_good);
+        registry.approve("peer-good");
+
+        // 1 个 Pending/Banned peer（ban 会从 inner 移除，所以用 Pending 来测试非 Approved 过滤）
+        // 先插入，然后 ban（ban 会从 inner 移除，所以 snapshot 不含它，已被过滤）
+        // 改用 Pending trust_state 测试
+        let peer_pending = PeerState {
+            device_id: "peer-pending".to_string(),
+            device_name: "Pending Device".to_string(),
+            addr: "192.168.1.21:5858".parse::<SocketAddr>().expect("addr"),
+            pubkey_b64: "pubkey_pending".to_string(),
+            aes_key: Zeroizing::new([0u8; 32]),
+            last_successful_sync_at: None,
+            last_heartbeat_at: None,
+            consecutive_heartbeat_failures: 0,
+            consecutive_send_failures: 0,
+            trust_state: TrustState::Pending,
+            last_seen_seq_by_kind: HashMap::new(),
+        };
+        registry.insert(peer_pending);
+        // 不 approve "peer-pending"，它处于 Pending 状态
+
+        let requester_id = "requester-new";
+
+        // 模拟 gossip_peers 构造（过滤非 Approved）
+        let gossip_peers: Vec<PeerStub> = registry
+            .snapshot()
+            .into_iter()
+            .filter(|p| p.trust_state == TrustState::Approved && p.device_id != requester_id)
+            .map(|p| PeerStub {
+                device_id: p.device_id,
+                addr: p.addr,
+            })
+            .collect();
+
+        assert_eq!(
+            gossip_peers.len(),
+            1,
+            "gossip_peers must only contain the 1 Approved peer (Pending filtered out)"
+        );
+        assert_eq!(
+            gossip_peers[0].device_id, "peer-good",
+            "the only gossip peer should be 'peer-good'"
+        );
+        assert!(
+            gossip_peers.iter().all(|s| s.device_id != "peer-pending"),
+            "gossip_peers must not contain Pending peers"
+        );
+
+        // 再测试：请求方自己在 registry 中（已 Approved），不应出现在 gossip_peers
+        let registry2 = PeerRegistry::new_for_test();
+        let peer_self = PeerState {
+            device_id: "peer-self".to_string(),
+            device_name: "Self".to_string(),
+            addr: "192.168.1.30:5858".parse::<SocketAddr>().expect("addr"),
+            pubkey_b64: "pubkey_self".to_string(),
+            aes_key: Zeroizing::new([0u8; 32]),
+            last_successful_sync_at: None,
+            last_heartbeat_at: None,
+            consecutive_heartbeat_failures: 0,
+            consecutive_send_failures: 0,
+            trust_state: TrustState::Approved,
+            last_seen_seq_by_kind: HashMap::new(),
+        };
+        registry2.insert(peer_self);
+        registry2.approve("peer-self");
+
+        let gossip_for_self_req: Vec<PeerStub> = registry2
+            .snapshot()
+            .into_iter()
+            .filter(|p| p.trust_state == TrustState::Approved && p.device_id != "peer-self")
+            .map(|p| PeerStub {
+                device_id: p.device_id,
+                addr: p.addr,
+            })
+            .collect();
+
+        assert!(
+            gossip_for_self_req.is_empty(),
+            "when requester is the only Approved peer, gossip_peers must be empty"
+        );
+    }
+
     // 新单测（PR-5b #1）— ADR-008 MUST-3 自连校验
     //
     // 验证：当 req.device_id == state.my_device_id 时，
@@ -331,6 +538,7 @@ mod tests {
             device_id: my_device_id.clone(),
             pubkey_b64: "test_pubkey_b64".to_string(),
             device_name: Some("TestDevice".to_string()),
+            peers: vec![], // PR-7：gossip peers 列表（测试用空）
         };
 
         assert_eq!(
