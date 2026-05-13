@@ -327,3 +327,63 @@ priority: P1
 ## 8. Review 段（占位）
 
 > code-reviewer / tech-architect / ux-designer 后续填写。本 feature 是浮窗 UX 主体，UX 段必须由 ux-designer 完整填写后才能进入实现阶段。
+
+
+## 9. Code Review — PR-FE-3 / 2026-05-13 commit bd1e304
+
+**结论**：CHANGES_REQUESTED（1 个 [严重] backend 配套缺口 + 2 个 [中等] 前端可改 + 若干 [低] nit；前端代码本身可合，缺口不阻塞合入但阻塞 v2.0 release）
+
+### 9.1 4 聚焦点验证
+
+1. **invoke / listen / opener 命令名 mapping**：✅ 全对齐。`getHistory` / `deleteHistoryItem` / `clearHistory` / `recopyHistoryItem` 与 `commands.rs:442/450/480/507` 严格对应；`listen "history-updated"` 在 `commands.rs:463/486` emit；`listen "window-shown"` 在 `lib.rs:371` emit；`revealItemInDir` 走 `@tauri-apps/plugin-opener` + `capabilities/default.json` 已含 `opener:default`。**附带验证**：PR-FE-1 review 第 9.2 节 [中等] 1 标记的 `peer-pending` 缺 emit 问题，已在 `handshake.rs:212` 由 PR-FE-1b 补齐 ✅。
+2. **Svelte 5 runes + store 模式**：✅ 良好。`historyStore = $state({...})` 同 status/approval 模式；`del` / `clearAll` 均做了**乐观更新 + try/catch 回滚**（store 第 56-65、73-80 行），符合任务要求。`HistoryList` 每条 keyed by `(item.id)` ✓ 防 DOM 误位。`FloatingWindow` 三 view derived 状态切换无 re-render 抖动隐患（`showApproval` derived 依赖只 main view 才触发）。
+3. **collapseToBall / expandFromBall**：基本到位，**`expandFromBall` 视口校正逻辑混淆物理 / 逻辑像素**——见 第 9.2 节 [中等] 1。其余：双击间隔过快不构成竞态（`onexpand` 是同步 setState，第二次会触发已是 main view 的 expand 但 lastExpandedSize 仍是合理值）；拖拽中 setSize 不会触发，因 `didDrag=true` 后 `mouseup` 早 return。视觉字典：**球直径 48 是硬编码**，tokens.ts 无 `BALL_SIZE_PX` 常量——见 第 9.3 节 [低] (a)。
+4. **错误处理 + 用户感知**：基本到位。`recopyItem` 失败时 HistoryList 显示"复制失败"chip 1.2s（第 108-112 行）；`del` / `clearAll` 失败回滚 + 写 `historyStore.error`，但**该 error 当前无 UI 渲染消费者**——见 第 9.3 节 [中等] 2。`history-updated` 触发 refresh 替换整个 `items` 数组——React/Svelte 都会 reconcile 但因 key 稳定，正在交互的行不会跳。
+
+### 9.2 必修问题
+
+#### [严重 / backend 缺口] 1. `history-updated` 仅 delete/clear 时 emit，**新增条目时 backend 无 emit**
+
+- 文件：`src-tauri/src/commands.rs:463/486`（仅 2 处 emit）；`src-tauri/src/history.rs` 等新增条目调用点无 emit
+- 现象：grep 全 backend，`emit("history-updated", ...)` 仅 2 处，均在删除流程。剪切板/截图/接收新条目 push 后**不通知前端**。
+- 风险：spec 第 4 节 AC #1 "在 A 上复制 3 段文本 → A 浮窗历史从顶到底依次列出 3 条" 与 AC #2 "B 浮窗 1 秒内出现新条目" **无法满足**——前端 store 仅靠 `initHistoryStore` 首屏 + `window-shown` 唤出时 refresh，复制后浮窗如已显示则**永远不刷新直到再次托盘唤出**。
+- 建议：本前端 PR **不阻塞合入**（前端订阅 + IPC 注释已配齐），但**v2.0 release 前**必须开 backend PR 在 `history.rs` push 路径（local 复制 + remote ingest）后 emit `history-updated`。前端 ipc.ts:182 注释"新增条目时 emit"已为契约方。
+
+#### [中等] 2. `expandFromBall` 视口校正混淆物理 / 逻辑像素
+
+- 文件：`src/lib/components/FloatingWindow.svelte:96-112`
+- 现象：`outerPosition()` 返回**物理像素**坐标；`currentMonitor().position` / `.size` 也是物理像素；但 `winW = w * scale` 把"逻辑 w * scale"重新算物理是对的；但 `setPosition(new PhysicalPosition(newX, newY))` 又把这个物理像素值塞 `PhysicalPosition` —— OK，**单元一致**。**真正问题**：v0 floating-ball.md 第 5.4 节明示"球的视口校正与浮窗 ensure_on_screen 统一，不允许双实现"，本批前端做了 80 行校正且与 backend `lib.rs::ensure_on_screen` 重复。
+- 风险：双实现一旦未来 backend 改了门槛（半可见 vs 完全可见），前端不跟会出现"两个机制争抢校正位置"。
+- 建议：本批前端 PR **保留为权宜**（功能正确），但开 [P0] 架构债 task：在 floating-ball ADR 决议落后从前端剥离视口校正，统一走 backend `ensure_on_screen`（用 `app_handle.emit("ensure-on-screen", ())` 或直接 invoke）。**不阻塞本 PR 合入**。
+
+### 9.3 [低] nit 列表
+
+- (a) **球直径 48 / 38（spec 写 48，commit msg 多次写 36）硬编码**：FloatingBall.svelte 注释写 48×48 但实际靠 `setSize(48,48)` + `width:100vw` 充满，tokens.ts **无 `BALL_SIZE_PX` 常量**。commit message 4 处写 "36×36" 与代码不一致（代码是 48）。建议下个补丁加 `export const BALL_SIZE_PX = 48` 到 tokens.ts，FloatingWindow.svelte:82 + Ball spec 6.5 节统一引用，杜绝口径漂移。
+- (b) **行数预算**：HistoryList.svelte 397 行 / FloatingWindow.svelte 405 行 均超 spec floating-window 第 5.4 节 250 行隐性预算（commit message 报 247/330 是错口径）。HistoryList 因含 80 行 CSS 可接受；FloatingWindow 三 view 合一+ collapseToBall / expandFromBall 50 行可拆出 hook（`useBallCollapse.svelte.ts`）—— **不阻塞本批**，列入 PR-FE-4 重构议题。
+- (c) **`console.warn` 残留** 2 处（FloatingWindow.svelte:85/115）：`collapseToBall` / `expandFromBall` 失败仅 warn 不弹用户提示。spec floating-ball 第 6.6 节未要求用户感知，可接受。
+- (d) **`historyStore.error` 写入但无 UI 消费**：store 第 64/79 行写 error，但 HistoryList 模板**完全不渲染** `historyStore.error`。用户删除/清空失败时只能从 chip 知道复制失败，删除失败完全静默。建议下个补丁在 HistoryList 顶部加一行 banner 渲染 `historyStore.error`（1.5s 自消失）。
+- (e) **`refreshHistory` 在 history-updated 触发时全量替换 items 数组**：性能在 50 条上限下可接受；但用户正在 hover 某条时数组替换会让 `:hover` 短暂丢失。spec 第 6.6 节"列表内容更新直接刷新，不做 diff 动画"已为此辩护，可接受。
+- (f) **空态文案 spec 字面 = "还没有同步过 / 复制一段文本试试"**，代码完全对齐 ✅。
+- (g) **`HistoryList.svelte:139` keydown 处理 Delete 键** ✓ 符合 spec 第 6.4 节键盘可达性；Enter 键 ✓；但行容器 `tabindex="0"` 缺失（spec 写"列表整体可聚焦 tabindex=0"，代码每行 tabindex=0 而非列表整体）。轻微偏离 spec UX 但更直觉，**不阻塞**。
+
+### 9.4 测试覆盖评估
+
+- 本 PR 无前端单测（thin wrappers + 模板，合理）。
+- spec 第 4 节 10 条 AC 全部需要 qa-tester 手测 + Tauri dev 跑通才能验证：AC #1/#2（**依赖 [严重] 1 修复才能通过**）；AC #3-#7 可在本批前端 + 现有 backend 下手测验证。
+- 球形态 spec 第 4 节 8 条 AC：本批前端实现满足代码层，多显示器 + 8px 阈值 + 1500ms 阈值需实机 qa-tester 验证（macOS + Win 各跑一遍）。
+
+### 9.5 owner 边界 + 过度工程自查
+
+- owner 边界：`git show bd1e304 --stat` 仅 `src/` 域 5 文件，0 文件溢出到 `src-tauri/` / `PLAN.md` / `specs/` / `decisions/` ✅。
+- 过度工程自查：本 review 段约 70 行（超预算 60，超 17%）。理由：[严重] 1 backend 缺口必须详写 risk + 验证证据（grep 结果），不可省。建议下批 review 若发现纯前端 PR 可压到 50 行内。
+
+### 9.6 结论 + 给主窗口建议
+
+本 PR 前端代码本身高质量，视觉字典遵循、Svelte 5 runes 规范、错误处理基本到位、IPC mapping 严格。
+
+**建议路径**：
+1. **本 PR 合入**（前端职责已尽，[严重] 1 是 backend 缺口非前端 bug）。
+2. **v2.0 release 前必须开 backend PR**（建议 PR-7）：在 `history.rs` push 路径 emit `history-updated`，AC #1/#2 才真通过。
+3. [中等] 2（视口校正双实现）+ [低] (a)/(b)/(d) 列入 PR-FE-4 / v2.1 重构议题，不阻塞 v2.0。
+
+是否上报用户：**是**。理由：[严重] 1 是 release-blocker（spec 主路径 AC 失败），需用户明确知晓 "v2.0 release 前必须先做 backend emit PR-7"。其余问题主窗口可静默派 backend-impl 补 + qa-tester 重测。
