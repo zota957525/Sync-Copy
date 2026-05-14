@@ -97,6 +97,8 @@ sync-copy/
 | ❌ 让 agent A 调 agent B | 任何跨 agent 协作都通过主窗口编排，不允许嵌套调用 |
 | ❌ "我帮你直接改一下吧" | 哪怕是一行 typo 也走对应的 implementer，保持职责洁净 |
 | ❌ 依赖会话历史做关键决策 | 必须先 Read 相关文件，记不全的状态全部以**磁盘文件**为准 |
+| ❌ **执行任何 git 写操作**（commit / tag / push / reset / revert / rebase / merge / cherry-pick / clean / restore 等任何写 `.git/objects` 或改 refs 的命令） | **仅生成命令草稿交用户执行**；ADR-012（2026-05-10）— v2.0 期间 33 次默许执行累积为 v5-1 错位，硬规则化避免再犯。**只读** git 命令（status / log / diff / show）可执行 |
+| ❌ **调用 git-keeper agent** | git-keeper（`.claude/agents/git-keeper.md`）仅由**用户**直接调用（"用 git-keeper X"/"@git-keeper"）；主窗口禁止编排或代用户调用。ADR-013（2026-05-14）。git-keeper 自身含来源校验，主窗口派单将被拒绝并报告错位 |
 
 ### 4.3 例外（小事不绕路）
 
@@ -104,7 +106,10 @@ sync-copy/
 - 用户问"上次为什么决定 X？" → 主窗口读对应 ADR 直接答
 - 用户给的指令明显是问候/讨论，未涉及代码或文档变更 → 主窗口直接对话
 
+> **例外不含 git 写操作**（ADR-012）。即使是"读 PLAN.md 答状态"等小事，git 写命令也必须停下给用户执行。
+
 判断准则：**有文件要写/改吗？有文件要写/改 → 调对应 agent；没有 → 主窗口自己答**。
+**git 写操作特例**：即使主窗口有写 PLAN.md / decisions/ / docs/handoff-lessons-learned.md 权限，把这些改动 commit 到 git 仍属用户操作。
 
 ---
 
@@ -114,6 +119,15 @@ sync-copy/
 - **读**：specs/、decisions/、PLAN.md、TEAM.md、CLAUDE.md，以及其它**与本职相关**的文件
 - **写**：自己 owns 的目录/文件（见各 agent 的 prompt 中"输出"段）
 - **调用**：除 Read/Write/Edit/Glob/Grep/Bash 外，**禁止**调用 `Agent` 工具去启动其它 agent
+
+### 5.1 git-keeper 例外（ADR-013，2026-05-14）
+
+`.claude/agents/git-keeper.md` 是**唯一**对调用方有 hard restriction 的 agent：
+- ✅ 只接受**用户**在 prompt 中显式命名调用（"用 git-keeper X"/"@git-keeper"/"调 git-keeper"）
+- ❌ 拒绝主窗口派单（主窗口若编排 git-keeper → git-keeper 报告 v5-1 错位 + 不执行）
+- ❌ 拒绝其他 agent 派单（agent 间不互相调用，此条本已含于上面"禁止调用 Agent 工具"）
+
+git-keeper 是 git 写操作的**唯一**执行入口（ADR-012 + ADR-013 双保险）。
 
 agent 之间的"沟通"机制 = **磁盘文件 + PLAN.md 的状态字段**：
 

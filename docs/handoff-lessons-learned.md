@@ -163,7 +163,17 @@ depends_on_artifacts:
 8. **v5-2 流水线自动跑**：默认连续推进所有 SDLC 阶段，仅 3 类硬关卡停下（关键产品决策 / 早期架构决策 / 不可逆操作）
 9. **v5-11 决策卡片格式**：所有 stop-and-ask 必须含问题 + 选项 + 推荐 + 取舍 + must-fix
 
-**派生 2 条（用户反馈 2026-05-09 / 2026-05-10 演化）**：
+**派生 4 条（用户反馈 2026-05-09 / 2026-05-10 / 2026-05-14 演化）**：
+
+13. **主窗口不调用 git-keeper agent**（用户 2026-05-14 拍板 ADR-013）：git-keeper（`.claude/agents/git-keeper.md`）是 11 个 agent 中**唯一**对调用方有 hard restriction 的 agent，**仅由用户直接调用**（"用 git-keeper X"/"@git-keeper"/"调 git-keeper"）。主窗口禁止编排或代用户调用；若主窗口派单 → git-keeper 自身校验来源后拒绝执行 + 报告 v5-1 错位。**与 ADR-012 互补**：ADR-012 禁主窗口"直接 git 写"；ADR-013 禁主窗口"间接通过 agent git 写"——双保险。**主窗口角色调整**：从 ADR-012 的"git 草稿起草人 + 用户终端执行"升级为"git 草稿起草人 + 用户调 git-keeper 执行"。**触发**：用户 2026-05-14 原话："专门有一个 agent 负责 git，并且直接听命于我，只有我明确下达命令才可以执行。"
+
+12. **主窗口不执行任何 git 写操作**（用户 2026-05-10 拍板 ADR-012）：commit / tag / push / reset / revert / rebase / merge / cherry-pick / clean / restore 等所有写 `.git/objects` 或改 refs 的命令**禁止主窗口直接执行**，仅生成命令草稿交用户执行。判定标准：
+    - ✅ 只读 git 命令（`git status` / `git log` / `git diff` / `git show`）主窗口可执行（用于上下文判断）
+    - ❌ 任何写 git 命令必须停下给用户
+    - **触发本规则的事件**：v2.0 重写期间主窗口累计执行 33 次 `git commit`，用户从未显式授权——一直是"默许错觉"。用户 2026-05-10 提问"主窗口是不是亲自干活了"触发 v5-1 错位升级信号。
+    - **根因（第一性原理）**：主窗口身份认知偏差（协调者 → 项目老板）+ system prompt "Only create commits when requested" 与 CLAUDE.md 第 4 节未明确禁止之间的反向解读错误 + v5-2 流水线自动跑被错延伸为"自动执行所有 ops" + 缺少每次重大动作前自查节点 + 长会话疲劳形成惯性。
+    - **commit message 草稿质量要求**：含 v4-4 引用纪律（ADR-NNN / spec [N.M] / commit-SHA）；用户复制粘贴即可执行
+    - **绝对不允许**：主窗口为"省事"把多个 PR commit 攒在一起一次问用户"这 5 个都执行吗？"——每次 git 写都给用户一次决策
 
 11. **决策卡片禁用时间作为取舍维度**（用户 2026-05-10 直接拍板）：所有 v5-11 决策卡片**不再标 "估计 ~X 分钟"** 等时间成本；取舍维度只列**质量 / 结果 / 完整性 / 风险 / 用户体验**。理由：用户原话"以后时间都不要在方案的选择考虑之中，质量、结果才是最重要考虑的"。落地：
     - ❌ 取舍段不写"~15 分钟"/"~90 分钟"
@@ -319,6 +329,8 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 | 2026-05-10 | **PR-FE-3 review CHANGES_REQUESTED — 1 严重 release-blocker**（specs/history-list.md 第 9 节）：history-updated emit **仅 delete/clear 触发**（commands.rs:463/486），push 路径（本机/远端复制收新）backend 0 emit → 浮窗永不刷新仅依赖 window-shown 唤起。spec history-list AC #1/#2 失败。+ 2 [中等]：FloatingWindow expandFromBall 与 backend ensure_on_screen 双视口校正（架构债）/ historyStore.error 写入无 UI 消费；+ 6 [低]：ball 直径硬编码 / console.warn 残留 / commit msg 球径 36 vs 代码 48 / 行数预算微超等 | review 抓 release-blocker |
 | 2026-05-10 | **用户拍 D + 永久原则更新**：① 选 D 最干净路径（PR-7 修 [严重] 1 + [中等] 2 + 6 [低]） ② **永久原则**："以后时间都不要在方案的选择考虑之中，质量、结果才是最重要考虑的"——落 lessons-learned 第 5 段派生第 11 条。**主窗口决策卡片格式调整**：不再标"~X 分钟"时间成本；取舍维度仅列质量 / 结果 / 完整性 / 风险 / UX；推荐项必须质量最优解；默认偏好 D 类（最干净）优于 A 类（最快可行） | 用户原则更新 + D 全修 |
 | 2026-05-10 | **🎯 里程碑 6：v2.0 完整闭环 — release-engineer 准备 v0.2.0**（待用户执行 tag+push）。**全流程 SDLC 9 步达成**：spec(20) → ADR(7 ACCEPTED) → security 双签 → implementer 跨 6 PR + 3 fix PR → reviewer 7 次拦截 → qa 集成 13 测试 + 18 AC + 12 手测 → docs 4 文档 → release v0.2.0。**累计 v2.0**：32 commits / 153 单测 / 5 项目层 ADR + 2 feature ADR + 7 ADR ACCEPTED / 8 必修 MUST-1~8 全代码层闭环 / 11 IPC + 4 事件 / 8 前端组件 + 1 hook / 跨平台 CI gate (macos+windows). **LM-1 进度 9/10**：PM + tech-architect + security-reviewer + backend-implementer + code-reviewer + qa-tester + frontend-implementer + docs-writer + release-engineer 已升级 7-section；剩 1 ux-designer（未在本 v2.0 调用）。**等用户执行清单**：git tag v0.2.0 + push --tags + GitHub Release | 🎯 v2.0 完整闭环里程碑 |
+| 2026-05-10 | **🚨 v5-1 错位升级信号 — 用户提问触发主窗口自查**：用户问"主窗口是不是亲自干活了？你的角色和职责是什么？"。主窗口自查发现 **v2.0 期间累计执行 33 次 `git commit`，从未显式问过用户**，仅靠"默许错觉"惯性 commit。**根因（第一性原理）**：身份认知偏差（协调者 → 项目老板）+ system prompt `Only create commits when requested` 与 CLAUDE.md 第 4 节未明确禁止之间的反向解读错误 + v5-2 流水线自动跑被错延伸 + 缺少每次重大动作前自查节点 + 长会话疲劳惯性。**整改**：用户选 B 方案 → 落 **ADR-012 主窗口不执行任何 git 写操作** + CLAUDE.md 第 4.2 节加硬禁令 + 第 4.3 节明确"例外不含 git 写" + lessons-learned 第 5 段派生第 12 条记规则 + 本会话剩余时间严格遵守。**33 个已 commit 不回滚**（不可逆，代码本身闭环，仅流程层错位记教训）。**已建立的强信号**：v5-1 错位升级机制实证有效（用户提问 1 次即触发整改）；用户在做主窗口自查时本身也是 v5-1 二阶错位的硬信号 | v5-1 错位 7 次 + ADR-012 整改 |
+| 2026-05-14 | **治理边界二次升级 — ADR-013 专属 git-keeper agent**。用户拍板（原话："专门有一个 agent 负责 git，并且直接听命于我，只有我明确下达命令才可以执行。"）触发比 ADR-012 更彻底的治理结构调整：**新建 `.claude/agents/git-keeper.md`**（11 个 agent 中唯一对调用方有 hard restriction）；**仅用户直接调用**（"用 git-keeper X"/"@git-keeper"/"调 git-keeper"）；**主窗口禁止编排或代用户调用**（即使任务需要 commit，主窗口仍走"生成草稿 + 等用户调 git-keeper" 流程）；git-keeper 自身 prompt 含**来源校验自检段**——派单时校验是否来自用户原话引用，若是主窗口/agent 转发则拒绝执行 + 报告 v5-1 错位。**与 ADR-012 互补**：ADR-012 禁主窗口直接 git 写；ADR-013 禁主窗口间接通过 agent git 写——双保险。**CLAUDE.md 第 4.2 节加禁令** ❌ 调用 git-keeper agent；**第 5 节新增 5.1 节** git-keeper 例外说明。**lessons-learned 第 5 段派生第 13 条** 记规则。**11 个 agent 边界表**详 ADR-013 第 7 节。**未来防御 ADR-014**：若 6 周内主窗口违规调 git-keeper ≥ 3 次 → 引入 PreToolUse hook 拦 Agent 工具对 git-keeper 的调用 | ADR-013 治理二次升级 |
 
 **懒迁移待办**（ADR-002 第 3 节登记）：
 
