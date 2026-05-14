@@ -29,7 +29,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.3.1
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -37,22 +37,22 @@ jobs:
           targets: ${{ matrix.extra_targets }}
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@v2.9.1
         with:
           workspaces: './src-tauri -> target'
           key: gate-${{ matrix.name }}
 
       # --- Cargo unit tests（--lib：src/ 内 #[cfg(test)] 单测）---
       - name: Unit tests (--lib)
-        run: cargo --manifest-path src-tauri/Cargo.toml test --lib
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
       # --- Cargo integration tests（tests/ 目录下的集成测试）---
       - name: Integration tests (--tests)
-        run: cargo --manifest-path src-tauri/Cargo.toml test --tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --tests
 
       # --- Clippy 静态分析（-D warnings 把所有 warning 升为错误）---
       - name: Clippy
-        run: cargo --manifest-path src-tauri/Cargo.toml clippy --all-targets -- -D warnings
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
   # ---------------------------------------------------------------------------
   # Gate 2: Tauri bundle build + artifact upload
@@ -81,10 +81,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.3.1
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v4.4.0
         with:
           node-version: 20
           cache: npm
@@ -95,7 +95,7 @@ jobs:
           targets: ${{ matrix.extra_targets }}
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@v2.9.1
         with:
           workspaces: './src-tauri -> target'
           key: build-${{ matrix.name }}
@@ -173,7 +173,7 @@ jobs:
           ls -la dist
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: sync-copy-${{ matrix.name }}-v${{ steps.version.outputs.version }}
           path: dist/*
