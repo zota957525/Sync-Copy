@@ -9,5 +9,8 @@ node_modules
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 
-# Claude Code local permissions (not to be committed)
-.claude/
+# Claude Code 项目治理资产策略（ADR-013 决议 2026-05-14，1A 路径）：
+# - 入 repo：agents/ / commands/ / hooks/ / pipeline-mode / settings.json
+#   （治理共享资产，未来 clone 的开发者获得完整脚手架）
+# - 不入 repo：settings.local.json（个人凭据 / 本机权限 allow 列表）
+.claude/settings.local.json

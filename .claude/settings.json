@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/safety-bar.sh"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "product-strategist",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '✅「产品经理」已产出 spec。建议主窗口下一步：调「UX 设计师」补 第 6 节 UX 段，或调「架构师」直接进入技术决策（如该 spec 不涉及 UI）。'"
+          }
+        ]
+      },
+      {
+        "matcher": "ux-designer",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '✅「UX 设计师」已填 spec 第 6 节 UX 段。建议主窗口下一步：调「架构师」写 ADR。'"
+          }
+        ]
+      },
+      {
+        "matcher": "tech-architect",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '✅「架构师」已产出 ADR。建议主窗口下一步：如涉及 crypto/网络协议/认证，调「安全工程师」追加 第 7 节 安全审阅；否则与用户/主窗口确认 ADR 状态推到 ACCEPTED。'"
+          }
+        ]
+      },
+      {
+        "matcher": "security-reviewer",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '✅「安全工程师」已审阅。建议主窗口下一步：如结论 APPROVED，调对应 implementer；如 CHANGES_REQUESTED，回到「架构师」改 ADR。'"
+          }
+        ]
+      },
+      {
+        "matcher": "backend-implementer",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '✅「后端工程师」已实现。建议主窗口下一步：调「评审工程师」review。如 spec 也涉及前端，需调「前端工程师」并行实现。'"
+          }
+        ]
+      },
+      {
+        "matcher": "frontend-implementer",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '✅「前端工程师」已实现。建议主窗口下一步：调「评审工程师」review。'"
+          }
+        ]
+      },
+      {
+        "matcher": "code-reviewer",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '✅「评审工程师」已 review。建议主窗口下一步：如 APPROVED 调「测试工程师」；如 CHANGES_REQUESTED 回到对应 implementer 修。'"
+          }
+        ]
+      },
+      {
+        "matcher": "qa-tester",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '✅「测试工程师」已写测试。建议主窗口下一步：测试通过则调「文档工程师」更新文档；阻塞则回到 implementer。'"
+          }
+        ]
+      },
+      {
+        "matcher": "docs-writer",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '✅「文档工程师」已更新文档。建议主窗口下一步：如准备发版本，调「发布工程师」；否则等下一个 feature 进入流水线。'"
+          }
+        ]
+      },
+      {
+        "matcher": "release-engineer",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '✅「发布工程师」已准备版本。给用户的下一步操作清单已在 agent 报告里。git tag 与 push 由用户手动执行（安全栏拦截了自动 push 到 main）。'"
+          }
+        ]
+      }
+    ]
+  }
+}
