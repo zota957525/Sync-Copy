@@ -1,0 +1,2 @@
+# 此文件用于 git 跟踪空目录，请保留。
+# qa-tester 的手测 checklist 会落到此目录下；自动化测试散在 src-tauri/tests/ 里。

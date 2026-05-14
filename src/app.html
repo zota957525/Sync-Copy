@@ -1,12 +1,26 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <link rel="icon" href="%sveltekit.assets%/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- color-scheme meta：Tauri 透明窗口 dark/light 兼容 -->
+    <meta name="color-scheme" content="dark light" />
     <title>Sync Copy</title>
     <style>
-      html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+      /* 全局重置：透明背景，禁止滚动条出现在浮窗里 */
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+        /* 禁止系统默认文字选取（工具型 UI；按需在具体元素 re-enable） */
+        -webkit-user-select: none;
+        user-select: none;
+      }
     </style>
     %sveltekit.head%
   </head>
