@@ -7,7 +7,15 @@ edition = "2021"
 
 [lib]
 name = "sync_copy_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# rlib only: desktop (macOS + Windows) 打包只走 bin crate (main.rs) 链 rlib 即可。
+# cdylib/staticlib 仅在 mobile (iOS/Android) tauri build 时才需要；
+# 项目当前仅支持 macOS + Windows，去掉这两个 crate-type 可避免：
+#   1. Windows CI: cargo test 生成的测试 exe 不 link WebView2Loader.dll（cdylib
+#      初始化路径拉入 webview2-com-sys -> WebView2Loader.dll，headless runner 上
+#      触发 STATUS_ENTRYPOINT_NOT_FOUND 0xc0000139）。
+#   2. 每次 cargo build 不必额外生成 .dll / .a 文件，加快构建。
+# see decisions/ADR-003-project-architecture-skeleton.md
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
