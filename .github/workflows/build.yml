@@ -51,8 +51,14 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: powershell
         run: |
-          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/partners/120/MicrosoftEdgeWebView2RuntimeInstallerX64.exe" -OutFile "$env:TEMP\WebView2Installer.exe"
-          Start-Process -FilePath "$env:TEMP\WebView2Installer.exe" -Args "/silent /install" -Wait
+          $url = "https://go.microsoft.com/fwlink/?linkid=2124703"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\MicrosoftEdgeWebview2Setup.exe"
+          $proc = Start-Process -FilePath "$env:TEMP\MicrosoftEdgeWebview2Setup.exe" -Args "/silent /install" -Wait -PassThru
+          if ($proc.ExitCode -notin @(0, 1638)) {
+            Write-Error "WebView2 installer exited with code $($proc.ExitCode)"
+            exit $proc.ExitCode
+          }
+          Write-Host "WebView2 install/check passed (exit code $($proc.ExitCode))"
 
       # --- Cargo unit tests（--lib：src/ 内 #[cfg(test)] 单测）---
       # Windows headless runner 链接 arboard 会触发 STATUS_ENTRYPOINT_NOT_FOUND；
