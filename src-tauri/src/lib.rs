@@ -103,12 +103,18 @@ pub fn run() {
 
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = lifecycle.start(&app_handle, &state).await {
+                    // fatal 三件套 #1：tracing::error 进日志文件（v4-7 / ADR-010 第 3.6 节）
                     tracing::error!(
                         target: "lifecycle",
                         error = %e,
                         "startup failed; process will exit"
                     );
-                    // 启动失败：Phase → Dead（start 内部已设），进程退出
+                    // fatal 三件套 #2：用户可见 dialog（v4-7 / ADR-010 第 3.6 节）
+                    // 文案不含错误字面（防敏感信息截图泄露），仅提示用户检查端口占用
+                    // Bug #2 修复（2026-05-15）：bind 失败时之前缺少此 dialog，用户无感知
+                    show_startup_error_dialog(&e.to_string());
+                    // fatal 三件套 #3：非静默 abort（v4-7 / ADR-010 第 3.6 节）
+                    // Phase → Dead（start 内部已设），进程退出
                     std::process::abort();
                 }
             });
@@ -170,6 +176,55 @@ fn install_panic_hook() {
         // v4-7 硬约束；不允许 std::process::exit(0) 静默吞 panic
         std::process::abort();
     }));
+}
+
+/// 启动失败时显示用户可见错误对话框（v4-7 fatal 三件套 #2）。
+///
+/// Bug #2 修复（2026-05-15）：lifecycle step 5 bind 失败时补全 fatal 三件套的 dialog 环节。
+/// 文案对用户友好（提示检查端口占用），不含内部错误字面（防敏感信息截图泄露）。
+/// 不依赖 Tauri runtime（startup 失败时 runtime 可能未就绪）。
+///
+/// error_hint：由调用方传入简短描述（如 StartupError::PortBind 的字符串），
+/// 用于在 dialog 中提示用户可操作的方向（如"端口 5858 已被占用"）。
+fn show_startup_error_dialog(error_hint: &str) {
+    // SECURITY (ADR-008 第 6.1 节)：dialog 文案不含内部栈变量值；
+    // error_hint 是 StartupError::Display 格式，已经过 thiserror 格式化，
+    // 不含密钥等敏感数据（StartupError 仅含端口号和 OS 错误码）。
+
+    #[cfg(target_os = "macos")]
+    {
+        let msg = format!(
+            "Sync Copy 启动失败。\\n\\n原因：{}\\n\\n请检查是否有其他程序占用该端口，或重启应用重试。",
+            error_hint
+        );
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(format!(
+                "display alert \"Sync Copy 无法启动\" message \"{}\" as critical",
+                msg
+            ))
+            .spawn();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let msg = format!(
+            "Sync Copy 启动失败。原因：{}。请检查是否有其他程序占用该端口，或重启应用重试。",
+            error_hint
+        );
+        let _ = std::process::Command::new("powershell")
+            .arg("-Command")
+            .arg(format!(
+                "[System.Windows.Forms.MessageBox]::Show('{}', 'Sync Copy 启动失败', 'OK', 'Error')",
+                msg
+            ))
+            .spawn();
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        eprintln!("[STARTUP ERROR] Sync Copy 启动失败：{}", error_hint);
+    }
 }
 
 /// 显示系统原生 fatal 错误对话框（不依赖 Tauri runtime）。

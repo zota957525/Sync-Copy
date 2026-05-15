@@ -158,6 +158,27 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: npm run tauri build
 
+      # --- Ad-hoc codesign（macOS only）---
+      # 背景：qa-tester 2026-05-15 实测 v0.2.0 artifact：codesign -v 显示 "not signed at all"；
+      # spctl -a -v 显示 "rejected, source=no usable signature"；
+      # 用户实测 macOS 报"Apple 无法验证 Sync Copy 是否包含恶意软件"→ 启动拒绝。
+      # _assumptions A29：不做 Apple Developer 代码签名/公证；ad-hoc sign（-）不需要 Developer 账号，
+      # 可消除 "not signed" 状态，用户仍需首次手动「允许」，但不再被完全拦截。
+      # 必须在打 zip 之前运行，确保 artifact 内含已签名的 .app。
+      - name: Ad-hoc codesign (macOS only)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          APP_PATH=$(find src-tauri/target -name "*.app" -type d | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app found under src-tauri/target"
+            exit 1
+          fi
+          echo "Found app: $APP_PATH"
+          codesign --deep --force --sign - "$APP_PATH"
+          codesign -dv --verbose=4 "$APP_PATH" 2>&1 | head -10
+          echo "Ad-hoc signing applied (Gatekeeper will still warn but allow open after manual approval)"
+
       # --- 产物打包：免安装版 + 版本号命名 ---
 
       - name: Package macOS portable (.app.zip)
