@@ -18,7 +18,10 @@ use std::sync::{
     mpsc::{self, Receiver, SyncSender},
     Arc,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// Instant is only needed in clipboard_thread_real (clipboard-real feature).
+#[cfg(feature = "clipboard-real")]
+use std::time::Instant;
 // done_tx / done_rx 用于 shutdown 100ms 软上限（ADR-010 第 3.3 节 step 4）
 // std::sync::mpsc 在 std::thread 内无 await，直接重用同一 use 块即可。
 
@@ -31,6 +34,8 @@ pub const MAX_TEXT_BYTES: usize = 1_000_000;
 const POLL_TICK_MS: u64 = 80;
 
 /// 真正 poll 剪切板的间隔（约 1 秒；A4）
+/// Only used in clipboard_thread_real (clipboard-real feature).
+#[cfg(feature = "clipboard-real")]
 const POLL_INTERVAL_MS: u64 = 1000;
 
 // ---------------------------------------------------------------------------
@@ -183,11 +188,74 @@ impl ClipboardWatcher {
 
 /// arboard 线程主循环（在专属 std::thread 内运行）。
 ///
+/// feature = "clipboard-real"（默认开启）：真正调用 arboard，轮询本机剪切板。
+/// feature = off（Windows headless CI / --no-default-features）：
+///   空循环仅处理 cancel 信号和 apply_rx Disconnect，不调任何 OS 剪切板 API，
+///   避免 DLL loader 在无 clipboard subsystem 的 runner 上触发
+///   STATUS_ENTRYPOINT_NOT_FOUND（0xc0000139）。
+///
 /// 循环逻辑（与 v0 一致，ADR-010 第 3.6 节）：
 ///   - 每 80ms tick 检查 cancel + 处理 apply_rx 命令
 ///   - 每 1s 真正 poll 剪切板（先 image stub，再 text）
 ///   - text 变化：hash 比较 → 发 broadcast_tx
 fn clipboard_thread_main(
+    cancel: Arc<AtomicBool>,
+    broadcast_tx: SyncSender<ClipboardEvent>,
+    apply_rx: Receiver<String>,
+) {
+    // When clipboard-real feature is disabled (e.g. Windows headless CI),
+    // run a minimal drain loop: honor cancel + drain apply_rx to avoid
+    // accumulation, but never touch the OS clipboard subsystem.
+    // This avoids STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) on headless runners.
+    #[cfg(not(feature = "clipboard-real"))]
+    {
+        // broadcast_tx is not used in headless mode; suppress unused-variable warning.
+        let _ = broadcast_tx;
+        tracing::info!(
+            target: "clipboard",
+            "clipboard_thread_main: clipboard-real feature disabled, running headless no-op loop"
+        );
+        clipboard_thread_headless(cancel, apply_rx);
+    }
+
+    // Real implementation: uses arboard to poll and write the OS clipboard.
+    // Only compiled when clipboard-real feature is enabled.
+    #[cfg(feature = "clipboard-real")]
+    clipboard_thread_real(cancel, broadcast_tx, apply_rx);
+}
+
+/// Headless no-op loop — compiled when `clipboard-real` feature is OFF.
+///
+/// Drains apply_rx and watches cancel; never calls any OS clipboard API.
+/// Used on Windows headless CI runners to prevent DLL loader failures.
+#[cfg(not(feature = "clipboard-real"))]
+fn clipboard_thread_headless(cancel: Arc<AtomicBool>, apply_rx: Receiver<String>) {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            tracing::debug!(target: "clipboard", "headless cancel flag set, exiting");
+            break;
+        }
+        // Drain apply_rx so the Sender does not block.
+        loop {
+            match apply_rx.try_recv() {
+                Ok(_) => {} // discard — no clipboard subsystem available
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    tracing::debug!(
+                        target: "clipboard",
+                        "headless apply_rx disconnected, exiting"
+                    );
+                    return;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(POLL_TICK_MS));
+    }
+}
+
+/// Real arboard loop — compiled when `clipboard-real` feature is ON (default).
+#[cfg(feature = "clipboard-real")]
+fn clipboard_thread_real(
     cancel: Arc<AtomicBool>,
     broadcast_tx: SyncSender<ClipboardEvent>,
     apply_rx: Receiver<String>,
@@ -260,6 +328,7 @@ fn clipboard_thread_main(
 
 // ---------------------------------------------------------------------------
 // apply_text_to_clipboard — 写入 OS 剪切板 + 更新 last_hash
+// (only compiled with clipboard-real feature)
 // ---------------------------------------------------------------------------
 
 /// 将远端发来的 plaintext 写入 OS 剪切板，同时更新 last_hash 防止环路广播。
@@ -267,6 +336,7 @@ fn clipboard_thread_main(
 /// 环路防止逻辑（spec 第 5.3 节）：
 ///   SetTextSuppress 写入后 last_hash = SHA-256(text)，
 ///   下一次 poll_text_clipboard 看到相同 hash 不广播。
+#[cfg(feature = "clipboard-real")]
 fn apply_text_to_clipboard(
     board: &mut arboard::Clipboard,
     text: &str,
@@ -299,12 +369,14 @@ fn apply_text_to_clipboard(
 
 // ---------------------------------------------------------------------------
 // poll_text_clipboard — 轮询文本剪切板
+// (only compiled with clipboard-real feature)
 // ---------------------------------------------------------------------------
 
 /// 轮询本机文本剪切板，检测变化后通过 broadcast_tx 通知异步层。
 ///
 /// 变化判定：SHA-256(text) 与 last_hash 不同。
 /// 跳过条件：空内容 / 超 1MB / get_text 失败（retry 1 次）。
+#[cfg(feature = "clipboard-real")]
 fn poll_text_clipboard(
     board: &mut arboard::Clipboard,
     broadcast_tx: &SyncSender<ClipboardEvent>,
@@ -375,6 +447,7 @@ fn poll_text_clipboard(
 
 // ---------------------------------------------------------------------------
 // try_handle_image — P0 stub（P1 替换函数体）
+// Only compiled with clipboard-real feature (called only from clipboard_thread_real).
 // ---------------------------------------------------------------------------
 
 /// 检查剪切板是否有图片（P0 阶段：直接返 false，不调 get_image()）。
@@ -385,6 +458,8 @@ fn poll_text_clipboard(
 ///   P1 接入时仅替换函数体不改其它代码"
 ///
 /// 返回 true 表示捕获到图片（本轮跳过 text）；P0 永远返 false。
+/// Only compiled when feature "clipboard-real" is enabled.
+#[cfg(feature = "clipboard-real")]
 fn try_handle_image() -> bool {
     // P0 stub — P1 在此处实现 arboard.get_image() + broadcast
     false
@@ -639,8 +714,10 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // 单测 7：try_handle_image 在 P0 阶段永远返 false
+    // Only runs when clipboard-real feature is enabled (function is gated).
     // -----------------------------------------------------------------------
     #[test]
+    #[cfg(feature = "clipboard-real")]
     fn try_handle_image_returns_false_in_p0() {
         assert!(
             !try_handle_image(),

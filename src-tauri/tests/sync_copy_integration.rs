@@ -721,8 +721,8 @@ async fn test_handshake_device_id_not_placeholder() {
 /// 直接验证 HistoryStore::push → snapshot 路径（lifecycle 消费路径的核心函数调用）。
 #[tokio::test]
 async fn test_local_clipboard_change_pushes_history() {
-    use sync_copy_lib::app::history::{HistoryEntry, HistoryPayload, HistorySource};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use sync_copy_lib::app::history::{HistoryEntry, HistoryPayload, HistorySource};
 
     let (state_a, _addr_a, handle_a) = spawn_test_instance().await;
 
@@ -815,10 +815,7 @@ async fn test_remote_clipboard_ingest_pushes_history() {
         .expect("A dial B 握手应成功");
 
     // 确认 B 知道 A（B.peers 含 A）
-    assert!(
-        state_b.peers.is_known(&device_id_a),
-        "B 应知道 A（握手后）"
-    );
+    assert!(state_b.peers.is_known(&device_id_a), "B 应知道 A（握手后）");
 
     // 取 B 侧记录的 A 的 AES key（B 用来解密 A 发来的消息）
     let peer_a_in_b = state_b

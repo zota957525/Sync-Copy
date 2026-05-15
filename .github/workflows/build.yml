@@ -43,16 +43,36 @@ jobs:
           key: gate-${{ matrix.name }}
 
       # --- Cargo unit tests（--lib：src/ 内 #[cfg(test)] 单测）---
+      # Windows headless runner 链接 arboard 会触发 STATUS_ENTRYPOINT_NOT_FOUND；
+      # 加 --no-default-features 跳过 clipboard-real feature，使用 headless stub。
       - name: Unit tests (--lib)
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cargo test --no-default-features --manifest-path src-tauri/Cargo.toml --lib
+          else
+            cargo test --manifest-path src-tauri/Cargo.toml --lib
+          fi
 
       # --- Cargo integration tests（tests/ 目录下的集成测试）---
       - name: Integration tests (--tests)
-        run: cargo test --manifest-path src-tauri/Cargo.toml --tests
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cargo test --no-default-features --manifest-path src-tauri/Cargo.toml --tests
+          else
+            cargo test --manifest-path src-tauri/Cargo.toml --tests
+          fi
 
       # --- Clippy 静态分析（-D warnings 把所有 warning 升为错误）---
       - name: Clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cargo clippy --no-default-features --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          else
+            cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          fi
 
   # ---------------------------------------------------------------------------
   # Gate 2: Tauri bundle build + artifact upload
