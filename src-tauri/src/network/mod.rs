@@ -108,42 +108,42 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 // start_server（ADR-010 第 3.2 节 step 5 真正落地）
 // ---------------------------------------------------------------------------
 
-/// 启动 axum HTTP server（lifecycle step 5 真正实现）。
+/// Step 5a：绑定 TCP 端口（必须在 tokio::spawn 之前 await，确保 bind 成功才报 INFO）。
 ///
-/// 替换 PR-3 占位 worker：
-/// - `tokio::net::TcpListener::bind(port)` 真起监听
-/// - `axum::serve(listener, router).with_graceful_shutdown(shutdown_rx)` 真起 serve
-/// - shutdown_rx：lifecycle step 5 `server_shutdown_tx.send(())` 触发优雅关闭
+/// Bug #2 修复（ADR-010 第 3.2 节 step 5 + ADR-010 第 3.6 节 fatal 三件套）：
+/// 原实现在 spawn 内部 bind，导致 bind 失败时 lifecycle 已报 "started" 并进入 Running 阶段。
+/// 修复后：bind 同步前置，失败立即返 Err，lifecycle step 5 unwind，进程 abort（v4-7 三件套）。
 ///
-/// 失败时返 `StartupError::PortBind`（lifecycle 按 step 5 unwind 处理）。
-///
-/// 端口：默认 DEFAULT_PORT(5858)；`settings-panel` PR 后可配置。
-pub async fn start_server(
-    state: Arc<AppState>,
-    shutdown_rx: oneshot::Receiver<()>,
-) -> Result<(), crate::app::lifecycle::StartupError> {
+/// 端口：DEFAULT_PORT(5858)；`settings-panel` PR 后可从 Config 读取。
+pub async fn bind_port() -> Result<TcpListener, crate::app::lifecycle::StartupError> {
     let addr = SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT));
-
-    let listener = TcpListener::bind(addr).await.map_err(|e| {
+    TcpListener::bind(addr).await.map_err(|e| {
         tracing::error!(
             target: "network::server",
             addr = %addr,
             error = %e,
             "TCP bind failed"
         );
-        crate::app::lifecycle::StartupError::PortBind(e.to_string())
-    })?;
+        crate::app::lifecycle::StartupError::PortBind(format!(
+            "端口 {} 已被占用（{}）",
+            DEFAULT_PORT, e
+        ))
+    })
+}
 
-    tracing::info!(
-        target: "network::server",
-        addr = %addr,
-        "HTTP server listening"
-    );
-
+/// Step 5b：在已绑定的 listener 上启动 axum serve 循环（在 tokio::spawn 内运行）。
+///
+/// 调用方（lifecycle step 5）已在 spawn 前完成 bind_port()，此函数只做 serve。
+/// shutdown_rx：lifecycle shutdown step 5 通过 oneshot send(()) 触发优雅关闭。
+pub async fn serve_on_listener(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    shutdown_rx: oneshot::Receiver<()>,
+) {
     let router = build_router(state);
 
     // axum::serve + graceful shutdown（ADR-010 第 3.3 节 step 5 500ms timeout）
-    axum::serve(
+    let result = axum::serve(
         listener,
         // ConnectInfo 提取 remote_addr（handshake handler 使用）
         router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -152,13 +152,38 @@ pub async fn start_server(
         let _ = shutdown_rx.await;
         tracing::info!(target: "network::server", "graceful shutdown signal received");
     })
-    .await
-    .map_err(|e| {
-        tracing::error!(target: "network::server", error = %e, "axum serve error");
-        crate::app::lifecycle::StartupError::PortBind(e.to_string())
-    })?;
+    .await;
 
-    tracing::info!(target: "network::server", "HTTP server stopped");
+    match result {
+        Ok(()) => {
+            tracing::info!(target: "network::server", "HTTP server stopped");
+        }
+        Err(e) => {
+            tracing::error!(target: "network::server", error = %e, "axum serve error during run");
+        }
+    }
+}
+
+/// 启动 axum HTTP server（旧接口，保持向后兼容；仅供单元测试使用）。
+///
+/// 注意：此函数在内部 bind，bind 失败时返 Err；但调用方必须在 spawn 之前 await 此函数，
+/// 否则 bind 失败发生在 spawn 内部，lifecycle 无法感知（Bug #2 根因）。
+///
+/// 新代码请使用 bind_port() + serve_on_listener()。
+#[allow(dead_code)]
+pub async fn start_server(
+    state: Arc<AppState>,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> Result<(), crate::app::lifecycle::StartupError> {
+    let listener = bind_port().await?;
+
+    tracing::info!(
+        target: "network::server",
+        addr = %listener.local_addr().unwrap_or_else(|_| SocketAddr::from(([0,0,0,0], DEFAULT_PORT))),
+        "HTTP server listening"
+    );
+
+    serve_on_listener(listener, state, shutdown_rx).await;
     Ok(())
 }
 
