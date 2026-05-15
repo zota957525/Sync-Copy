@@ -8,8 +8,10 @@ on:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Gate 1: Rust unit + integration tests + clippy
-  # 先跑 cargo test + clippy，保证"代码健康度门禁"（specs/cross-platform-build.md 第 5.4 节）
+  # Gate 1: Rust tests / build-verification + clippy
+  # 分工策略（2026-05-15 决策 B）：
+  #   macOS  — cargo test --lib / --tests（142 单测全平台逻辑，Mac 覆盖即可）
+  #   Windows — cargo build 编译验证 + clippy（STATUS_ENTRYPOINT_NOT_FOUND DLL 问题绕开）
   # 两个 OS 并行运行，任一失败即阻断后续 tauri build job（needs: gate）
   # ---------------------------------------------------------------------------
   gate:
@@ -60,27 +62,26 @@ jobs:
           }
           Write-Host "WebView2 install/check passed (exit code $($proc.ExitCode))"
 
-      # --- Cargo unit tests（--lib：src/ 内 #[cfg(test)] 单测）---
-      # Windows headless runner 链接 arboard 会触发 STATUS_ENTRYPOINT_NOT_FOUND；
-      # 加 --no-default-features 跳过 clipboard-real feature，使用 headless stub。
-      - name: Unit tests (--lib)
+      # --- Cargo unit tests（--lib，macOS only）---
+      # Windows 跳过：0xc0000139 STATUS_ENTRYPOINT_NOT_FOUND — cargo test exe 启动时
+      # DLL 入口点找不到，--no-default-features 仍无法绕开；Mac 已覆盖 142 单测。
+      - name: Unit tests (--lib, macOS only)
+        if: matrix.os == 'macos-latest'
         shell: bash
-        run: |
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cargo test --no-default-features --manifest-path src-tauri/Cargo.toml --lib
-          else
-            cargo test --manifest-path src-tauri/Cargo.toml --lib
-          fi
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
-      # --- Cargo integration tests（tests/ 目录下的集成测试）---
-      - name: Integration tests (--tests)
+      # --- Cargo integration tests（tests/ 目录，macOS only）---
+      - name: Integration tests (--tests, macOS only)
+        if: matrix.os == 'macos-latest'
         shell: bash
-        run: |
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cargo test --no-default-features --manifest-path src-tauri/Cargo.toml --tests
-          else
-            cargo test --manifest-path src-tauri/Cargo.toml --tests
-          fi
+        run: cargo test --manifest-path src-tauri/Cargo.toml --tests
+
+      # --- Windows 编译验证（替代 cargo test）---
+      # 验证 Rust 代码在 Windows target 可编译；不运行 exe 避免 DLL 问题。
+      - name: Build verification (Windows only)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: cargo build --no-default-features --manifest-path src-tauri/Cargo.toml
 
       # --- Clippy 静态分析（-D warnings 把所有 warning 升为错误）---
       - name: Clippy
