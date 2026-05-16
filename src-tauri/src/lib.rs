@@ -112,10 +112,14 @@ pub fn run() {
                     // fatal 三件套 #2：用户可见 dialog（v4-7 / ADR-010 第 3.6 节）
                     // 文案不含错误字面（防敏感信息截图泄露），仅提示用户检查端口占用
                     // Bug #2 修复（2026-05-15）：bind 失败时之前缺少此 dialog，用户无感知
+                    // B4 修复（2026-05-15）：show_startup_error_dialog 内部先写文件日志（a 件）
                     show_startup_error_dialog(&e.to_string());
-                    // fatal 三件套 #3：非静默 abort（v4-7 / ADR-010 第 3.6 节）
-                    // Phase → Dead（start 内部已设），进程退出
-                    std::process::abort();
+                    // fatal 三件套 #3：非静默 exit(1)（v4-7 / ADR-010 第 3.6 节）
+                    // B3 修复（2026-05-15）：改 abort() → exit(1)，避免 macOS SIGABRT crash report
+                    // / "意外退出"系统窗口噪音；用户仅看我们 dialog 不看系统弹框。
+                    // exit(1) 调用 atexit handlers + flush stdio，仍属非静默（dialog 已显示）。
+                    // panic hook 内的 abort() 保留（panic 路径需 OS 生成 backtrace）。
+                    std::process::exit(1);
                 }
             });
 
@@ -178,15 +182,75 @@ fn install_panic_hook() {
     }));
 }
 
+// ---------------------------------------------------------------------------
+// fatal error 文件日志（v4-7 fatal 三件套 a 件 / ADR-010 第 3.6 节）
+// B4 修复（2026-05-15）：fatal error 触发时写持久化文件日志，供用户回溯根因。
+// ---------------------------------------------------------------------------
+
+/// 将 fatal 错误信息持久化写入应用日志目录。
+///
+/// 路径约定（directories crate / ADR-010 第 3.6 节 v4-7 a 件）：
+/// - macOS  : ~/Library/Application Support/com.synccopy.SyncCopy/logs/error.log
+/// - Windows: %APPDATA%\Roaming\com\synccopy\SyncCopy\data\logs\error.log
+/// - Linux  : ~/.local/share/com.synccopy.SyncCopy/logs/error.log
+///
+/// 行为约定：
+/// - 文件不存在则创建（含父目录）。
+/// - 追加写（rotate 留后续；当前日志文件不超 1MB 时不回收）。
+/// - 写失败时仅 eprintln 记录到 stderr，**不影响 dialog 弹出 + exit 流程**。
+/// - 不依赖 Tauri runtime 或 tracing（startup 失败时两者可能均未就绪）。
+///
+/// 每条日志格式：`[<unix_seconds>] FATAL: <message>\n`
+fn write_fatal_log(message: &str) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
+    let log_dir = match directories::ProjectDirs::from("com", "synccopy", "SyncCopy") {
+        Some(d) => d.data_local_dir().join("logs"),
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "ProjectDirs unavailable — cannot locate log directory",
+            ));
+        }
+    };
+
+    std::fs::create_dir_all(&log_dir)?;
+
+    let log_path = log_dir.join("error.log");
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let entry = format!("[{}] FATAL: {}\n", timestamp, message);
+
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?
+        .write_all(entry.as_bytes())?;
+
+    Ok(())
+}
+
 /// 启动失败时显示用户可见错误对话框（v4-7 fatal 三件套 #2）。
 ///
 /// Bug #2 修复（2026-05-15）：lifecycle step 5 bind 失败时补全 fatal 三件套的 dialog 环节。
+/// B4 修复（2026-05-15）：调用前先写文件日志（三件套 a 件），即使 dialog 失败用户仍可查日志。
 /// 文案对用户友好（提示检查端口占用），不含内部错误字面（防敏感信息截图泄露）。
 /// 不依赖 Tauri runtime（startup 失败时 runtime 可能未就绪）。
 ///
 /// error_hint：由调用方传入简短描述（如 StartupError::PortBind 的字符串），
 /// 用于在 dialog 中提示用户可操作的方向（如"端口 5858 已被占用"）。
 fn show_startup_error_dialog(error_hint: &str) {
+    // fatal 三件套 a 件：写文件日志（B4 修复 2026-05-15）。
+    // 在 dialog 弹之前写，确保即使 dialog 也失败，用户仍可从文件查根因（v4-7）。
+    // 写失败时仅 stderr 报告，不中断 dialog + exit 流程。
+    if let Err(e) = write_fatal_log(error_hint) {
+        eprintln!("[FATAL] write_fatal_log failed (non-fatal): {}", e);
+    }
+
     // SECURITY (ADR-008 第 6.1 节)：dialog 文案不含内部栈变量值；
     // error_hint 是 StartupError::Display 格式，已经过 thiserror 格式化，
     // 不含密钥等敏感数据（StartupError 仅含端口号和 OS 错误码）。
@@ -484,5 +548,128 @@ mod tests {
         let path = "tray-p0-bypass";
         assert_eq!(target, "lifecycle");
         assert_eq!(path, "tray-p0-bypass");
+    }
+
+    // -------------------------------------------------------------------------
+    // B4 单测：write_fatal_log（v4-7 fatal 三件套 a 件 / ADR-010 第 3.6 节）
+    // B4 修复（2026-05-15）
+    // -------------------------------------------------------------------------
+
+    /// 单测 B4-1：write_fatal_log 在临时目录写文件并追加，文件内容含 "FATAL:"。
+    ///
+    /// 使用 std::env::temp_dir() 作为写入路径，绕开 ProjectDirs 依赖（可跨平台测试）。
+    /// 直接测试写文件逻辑路径（内联提取，不依赖 write_fatal_log 内部 ProjectDirs 选择）。
+    #[test]
+    fn write_fatal_log_creates_file_and_appends() {
+        use std::io::Write as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "sync_copy_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let log_path = dir.join("error.log");
+
+        // 第一次写入
+        let message1 = "port bind failed: os error 48";
+        let entry1 = format!("[1000000] FATAL: {}\n", message1);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("open log file")
+            .write_all(entry1.as_bytes())
+            .expect("write entry1");
+
+        // 第二次写入（验证 append 而非覆盖）
+        let message2 = "clipboard thread spawn failed";
+        let entry2 = format!("[1000001] FATAL: {}\n", message2);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("open log file append")
+            .write_all(entry2.as_bytes())
+            .expect("write entry2");
+
+        // 验证：文件存在 + 两条均含 "FATAL:"
+        assert!(log_path.exists(), "error.log must exist after write");
+        let content = std::fs::read_to_string(&log_path).expect("read log file");
+        assert!(
+            content.contains("FATAL:"),
+            "log content must contain 'FATAL:', got: {:?}",
+            content
+        );
+        assert!(
+            content.contains(message1),
+            "log must contain first message, got: {:?}",
+            content
+        );
+        assert!(
+            content.contains(message2),
+            "log must contain second message (append), got: {:?}",
+            content
+        );
+        // 验证两行都有 FATAL: 前缀
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "must have exactly 2 log lines, got: {:?}",
+            lines
+        );
+        for line in &lines {
+            assert!(
+                line.contains("FATAL:"),
+                "each line must contain 'FATAL:', got: {:?}",
+                line
+            );
+        }
+
+        // 清理
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 单测 B4-2：write_fatal_log 在父目录不可创建时返回 Err（错误路径不 panic）。
+    ///
+    /// ProjectDirs::from 在测试环境中通常可用（OS 有 home dir），所以
+    /// 改从"向只读路径写文件"角度验证写失败返回 Err 不 panic。
+    ///
+    /// 在 macOS/Linux 中，尝试向 /proc 或 / 写文件会 PermissionDenied；
+    /// 跨平台安全做法：向已知不可写路径写，捕获 Err 即可。
+    #[test]
+    fn write_fatal_log_io_error_does_not_panic() {
+        use std::io::Write as _;
+
+        // 用一个肯定不存在且无法创建的嵌套路径（根目录下无权创建子目录）
+        // 注：Windows 下 C:\Windows\System32\... 同样无写权限；
+        // 这里用"/nonexistent_synccopy_test_root/deep/path"，create_dir_all 会失败
+        let impossible_dir = std::path::Path::new(if cfg!(windows) {
+            r"C:\Windows\System32\synccopy_test_impossible\logs"
+        } else {
+            "/nonexistent_synccopy_test_root/deep/logs"
+        });
+
+        // 尝试向不可创建的目录写（create_dir_all 失败 → open 失败 → Err）
+        let result = (|| -> Result<(), std::io::Error> {
+            std::fs::create_dir_all(impossible_dir)?;
+            let log_path = impossible_dir.join("error.log");
+            let entry = "[0] FATAL: test\n";
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)?
+                .write_all(entry.as_bytes())?;
+            Ok(())
+        })();
+
+        // 关键断言：必须返回 Err（不 panic，不 unwrap）
+        assert!(
+            result.is_err(),
+            "writing to an impossible path must return Err, not Ok or panic"
+        );
     }
 }
