@@ -10,6 +10,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.1] — 2026-05-16
+
+### Fixed
+
+- macOS：CI 加 ad-hoc codesign step，消除"未签名"Gatekeeper 拒绝（v0.2.0 用户实测报告，_assumptions A29）
+- macOS：`使用说明.md` FAQ Q6 补 Gatekeeper 三方法放行步骤（右键打开 / xattr / 系统设置）
+- 端口冲突静默失败修复（lifecycle step 5 bind 同步前置 + show_startup_error_dialog + exit(1)，违反 ADR-010 第 3.6 节 + v4-7 fatal 三件套已闭环）
+- 新增 fatal error 文件日志（`~/Library/Application Support/com.synccopy.SyncCopy/logs/error.log`），完成 v4-7 三件套 a 件
+- 加入小组按钮无反应修复（`btn-join` 之前是 PR-FE-3 占位无 onclick handler；新建 `JoinDialog` 组件 + FloatingWindow 加 'join' view state）
+- IPC 参数命名修复（`join_group` / `approve_peer` / `reject_peer` 三处前端 camelCase 改 snake_case 与 Rust 后端匹配，Tauri 2 不做自动转换）
+
+### Changed
+
+- `process::abort()` → `process::exit(1)` 在 lifecycle fatal path（B3，避免 macOS 系统"意外退出"crash report 噪音；panic hook 内 abort 保留给 backtrace）
+
+### Security
+
+- B3 + B4 修复完成后，所有 fatal error 路径满足 v4-7 三件套（写文件日志 + GUI dialog + 非静默 exit）
+
+### Known limitations
+
+- Windows 浮窗与按钮在 v0.2.0 同样受 IPC camelCase bug 影响，本次修复跨平台生效，Windows artifact 待 v0.2.1 CI build 验证
+- Apple Developer 公证仍未做（_assumptions A29），ad-hoc 签名仍需用户首次手动放行
+
+---
+
 ## [0.2.0] — 2026-05-10
 
 This release represents a **complete rewrite** from the v0 prototype (`legacy-prototype` branch, commit `f4be188`). All code is new; the v0 prototype is preserved for historical reference only. The primary motivation is documented in `decisions/ADR-001`.

@@ -24,9 +24,10 @@
     statusText: string;
     oncollapse: () => void;
     onsettings: () => void;
+    onjoin: () => void;
   }
 
-  let { dotState, statusText, oncollapse, onsettings }: Props = $props();
+  let { dotState, statusText, oncollapse, onsettings, onjoin }: Props = $props();
 </script>
 
 <div class="statusbar" data-tauri-drag-region>
@@ -41,12 +42,13 @@
     </span>
   </div>
   <div class="statusbar-right">
-    <!-- [加入] 胶囊按钮（PR-FE-3 接入 JoinDialog）-->
+    <!-- [加入] 胶囊按钮（floating-window spec 第 6.3 节 → JoinDialog view）-->
     <button
       class="btn-join"
       style:background={COLOR_BTN_PRIMARY_BG}
       style:color={COLOR_TEXT_PRIMARY}
       style:font-size={FONT_SIZE_SECONDARY}
+      onclick={onjoin}
       aria-label="加入小组"
     >
       加入

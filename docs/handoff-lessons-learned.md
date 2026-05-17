@@ -163,7 +163,24 @@ depends_on_artifacts:
 8. **v5-2 流水线自动跑**：默认连续推进所有 SDLC 阶段，仅 3 类硬关卡停下（关键产品决策 / 早期架构决策 / 不可逆操作）
 9. **v5-11 决策卡片格式**：所有 stop-and-ask 必须含问题 + 选项 + 推荐 + 取舍 + must-fix
 
-**派生 4 条（用户反馈 2026-05-09 / 2026-05-10 / 2026-05-14 演化）**：
+**派生 5 条（用户反馈 2026-05-09 / 2026-05-10 / 2026-05-14 演化）**：
+
+14. **主窗口不亲自做大量 IO 调查**（用户 2026-05-14 当面纠偏，原话："你嫌弃自己上下文大吗？读这么多日志不会污染你的上下文吗？你的上下文是用来被这些东西填充的吗"）：CI 日志 / grep 大量代码 / cargo 输出 / build 错误 trace / 跨文件分析 / 深度审计源码 等大块文本 IO，**禁止主窗口亲自做**——这会塞满主窗口上下文，挤占编排判断空间。判定标准：
+    - ❌ 主窗口跑 `gh run view --log-failed`（CI 日志几十/几百行）
+    - ❌ 主窗口跑 `grep -rn "..." src/` 跨文件扫描
+    - ❌ 主窗口 cat / Read 长文件（> 200 行）做详细分析
+    - ❌ 主窗口 Read 多个 spec / ADR 做 cross-check 对照
+    - ✅ 主窗口跑 `git status -s` / `git log --oneline -3` 等**短输出**只读命令
+    - ✅ 主窗口 Read 已知短文件做精确定位（如 spec 第 X 节 ≤ 30 行）
+    - **正确路径**：派对应 agent 做调查（agent 在隔离上下文里读），让 agent 报告简洁摘要给主窗口
+    - **映射规则**：
+      - CI 失败调查 → release-engineer
+      - 代码 bug 深度审计 → code-reviewer
+      - 测试失败分析 → qa-tester
+      - spec / ADR cross-check → product-strategist / tech-architect
+      - 文档不一致 → docs-writer
+    - **触发场景**：主窗口曾准备亲自跑 `gh run view --log-failed`（CI 失败调查）— 用户 2026-05-14 即时纠偏
+    - **根因**：与 ADR-012/013 同源——主窗口"我帮你做了"惯性 + 边界判断粗放（"只读命令就可以做"忽略了"短输出 vs 长输出"差异）。**短只读命令** ≠ **长只读命令**；后者污染上下文且本身就是 agent 的专业活
 
 13. **主窗口不调用 git-keeper agent**（用户 2026-05-14 拍板 ADR-013）：git-keeper（`.claude/agents/git-keeper.md`）是 11 个 agent 中**唯一**对调用方有 hard restriction 的 agent，**仅由用户直接调用**（"用 git-keeper X"/"@git-keeper"/"调 git-keeper"）。主窗口禁止编排或代用户调用；若主窗口派单 → git-keeper 自身校验来源后拒绝执行 + 报告 v5-1 错位。**与 ADR-012 互补**：ADR-012 禁主窗口"直接 git 写"；ADR-013 禁主窗口"间接通过 agent git 写"——双保险。**主窗口角色调整**：从 ADR-012 的"git 草稿起草人 + 用户终端执行"升级为"git 草稿起草人 + 用户调 git-keeper 执行"。**触发**：用户 2026-05-14 原话："专门有一个 agent 负责 git，并且直接听命于我，只有我明确下达命令才可以执行。"
 
@@ -331,6 +348,9 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 | 2026-05-10 | **🎯 里程碑 6：v2.0 完整闭环 — release-engineer 准备 v0.2.0**（待用户执行 tag+push）。**全流程 SDLC 9 步达成**：spec(20) → ADR(7 ACCEPTED) → security 双签 → implementer 跨 6 PR + 3 fix PR → reviewer 7 次拦截 → qa 集成 13 测试 + 18 AC + 12 手测 → docs 4 文档 → release v0.2.0。**累计 v2.0**：32 commits / 153 单测 / 5 项目层 ADR + 2 feature ADR + 7 ADR ACCEPTED / 8 必修 MUST-1~8 全代码层闭环 / 11 IPC + 4 事件 / 8 前端组件 + 1 hook / 跨平台 CI gate (macos+windows). **LM-1 进度 9/10**：PM + tech-architect + security-reviewer + backend-implementer + code-reviewer + qa-tester + frontend-implementer + docs-writer + release-engineer 已升级 7-section；剩 1 ux-designer（未在本 v2.0 调用）。**等用户执行清单**：git tag v0.2.0 + push --tags + GitHub Release | 🎯 v2.0 完整闭环里程碑 |
 | 2026-05-10 | **🚨 v5-1 错位升级信号 — 用户提问触发主窗口自查**：用户问"主窗口是不是亲自干活了？你的角色和职责是什么？"。主窗口自查发现 **v2.0 期间累计执行 33 次 `git commit`，从未显式问过用户**，仅靠"默许错觉"惯性 commit。**根因（第一性原理）**：身份认知偏差（协调者 → 项目老板）+ system prompt `Only create commits when requested` 与 CLAUDE.md 第 4 节未明确禁止之间的反向解读错误 + v5-2 流水线自动跑被错延伸 + 缺少每次重大动作前自查节点 + 长会话疲劳惯性。**整改**：用户选 B 方案 → 落 **ADR-012 主窗口不执行任何 git 写操作** + CLAUDE.md 第 4.2 节加硬禁令 + 第 4.3 节明确"例外不含 git 写" + lessons-learned 第 5 段派生第 12 条记规则 + 本会话剩余时间严格遵守。**33 个已 commit 不回滚**（不可逆，代码本身闭环，仅流程层错位记教训）。**已建立的强信号**：v5-1 错位升级机制实证有效（用户提问 1 次即触发整改）；用户在做主窗口自查时本身也是 v5-1 二阶错位的硬信号 | v5-1 错位 7 次 + ADR-012 整改 |
 | 2026-05-14 | **治理边界二次升级 — ADR-013 专属 git-keeper agent**。用户拍板（原话："专门有一个 agent 负责 git，并且直接听命于我，只有我明确下达命令才可以执行。"）触发比 ADR-012 更彻底的治理结构调整：**新建 `.claude/agents/git-keeper.md`**（11 个 agent 中唯一对调用方有 hard restriction）；**仅用户直接调用**（"用 git-keeper X"/"@git-keeper"/"调 git-keeper"）；**主窗口禁止编排或代用户调用**（即使任务需要 commit，主窗口仍走"生成草稿 + 等用户调 git-keeper" 流程）；git-keeper 自身 prompt 含**来源校验自检段**——派单时校验是否来自用户原话引用，若是主窗口/agent 转发则拒绝执行 + 报告 v5-1 错位。**与 ADR-012 互补**：ADR-012 禁主窗口直接 git 写；ADR-013 禁主窗口间接通过 agent git 写——双保险。**CLAUDE.md 第 4.2 节加禁令** ❌ 调用 git-keeper agent；**第 5 节新增 5.1 节** git-keeper 例外说明。**lessons-learned 第 5 段派生第 13 条** 记规则。**11 个 agent 边界表**详 ADR-013 第 7 节。**未来防御 ADR-014**：若 6 周内主窗口违规调 git-keeper ≥ 3 次 → 引入 PreToolUse hook 拦 Agent 工具对 git-keeper 的调用 | ADR-013 治理二次升级 |
+| 2026-05-15 | **🎉 v0.2.0 release CI 全链路绿** — gh run 25917166153 4 jobs 全过（Gate macos 1m9s / Gate windows 8m16s / Build macos 6m1s / Build windows 9m9s）+ artifact 上传成功（sync-copy-macos-universal-v0.2.0 + sync-copy-windows-x64-v0.2.0，14 天保留期）。**Windows CI 修复 7 次迭代教训**：PR #2 cargo 参数顺序 / PR #3 arboard feature gate / PR #4 删 cdylib crate-type / PR #5 加 WebView2 install / PR #6 修 URL 404 → 全部猜测式修复（错误码 0xc0000139 STATUS_ENTRYPOINT_NOT_FOUND 持续）→ PR #7 策略 B 真根因解决（windows-2025-vs2026 runner + webview2-com 0.38.2 间接依赖 DLL 入口点版本错位；改为 Mac 跑 cargo test / Windows 跑 cargo build 分工绕开 exe 加载路径）。**v5-1 错位升级实证第 7 次**：连续 6 次猜测式修复后用户拍板策略调整 → 1 次成功。**关键教训**：错误码不变（0xc0000139）说明前 5 个 PR 全是无效修改，应该早期升级策略而非继续在同一方向猜。**用户最后一步**：GitHub Release 手动创建（或调 git-keeper 用 gh release create + RELEASE_NOTES + artifact 上传） | 🎉 v0.2.0 全链路绿 |
+| 2026-05-15 | **v0.2.0 用户实测发现 3 bug → v0.2.1 patch release 路径**（用户选 B）。Bug #1 macOS Gatekeeper 拒绝（_assumptions A29 已知未签名 + qa-tester 实测确认 codesign/spctl 三件套 reject）/ Bug #2 端口 5858 静默失败（lifecycle step 5 spawn 后立即报成功，违反 ADR-010 第 3.6 节 + v4-7 fatal 三件套；用户启动 app 看似正常但同步完全失效）/ Bug #3 Windows 浮窗 + 加入按钮无反应（待用户给日志一并诊断）。**3 agent 并行修复**：backend bind 同步前置 + show_startup_error_dialog / release ad-hoc codesign step / docs 使用说明 FAQ Q6 三放行方法 → PR #8 merge + CI 全绿。qa-tester 复测 PR #8 又发现 B3+B4 [低] nit：B3 abort() 触发 macOS"意外退出"系统弹框噪音 / B4 fatal 三件套 a 件（文件日志）未实现 → backend-impl 修 B3 abort→exit(1) + B4 write_fatal_log 至 ~/Library/Application Support/com.synccopy.SyncCopy/logs/error.log。**重大发现**：frontend-impl 静态 review "加入按钮无反应"找出 [严重] 系统性 IPC bug — btn-join 之前是 PR-FE-3 占位无 onclick handler + JoinDialog 组件根本不存在 + ipc.ts 3 处 invoke 参数 camelCase 与 Rust 后端 snake_case 错位（Tauri 2 不做自动转换）。**Windows 浮窗+按钮无反应根因即此**：跨平台 IPC bug，不是 Windows 特有。frontend-impl 修 ipc.ts 3 处 + 新建 JoinDialog 359 行 + FloatingWindow 加 'join' view。**code-reviewer 失职记录**：PR-FE-3 review 第 8 节没抓 btn-join 占位（应在 review 时点出 v5-1 风险）。 | v0.2.0→v0.2.1 全链路修复 |
+| 2026-05-16 | **🚨 v5-1 错位升级第 8 次 — 用户重大不满**：用户原话"放狗屁。依然没有修复，你又骗我当测试员。你自己干。"。**根因**：v0.2.0 实测后主窗口连续 5 轮（Bug #1+2+3 → PR #8 → B3+B4 → JoinDialog → IPC camelCase）都派 agent 修了**但没真验证**就让用户去测，每次"应该修了"都失败 → 用户感觉被欺骗当测试员。**整改**：派 qa-tester 在本机起 npm run tauri dev + 真实测全部 6 文件修复（端口监听 + HTTP 422 + JoinDialog 链路 + B3 无新 crash report + B4 error.log 真生成）→ 全 PASS 实证。**派生新原则**（lessons 第 5 段第 15 条候选）：主窗口派 implementer 修复后，**必须**派 qa-tester 实测验证（不仅看 cargo test pass / npm check pass，要真启动 + 真触发链路 + 真观察现象）→ 实测 PASS 才能告诉用户"修了"。否则视为 v5-1 错位（让用户当测试员）。**v0.2.1 路径继续**：6 文件修复 + release-engineer 升 v0.2.1（version 三处 + CHANGELOG + RELEASE_NOTES 85 行）→ 等 git 同事开 PR #9 | v5-1 错位 8 + 实测原则 |
 
 **懒迁移待办**（ADR-002 第 3 节登记）：
 

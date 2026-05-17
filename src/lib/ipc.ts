@@ -61,7 +61,7 @@ export async function getPeers(): Promise<PeerInfo[]> {
 /** 向目标地址发起握手加入小组（group-discovery spec 第 3 节）。*/
 export async function joinGroup(targetAddr: string): Promise<void> {
   try {
-    await invoke<void>("join_group", { targetAddr });
+    await invoke<void>("join_group", { target_addr: targetAddr });
   } catch (e) {
     throw wrapError(e);
   }
@@ -96,7 +96,7 @@ export async function setConfig(cfg: ConfigPayload): Promise<void> {
 /** 同意某 peer 加入请求（group-approval 弹框 approve 按钮）。*/
 export async function approvePeer(deviceId: string): Promise<void> {
   try {
-    await invoke<void>("approve_peer", { deviceId });
+    await invoke<void>("approve_peer", { device_id: deviceId });
   } catch (e) {
     throw wrapError(e);
   }
@@ -105,7 +105,7 @@ export async function approvePeer(deviceId: string): Promise<void> {
 /** 拒绝某 peer 加入请求（group-approval 弹框 reject 按钮）。*/
 export async function rejectPeer(deviceId: string): Promise<void> {
   try {
-    await invoke<void>("reject_peer", { deviceId });
+    await invoke<void>("reject_peer", { device_id: deviceId });
   } catch (e) {
     throw wrapError(e);
   }

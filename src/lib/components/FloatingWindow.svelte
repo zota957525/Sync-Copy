@@ -23,6 +23,7 @@
   import ApprovalDialog from "./ApprovalDialog.svelte";
   import HistoryList from "./HistoryList.svelte";
   import FloatingBall from "./FloatingBall.svelte";
+  import JoinDialog from "./JoinDialog.svelte";
   import {
     COLOR_WINDOW_BG,
     COLOR_WINDOW_BORDER,
@@ -39,10 +40,10 @@
   import { createBallCollapse } from "$lib/hooks/useBallCollapse.svelte";
 
   // ---------------------------------------------------------------------------
-  // View 状态：main | settings | ball
+  // View 状态：main | settings | ball | join
   // ---------------------------------------------------------------------------
 
-  type ViewState = "main" | "settings" | "ball";
+  type ViewState = "main" | "settings" | "ball" | "join";
   let currentView = $state<ViewState>("main");
 
   function openSettings(): void {
@@ -50,6 +51,14 @@
   }
 
   function closeSettings(): void {
+    currentView = "main";
+  }
+
+  function openJoin(): void {
+    currentView = "join";
+  }
+
+  function closeJoin(): void {
     currentView = "main";
   }
 
@@ -135,6 +144,10 @@
     <!-- ---- Settings View ---- -->
     <SettingsPanel onclose={closeSettings} {historyCount} />
 
+  {:else if currentView === "join"}
+    <!-- ---- Join View ---- -->
+    <JoinDialog oncancel={closeJoin} />
+
   {:else}
     <!-- ---- Main View ---- -->
 
@@ -144,6 +157,7 @@
       {statusText}
       oncollapse={collapseToBall}
       onsettings={openSettings}
+      onjoin={openJoin}
     />
 
     <!-- 分割线 -->
